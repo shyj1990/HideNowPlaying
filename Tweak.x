@@ -1,20 +1,24 @@
-// HideNowPlaying v0.0.11 — 侦察终极版(通知列表单元格深挖)
+// HideNowPlaying v0.0.12 — 功能版(基于侦察确认的真实结构)
 //
-// v0.0.10 侦察结论(iPhone 15 Pro / iOS 17.0 / relaxin):
-//   ✅ 锁屏窗口(CoverSheet)结构: CSScrollView(分页) → CSMainPageView → NCNotificationListView
-//      → 多个 NCNotificationListView 分节滚动视图(深度11) → 单元格(深度12, 被深度上限截断!)
-//   ✅ 全树无任何 Media/Player/NowPlaying 类名 → 播放卡片是通知列表深处的一个单元格
-//   ✅ 灵动岛: SBSystemApertureWindow → SBSystemApertureContainerView → ScalingContentView
-//      → RotatingContentView(深度8截断, 媒体内容在其下)
-//   ✅ MRUNowPlayingCellContentView(333x108) 属于控制中心模块内部, 不是锁屏卡片
+// v0.0.11 侦察结论(iPhone 15 Pro / iOS 17.0 / relaxin):
+//   锁屏播放卡片 = 通知列表里的一个单元格:
+//     NCNotificationListCell(365x167, 自带 UIPanGestureRecognizer)
+//       └ NCNotificationListSupplementaryHostingView(GR<Tap>)
+//         └ PLPlatterView(毛玻璃底板)
+//           └ CSActivityItemContentView  ← 媒体实况活动内容(远程渲染 _UIScenePresentationView)
+//   灵动岛 = SBSystemApertureContainerView
+//     └ ScalingContentView → RotatingContentView → SAUIElementView
+//       ├ _SAUIElementViewContentView(锁图标 SBUIProudLockIconView + 媒体图标 37x37)
+//       └ _SAUIProvidedViewContainerView x3 → _SAUIPortalView(媒体内容为远程门户渲染)
 //
-// v0.0.11 侦察3:
-//   1. 锁屏窗口第1轮: 全量树 深度15/上限1200
-//   2. 锁屏窗口后续轮: 定向深挖 NCNotificationList*(宽>300)子树 深度15/900 + 关键词命中
-//   3. 灵动岛窗口: 全量树 深度12/上限300
-//   其余不变(播放中每12秒一次, 最多4次; 手势/隐藏机制保留但等侦察结果)
+// v0.0.12 功能实现:
+//   1. hook CSActivityItemContentView 入窗口 → 上溯找到所属 NCNotificationListCell
+//      → 登记为媒体卡片 + 挂左滑手势(代理抢占优先级)
+//   2. 左滑 → 隐藏卡片单元格 + 灵动岛媒体内容(_SAUIElementViewContentView + 宽>=30 的门户)
+//   3. 暂停≥1秒 → 继续播放 → 恢复显示(播放速率轮询)
+//   4. 隐藏期间新出现的卡片/灵动岛内容自动保持隐藏
 //
-// 日志: /var/mobile/Documents/HideNowPlaying.log
+// 日志: /var/mobile/Documents/HideNowPlaying.log   紧急开关: /var/mobile/Documents/HideNowPlaying.off
 
 #import <UIKit/UIKit.h>
 #import <Foundation/Foundation.h>
@@ -26,9 +30,7 @@
 #pragma mark - 前置声明
 
 static void HNPMSetHidden(BOOL hide, NSString *reason);
-static void HNPMStopPolling(void);
 static void HNPMLogThrottled(NSString *text);
-static void HNPMReconDump(NSString *reason, int round);
 
 #pragma mark - 日志
 
@@ -63,18 +65,15 @@ static void HNPMLogThrottled(NSString *text) {
 
 #pragma mark - 全局状态
 
-static BOOL hnpmHidden = NO;
-static BOOL hnpmBaseline = NO;
-static BOOL hnpmLastPlaying = NO;
-static int  hnpmPauseStreak = 0;
-static NSTimer *hnpmTimer = nil;
-static int hnpmDumpCount = 0;
-static CFAbsoluteTime hnpmLastDump = 0;
-static NSHashTable *hnpmCardViews = nil;
-static NSHashTable *hnpmAmbientViews = nil;
-static void *kHNPMPanKey = &kHNPMPanKey;
+static BOOL hnpmHidden = NO;                  // 当前是否已隐藏
+static BOOL hnpmBaseline = NO;                // 隐藏后是否完成首次播放采样
+static BOOL hnpmLastPlaying = NO;             // 上次采样播放状态
+static int  hnpmPauseStreak = 0;              // 连续"未播放"采样次数(0.5s 每次)
+static NSHashTable *hnpmCardViews = nil;      // 弱引用: 卡片单元格 + 内容视图
+static NSHashTable *hnpmIslandViews = nil;    // 弱引用: 灵动岛媒体相关视图
+static void *kHNPMPanKey = &kHNPMPanKey;      // 关联对象: 已挂手势标记
 
-#pragma mark - MediaRemote
+#pragma mark - MediaRemote(运行时 dlopen, 无需链接参数)
 
 typedef void (*HNPMGetInfoFunc)(dispatch_queue_t, void (^)(CFDictionaryRef));
 static HNPMGetInfoFunc hnpmGetInfo = NULL;
@@ -83,8 +82,13 @@ static HNPMGetInfoFunc hnpmGetInfo = NULL;
 
 static void HNPMApplyHiddenToViews(BOOL hide) {
     @try {
-        for (UIView *v in hnpmCardViews)   { v.hidden = hide; }
-        for (UIView *v in hnpmAmbientViews){ v.hidden = hide; }
+        for (UIView *v in hnpmCardViews)  { v.hidden = hide; }
+        for (UIView *v in hnpmIslandViews) {
+            // 门户只隐藏媒体尺寸(>=30)的; 元素内容视图全部隐藏
+            if ([NSStringFromClass([v class]) containsString:@"ProvidedViewContainer"] &&
+                v.frame.size.width < 30 && v.frame.size.height < 30) continue;
+            v.hidden = hide;
+        }
     } @catch (NSException *e) {}
 }
 
@@ -93,21 +97,63 @@ static void HNPMSetHidden(BOOL hide, NSString *reason) {
     hnpmHidden = hide;
     hnpmBaseline = NO;
     hnpmPauseStreak = 0;
-    if (!hide) HNPMStopPolling();
     dispatch_async(dispatch_get_main_queue(), ^{
         @try {
             HNPMApplyHiddenToViews(hide);
             HNPMAppendLog([NSString stringWithFormat:@"%@ → 状态=%@ (卡片%lu个/灵动岛%lu个)",
                            reason, hide ? @"已隐藏(音乐继续)" : @"已恢复显示",
-                           (unsigned long)hnpmCardViews.count, (unsigned long)hnpmAmbientViews.count]);
+                           (unsigned long)hnpmCardViews.count, (unsigned long)hnpmIslandViews.count]);
         } @catch (NSException *e) {}
     });
 }
 
-static void HNPMStopPolling(void) {
+// 0.5 秒轮询: 隐藏期间检测"暂停→继续播放"以恢复显示
+static void HNPMStartRestorePolling(void) {
     dispatch_async(dispatch_get_main_queue(), ^{
         @try {
-            if (hnpmTimer) { [hnpmTimer invalidate]; hnpmTimer = nil; }
+            static NSTimer *restoreTimer = nil;
+            if (restoreTimer) return;
+            restoreTimer = [NSTimer timerWithTimeInterval:0.5 repeats:YES block:^(NSTimer *timer) {
+                @try {
+                    if (!hnpmHidden) {
+                        [timer invalidate];
+                        restoreTimer = nil;
+                        return;
+                    }
+                    if (!hnpmGetInfo) return;
+                    hnpmGetInfo(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^(CFDictionaryRef info) {
+                        @try {
+                            BOOL hasInfo = (info != NULL && CFDictionaryGetCount(info) > 0);
+                            double rate = 0;
+                            if (hasInfo) {
+                                CFNumberRef rateRef = CFDictionaryGetValue(info, CFSTR("kMRMediaRemoteNowPlayingInfoPlaybackRate"));
+                                if (rateRef) CFNumberGetValue(rateRef, kCFNumberDoubleType, &rate);
+                            }
+                            BOOL playing = (hasInfo && rate > 0.05);
+                            dispatch_async(dispatch_get_main_queue(), ^{
+                                @try {
+                                    if (!hnpmHidden) return;
+                                    if (!hnpmBaseline) {
+                                        hnpmLastPlaying = playing;
+                                        hnpmPauseStreak = playing ? 0 : 1;
+                                        hnpmBaseline = YES;
+                                    } else if (!playing) {
+                                        hnpmLastPlaying = NO;
+                                        hnpmPauseStreak++;
+                                    } else {
+                                        if (!hnpmLastPlaying && hnpmPauseStreak >= 2) {
+                                            HNPMSetHidden(NO, @"检测到暂停后继续播放");
+                                        }
+                                        hnpmLastPlaying = YES;
+                                        hnpmPauseStreak = 0;
+                                    }
+                                } @catch (NSException *e) {}
+                            });
+                        } @catch (NSException *e) {}
+                    });
+                } @catch (NSException *e) {}
+            }];
+            [[NSRunLoop mainRunLoop] addTimer:restoreTimer forMode:NSRunLoopCommonModes];
         } @catch (NSException *e) {}
     });
 }
@@ -128,10 +174,12 @@ static void HNPMStopPolling(void) {
             HNPMLogThrottled([NSString stringWithFormat:@"[手势] 移动中 t=(%.0f,%.0f) v=(%.0f,%.0f)", t.x, t.y, v.x, v.y]);
             if (t.x < -60 && fabs(t.x) > fabs(t.y) * 1.5) {
                 HNPMSetHidden(YES, @"锁屏播放卡片左滑");
+                HNPMStartRestorePolling();
             }
         } else if (gr.state == UIGestureRecognizerStateEnded) {
             if (t.x < -55 && fabs(t.x) > fabs(t.y) * 1.2 && v.x < -300) {
                 HNPMSetHidden(YES, @"锁屏播放卡片左滑(轻扫)");
+                HNPMStartRestorePolling();
             }
         }
     } @catch (NSException *e) {}
@@ -149,13 +197,10 @@ static void HNPMStopPolling(void) {
     } @catch (NSException *e) { return NO; }
 }
 
+// 我们的手势优先: 其它所有手势(通知清除/列表滚动)等我们先判定
+// (shouldBegin 对非左滑立即返回 NO, 不影响正常交互)
 - (BOOL)gestureRecognizer:(UIGestureRecognizer *)gr shouldBeRequiredToFailByGestureRecognizer:(UIGestureRecognizer *)other {
-    @try {
-        UIView *otherView = other.view;
-        UIView *card = gr.view;
-        if (!otherView || !card) return NO;
-        return ![otherView isDescendantOfView:card];
-    } @catch (NSException *e) { return NO; }
+    return YES;
 }
 
 @end
@@ -177,175 +222,68 @@ static void HNPMAttachPanIfNeeded(UIView *view) {
     } @catch (NSException *e) {}
 }
 
-#pragma mark - 视图树侦察
+#pragma mark - 媒体卡片识别
 
-static void HNPMSubtree(UIView *v, NSMutableString *out, NSInteger depth, NSInteger *count, NSInteger cap, NSInteger maxDepth) {
+// 从 CSActivityItemContentView 上溯找所属的通知单元格
+static UIView *HNPMFindCellAncestor(UIView *v) {
     @try {
-        if (!v || *count > cap || depth > maxDepth) return;
-        (*count)++;
-        NSString *indent = depth > 0 ? [@"" stringByPaddingToLength:(NSUInteger)(depth * 2) withString:@" " startingAtIndex:0] : @"";
-        [out appendFormat:@"%@%@ frame=%@ hidden=%d alpha=%.1f userInt=%d",
-         indent, NSStringFromClass([v class]), NSStringFromCGRect(v.frame),
-         v.hidden ? 1 : 0, v.alpha, v.userInteractionEnabled ? 1 : 0];
-        NSArray *grs = [v gestureRecognizers];
-        if (grs.count > 0) {
-            NSMutableArray *names = [NSMutableArray array];
-            for (UIGestureRecognizer *g in grs) [names addObject:NSStringFromClass([g class])];
-            [out appendFormat:@" GR<%@>", [names componentsJoinedByString:@","]];
-        }
-        [out appendString:@"\n"];
-        for (UIView *s in [v subviews]) HNPMSubtree(s, out, depth + 1, count, cap, maxDepth);
-    } @catch (NSException *e) {}
+        Class cellClass = NSClassFromString(@"NCNotificationListCell");
+        if (!cellClass) return nil;
+        UIView *p = v;
+        while (p && ![p isKindOfClass:cellClass]) p = p.superview;
+        return p;
+    } @catch (NSException *e) { return nil; }
 }
 
-static BOOL HNPMInteresting(UIView *v) {
-    @try {
-        if (!v || v.hidden || v.alpha < 0.05) return NO;
-        if (v.frame.size.width < 40 || v.frame.size.height < 40) return NO;
-        NSString *n = NSStringFromClass([v class]);
-        return ([n containsString:@"Media"] || [n containsString:@"NowPlaying"] ||
-                [n containsString:@"Controls"] || [n containsString:@"Player"] ||
-                [n containsString:@"Ambient"] || [n containsString:@"Backdrop"] ||
-                [n containsString:@"DashBoard"] || [n containsString:@"Island"] ||
-                [n containsString:@"MPU"] || [n containsString:@"Music"]);
-    } @catch (NSException *e) { return NO; }
-}
+#pragma mark - 类声明(logos 编译期)
 
-static void HNPMSearchTree(UIView *v, NSMutableString *out, NSInteger *count) {
-    @try {
-        if (!v || *count > 300) return;
-        if (HNPMInteresting(v)) {
-            UIView *root = v;
-            for (int i = 0; i < 3 && root.superview; i++) root = root.superview;
-            HNPMSubtree(root, out, 0, count, 150, 8);
-            [out appendString:@"  ---[周边子树结束]---\n"];
-            return;
-        }
-        for (UIView *s in [v subviews]) HNPMSearchTree(s, out, count);
-    } @catch (NSException *e) {}
-}
+@interface CSActivityItemContentView : UIView @end
+@interface _SAUIProvidedViewContainerView : UIView @end
+@interface _SAUIElementViewContentView : UIView @end
+@interface NCNotificationListCell : UIView @end
 
-// 定向深挖: 通知列表主滚动视图(宽>300)的完整子树
-static void HNPMNotifyDig(UIView *v, NSMutableString *out, NSInteger *count) {
-    @try {
-        if (!v || *count > 900) return;
-        NSString *n = NSStringFromClass([v class]);
-        if ([n containsString:@"NCNotificationList"] && v.frame.size.width > 300) {
-            HNPMSubtree(v, out, 0, count, 900, 15);
-            [out appendString:@"  ---[通知子树结束]---\n"];
-            return;
-        }
-        for (UIView *s in [v subviews]) HNPMNotifyDig(s, out, count);
-    } @catch (NSException *e) {}
-}
+#pragma mark - hooks
 
-static void HNPMReconDump(NSString *reason, int round) {
+// 媒体卡片内容(实况活动)出现 → 找到单元格 → 登记 + 挂手势
+%group HNPMActivityCard
+%hook CSActivityItemContentView
+- (void)didMoveToWindow {
+    %orig;
     @try {
-        NSMutableString *out = [NSMutableString stringWithFormat:@"[侦察] 原因=%@ 轮次=%d 时间=%@\n", reason, round, [NSDate date]];
-        NSArray *windows = [UIApplication sharedApplication].windows;
-        for (UIWindow *w in windows) {
-            [out appendFormat:@"[窗口] %@ hidden=%d key=%d\n",
-             NSStringFromClass([w class]), w.hidden ? 1 : 0, w.isKeyWindow ? 1 : 0];
-        }
-        for (UIWindow *w in windows) {
-            if (w.hidden) continue;
-            NSString *wc = NSStringFromClass([w class]);
-            NSInteger count = 0;
-            if ([wc containsString:@"CoverSheet"]) {
-                if (round == 1) {
-                    NSMutableString *tree = [NSMutableString stringWithFormat:@"[侦察] 锁屏窗口 %@ 全量树(深度15):\n", wc];
-                    HNPMSubtree(w, tree, 0, &count, 1200, 15);
-                    [out appendString:tree];
-                } else {
-                    NSMutableString *tree = [NSMutableString stringWithFormat:@"[侦察] 锁屏窗口 %@ 通知深挖:\n", wc];
-                    HNPMNotifyDig(w, tree, &count);
-                    if (count > 0) [out appendString:tree];
-                }
-            } else if ([wc containsString:@"Aperture"]) {
-                NSMutableString *tree = [NSMutableString stringWithFormat:@"[侦察] 灵动岛窗口 %@ 全量树(深度12):\n", wc];
-                HNPMSubtree(w, tree, 0, &count, 300, 12);
-                [out appendString:tree];
-            } else {
-                NSMutableString *tree = [NSMutableString stringWithFormat:@"[侦察] 窗口 %@ 命中:\n", wc];
-                HNPMSearchTree(w, tree, &count);
-                if (count > 0) [out appendString:tree];
-            }
-        }
-        HNPMAppendLog(out);
-        HNPMAppendLog([NSString stringWithFormat:@"[侦察] 本轮完成(第 %d/4 次)", round]);
-    } @catch (NSException *e) {
-        HNPMAppendLog(@"[侦察] 执行异常");
-    }
-}
-
-#pragma mark - 播放状态轮询
-
-static void HNPMCheckPlayback(void) {
-    @try {
-        if (!hnpmGetInfo) return;
-        hnpmGetInfo(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^(CFDictionaryRef info) {
+        if (!self.window) return;
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.3 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
             @try {
-                BOOL hasInfo = (info != NULL && CFDictionaryGetCount(info) > 0);
-                double rate = 0;
-                if (hasInfo) {
-                    CFNumberRef rateRef = CFDictionaryGetValue(info, CFSTR("kMRMediaRemoteNowPlayingInfoPlaybackRate"));
-                    if (rateRef) CFNumberGetValue(rateRef, kCFNumberDoubleType, &rate);
+                if (!self.window) return;
+                UIView *cell = HNPMFindCellAncestor(self);
+                if (!cell) {
+                    HNPMLogThrottled(@"[卡片] CSActivityItemContentView 不在通知单元格内(可能是其他实况活动)");
+                    return;
                 }
-                BOOL playing = (hasInfo && rate > 0.05);
-                dispatch_async(dispatch_get_main_queue(), ^{
-                    @try {
-                        if (hnpmHidden) {
-                            if (!hnpmBaseline) {
-                                hnpmLastPlaying = playing;
-                                hnpmPauseStreak = playing ? 0 : 1;
-                                hnpmBaseline = YES;
-                            } else if (!playing) {
-                                hnpmLastPlaying = NO;
-                                hnpmPauseStreak++;
-                            } else {
-                                if (!hnpmLastPlaying && hnpmPauseStreak >= 2) {
-                                    HNPMSetHidden(NO, @"检测到暂停后继续播放");
-                                }
-                                hnpmLastPlaying = YES;
-                                hnpmPauseStreak = 0;
-                            }
-                            return;
-                        }
-                        if (playing && hnpmDumpCount < 4 &&
-                            CFAbsoluteTimeGetCurrent() - hnpmLastDump > 12) {
-                            hnpmDumpCount++;
-                            hnpmLastDump = CFAbsoluteTimeGetCurrent();
-                            int round = hnpmDumpCount;
-                            NSTimeInterval delay = (round == 1) ? 2.0 : 0.0;
-                            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delay * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-                                HNPMReconDump(round == 1 ? @"开始播放" : @"播放中持续侦察", round);
-                            });
-                        }
-                    } @catch (NSException *e) {}
-                });
+                [hnpmCardViews addObject:self];
+                [hnpmCardViews addObject:cell];
+                HNPMAttachPanIfNeeded(cell);
+                HNPMLogThrottled([NSString stringWithFormat:@"[卡片] 媒体卡片已登记 单元格=%@ 内容=%@",
+                                  NSStringFromCGRect(cell.frame), NSStringFromCGRect(self.frame)]);
+                if (hnpmHidden) {
+                    self.hidden = YES;
+                    cell.hidden = YES;
+                }
             } @catch (NSException *e) {}
         });
     } @catch (NSException *e) {}
 }
+%end
+%end
 
-#pragma mark - 类声明
-
-@interface MRUNowPlayingViewController : UIViewController @end
-@interface SBLockScreenNowPlayingController : NSObject @end
-@interface MRUNowPlayingCellContentView : UIView @end
-@interface MRUAmbientNowPlayingView : UIView @end
-@interface MRUAmbientCompactNowPlayingView : UIView @end
-
-#pragma mark - hooks
-
-%group HNPMCellView
-%hook MRUNowPlayingCellContentView
+// 灵动岛: 元素内容视图(锁图标+媒体图标)
+%group HNPMIslandElement
+%hook _SAUIElementViewContentView
 - (void)didMoveToWindow {
     %orig;
     @try {
-        [hnpmCardViews addObject:self];
-        HNPMAttachPanIfNeeded(self);
-        HNPMLogThrottled([NSString stringWithFormat:@"[跟踪] MRUNowPlayingCellContentView 入窗口 frame=%@",
+        if (!self.window) return;
+        [hnpmIslandViews addObject:self];
+        HNPMLogThrottled([NSString stringWithFormat:@"[灵动岛] 元素内容视图登记 frame=%@",
                           NSStringFromCGRect(self.frame)]);
         if (hnpmHidden) self.hidden = YES;
     } @catch (NSException *e) {}
@@ -353,74 +291,18 @@ static void HNPMCheckPlayback(void) {
 %end
 %end
 
-%group HNPMAmbientViewFull
-%hook MRUAmbientNowPlayingView
+// 灵动岛: 门户容器(媒体内容远程渲染, 媒体的宽约 37)
+%group HNPMIslandPortal
+%hook _SAUIProvidedViewContainerView
 - (void)didMoveToWindow {
     %orig;
     @try {
-        [hnpmAmbientViews addObject:self];
-        HNPMLogThrottled([NSString stringWithFormat:@"[跟踪] MRUAmbientNowPlayingView 入窗口 frame=%@",
+        if (!self.window) return;
+        [hnpmIslandViews addObject:self];
+        HNPMLogThrottled([NSString stringWithFormat:@"[灵动岛] 门户登记 frame=%@",
                           NSStringFromCGRect(self.frame)]);
         if (hnpmHidden) self.hidden = YES;
     } @catch (NSException *e) {}
-}
-%end
-%end
-
-%group HNPMAmbientViewCompact
-%hook MRUAmbientCompactNowPlayingView
-- (void)didMoveToWindow {
-    %orig;
-    @try {
-        [hnpmAmbientViews addObject:self];
-        HNPMLogThrottled([NSString stringWithFormat:@"[跟踪] MRUAmbientCompactNowPlayingView 入窗口 frame=%@",
-                          NSStringFromCGRect(self.frame)]);
-        if (hnpmHidden) self.hidden = YES;
-    } @catch (NSException *e) {}
-}
-%end
-%end
-
-%group HNPMCard
-%hook MRUNowPlayingViewController
-- (void)viewDidLoad {
-    %orig;
-    @try { HNPMAppendLog(@"[跟踪] MRUNowPlayingViewController(控制中心模块) viewDidLoad"); } @catch (NSException *e) {}
-}
-%end
-%end
-
-%group HNPMInspector
-%hook SBLockScreenNowPlayingController
-- (instancetype)init {
-    id orig = %orig;
-    @try {
-        static BOOL dumped = NO;
-        if (orig && !dumped) {
-            dumped = YES;
-            unsigned int count = 0;
-            Class cls = object_getClass(orig);
-            Ivar *ivars = class_copyIvarList(cls, &count);
-            if (ivars) {
-                NSMutableString *rep = [NSMutableString stringWithFormat:@"[诊断] %@ 成员变量(%u): ", NSStringFromClass(cls), count];
-                for (unsigned int i = 0; i < count; i++) {
-                    const char *type = ivar_getTypeEncoding(ivars[i]);
-                    NSString *name = @(ivar_getName(ivars[i]));
-                    [rep appendFormat:@"%@(%s)", name, type ? type : "?"];
-                    if (type && type[0] == '@') {
-                        id val = object_getIvar(orig, ivars[i]);
-                        if (val && [val isKindOfClass:[NSObject class]]) {
-                            [rep appendFormat:@"=<%@>", NSStringFromClass([val class])];
-                        }
-                    }
-                    [rep appendString:@"; "];
-                }
-                free(ivars);
-                HNPMAppendLog(rep);
-            }
-        }
-    } @catch (NSException *e) {}
-    return orig;
 }
 %end
 %end
@@ -428,12 +310,12 @@ static void HNPMCheckPlayback(void) {
 #pragma mark - 入口
 
 __attribute__((constructor)) static void HNPMRawCtor(void) {
-    HNPMAppendLog(@"v0.0.11: dylib 构造函数已执行(dyld 加载成功)");
+    HNPMAppendLog(@"v0.0.12: dylib 构造函数已执行(dyld 加载成功)");
 }
 
 %ctor {
     @autoreleasepool {
-        HNPMAppendLog(@"v0.0.11: logos %ctor 进入");
+        HNPMAppendLog(@"v0.0.12: logos %ctor 进入");
 
         if ([[NSFileManager defaultManager] fileExistsAtPath:@"/var/mobile/Documents/HideNowPlaying.off"]) {
             HNPMAppendLog(@"检测到开关文件 HideNowPlaying.off, 不注册任何 hook");
@@ -441,7 +323,7 @@ __attribute__((constructor)) static void HNPMRawCtor(void) {
         }
 
         hnpmCardViews = [NSHashTable weakObjectsHashTable];
-        hnpmAmbientViews = [NSHashTable weakObjectsHashTable];
+        hnpmIslandViews = [NSHashTable weakObjectsHashTable];
         hnpmPanTarget = [[HNPMPanTarget alloc] init];
 
         void *mr = dlopen("/System/Library/PrivateFrameworks/MediaRemote.framework/MediaRemote", RTLD_LAZY);
@@ -452,20 +334,9 @@ __attribute__((constructor)) static void HNPMRawCtor(void) {
             HNPMAppendLog(@"MediaRemote 加载失败");
         }
 
-        if (hnpmGetInfo) {
-            NSTimer *t = [NSTimer timerWithTimeInterval:1.0 repeats:YES block:^(NSTimer *timer) {
-                HNPMCheckPlayback();
-            }];
-            [[NSRunLoop mainRunLoop] addTimer:t forMode:NSRunLoopCommonModes];
-            hnpmTimer = t;
-            HNPMAppendLog(@"播放状态轮询已启动(1s)");
-        }
-
-        if (objc_getClass("MRUNowPlayingCellContentView")) { %init(HNPMCellView); }
-        if (objc_getClass("MRUAmbientNowPlayingView"))     { %init(HNPMAmbientViewFull); }
-        if (objc_getClass("MRUAmbientCompactNowPlayingView")) { %init(HNPMAmbientViewCompact); }
-        if (objc_getClass("MRUNowPlayingViewController"))  { %init(HNPMCard); }
-        if (objc_getClass("SBLockScreenNowPlayingController")) { %init(HNPMInspector); }
-        HNPMAppendLog(@"v0.0.11: %ctor 正常完成(hook 全部按需注册)");
+        if (objc_getClass("CSActivityItemContentView"))       { %init(HNPMActivityCard); HNPMAppendLog(@"hook 已注册: 媒体卡片 CSActivityItemContentView"); }
+        if (objc_getClass("_SAUIElementViewContentView"))     { %init(HNPMIslandElement); HNPMAppendLog(@"hook 已注册: 灵动岛元素内容"); }
+        if (objc_getClass("_SAUIProvidedViewContainerView"))  { %init(HNPMIslandPortal); HNPMAppendLog(@"hook 已注册: 灵动岛门户"); }
+        HNPMAppendLog(@"v0.0.12: %ctor 正常完成(功能版, 左滑隐藏 / 暂停再播恢复)");
     }
 }
