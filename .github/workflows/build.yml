@@ -7,22 +7,22 @@ on:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    runs-on: macos-14
     steps:
       - name: 拉取代码
         uses: actions/checkout@v4
 
-      - name: 安装 Theos 编译环境 (roothide 版)
+      - name: 安装 Theos (roothide 版 + Apple 官方编译器)
         run: |
+          brew install ldid make dpkg
+          echo "$(brew --prefix)/opt/make/libexec/gnubin" >> $GITHUB_PATH
           git clone --depth 1 https://github.com/roothide/theos.git $HOME/theos
-          # 提前拉取 SDK(iPhoneOS14.5),绕开 install-theos 对 api.github.com 的请求(常被限流)
+          # SDK 预先放置,绕开 install-theos 对 api.github.com 的请求(常被限流)
           git clone --depth 1 --filter=blob:none --sparse https://github.com/theos/sdks.git $HOME/sdks_tmp
           cd $HOME/sdks_tmp && git sparse-checkout set iPhoneOS14.5.sdk
           rm -rf $HOME/theos/sdks
           mv $HOME/sdks_tmp $HOME/theos/sdks
-          bash -c "$(curl -fsSL https://raw.githubusercontent.com/roothide/theos/master/bin/install-theos)"
           echo "THEOS=$HOME/theos" >> $GITHUB_ENV
-          echo "PATH=$HOME/theos/bin:$PATH" >> $GITHUB_ENV
 
       - name: 编译
         run: make package FINALPACKAGE=1
