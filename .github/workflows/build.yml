@@ -16,9 +16,10 @@ jobs:
         run: |
           git clone --depth 1 https://github.com/theos/theos.git $HOME/theos
           # 提前拉取 SDK(iPhoneOS14.5),绕开 install-theos 对 api.github.com 的请求(常被限流)
-          git clone --depth 1 --filter=blob:none --sparse https://github.com/theos/sdks.git $HOME/theos/sdks \
-            || git clone --depth 1 https://github.com/theos/sdks.git $HOME/theos/sdks
-          cd $HOME/theos/sdks && git sparse-checkout set iPhoneOS14.5.sdk
+          git clone --depth 1 --filter=blob:none --sparse https://github.com/theos/sdks.git $HOME/sdks_tmp
+          cd $HOME/sdks_tmp && git sparse-checkout set iPhoneOS14.5.sdk
+          rm -rf $HOME/theos/sdks
+          mv $HOME/sdks_tmp $HOME/theos/sdks
           bash -c "$(curl -fsSL https://raw.githubusercontent.com/theos/theos/master/bin/install-theos)"
           echo "THEOS=$HOME/theos" >> $GITHUB_ENV
           echo "PATH=$HOME/theos/bin:$PATH" >> $GITHUB_ENV
