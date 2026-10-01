@@ -1,17 +1,16 @@
-// HideNowPlaying v0.0.2 — 安全探针版(不含任何 hook)
+// HideNowPlaying v0.0.3 — 探针版 2(无任何 hook)
 //
-// 目的:
-//   1. 验证插件能被 roothide/ElleKit 安全加载(上一版导致黑屏,先隔离加载层问题)
-//   2. 收集 iOS 17 上真实存在的播放器相关类名,用于下一版精确挂钩
+// 相比 v0.0.2 的变化:
+//   1. 去掉链接参数 -Wl,-undefined,dynamic_lookup(排除链接变量)
+//   2. 最早的原始构造函数里就写日志(区分"dyld 加载崩"还是"logos %ctor 崩")
+//   3. 支持紧急开关: 存在 /var/mobile/Documents/HideNowPlaying.off 文件时 %ctor 直接返回
 //
-// 日志文件: /var/mobile/Documents/HideNowPlaying.log (用 Filza 打开查看)
+// 日志文件: /var/mobile/Documents/HideNowPlaying.log
 
 #import <Foundation/Foundation.h>
 #import <objc/runtime.h>
 #import <stdlib.h>
 
-// 写日志到文件(SpringBoard 以 mobile 用户运行,/var/mobile/Documents 可写;
-// 全程 @try 包裹,写失败也不影响系统)
 static void HNPMAppendLog(NSString *text) {
     @try {
         NSString *path = @"/var/mobile/Documents/HideNowPlaying.log";
@@ -33,15 +32,24 @@ static void HNPMAppendLog(NSString *text) {
     }
 }
 
+// 最早的入口: dyld 加载本 dylib 后、logos %ctor 之前执行
+__attribute__((constructor)) static void HNPMRawCtor(void) {
+    HNPMAppendLog(@"v0.0.3 探针: dylib 构造函数已执行(dyld 加载成功)");
+}
+
 %ctor {
     @autoreleasepool {
+        HNPMAppendLog(@"v0.0.3 探针: logos %ctor 已进入");
+
+        // 紧急开关: 创建 /var/mobile/Documents/HideNowPlaying.off 即可让插件完全不干活
+        if ([[NSFileManager defaultManager] fileExistsAtPath:@"/var/mobile/Documents/HideNowPlaying.off"]) {
+            HNPMAppendLog(@"检测到开关文件 HideNowPlaying.off, 探针直接退出");
+            return;
+        }
+
         NSMutableString *report = [NSMutableString string];
-
-        // 1) 确认加载到了正确进程
         [report appendFormat:@"进程: %s", getprogname()];
-        [report appendString:@" | 插件加载成功(探针版,无任何 hook)"];
 
-        // 2) 检查候选类是否存在
         NSArray *candidates = @[
             @"SBDashBoardAggregatedMusicPlayerViewController",
             @"SBDashBoardNowPlayingViewController",
@@ -49,13 +57,13 @@ static void HNPMAppendLog(NSString *text) {
             @"SBFloatingMediaControlsViewController",
             @"MRMediaControlsViewController",
         ];
-        [report appendString:@"\n--- 候选类检查 ---"];
+        [report appendString:@" | 候选类: "];
         for (NSString *name in candidates) {
-            Class cls = objc_getClass(name.UTF8String);
-            [report appendFormat:@"\n%@ : %@", name, cls ? @"存在" : @"不存在"];
+            [report appendFormat:@"%@=%@ ", name, objc_getClass(name.UTF8String) ? @"Y" : @"N"];
         }
+        HNPMAppendLog(report);
 
-        // 3) 收集系统里所有播放器相关的类名(下一版挂钩用)
+        // 收集系统里所有播放器相关类名
         @try {
             unsigned int count = 0;
             Class *classes = objc_copyClassList(&count);
@@ -71,12 +79,12 @@ static void HNPMAppendLog(NSString *text) {
                     }
                 }
                 free(classes);
-                [report appendFormat:@"\n--- 系统相关类(共%lu个) ---\n%@", (unsigned long)found.count, [found componentsJoinedByString:@"\n"]];
+                HNPMAppendLog([NSString stringWithFormat:@"系统相关类(%lu个):\n%@", (unsigned long)found.count, [found componentsJoinedByString:@"\n"]]);
             }
         } @catch (NSException *exception) {
-            [report appendString:@"\n类名收集失败"];
+            HNPMAppendLog(@"类名收集异常");
         }
 
-        HNPMAppendLog(report);
+        HNPMAppendLog(@"v0.0.3 探针: %ctor 正常完成");
     }
 }
