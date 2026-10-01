@@ -16,10 +16,8 @@ jobs:
         run: |
           brew install ldid make
           echo "$(brew --prefix)/opt/make/libexec/gnubin" >> $GITHUB_PATH
-          git clone --depth 1 https://github.com/roothide/theos.git $HOME/theos
-          # macOS 打包需要 dm.pl(theos 官方 deb 打包脚本)
-          curl -fsSL -o $HOME/theos/bin/dm.pl https://raw.githubusercontent.com/theos/dm.pl/master/dm.pl
-          chmod +x $HOME/theos/bin/dm.pl
+          # --recursive 拉齐全部 git 子模块: vendor/include(vendor 头文件)、vendor/lib(链接库)、vendor/logos、vendor/dm.pl(打包脚本)
+          git clone --depth 1 --recursive --shallow-submodules https://github.com/roothide/theos.git $HOME/theos
           # SDK 预先放置,绕开 install-theos 对 api.github.com 的请求(常被限流)
           git clone --depth 1 --filter=blob:none --sparse https://github.com/theos/sdks.git $HOME/sdks_tmp
           cd $HOME/sdks_tmp && git sparse-checkout set iPhoneOS14.5.sdk
