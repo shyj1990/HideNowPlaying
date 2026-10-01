@@ -1,4 +1,4 @@
-// HideNowPlaying v0.0.6 — 左滑触发修复版
+// HideNowPlaying v0.0.7 — 左滑触发修复版
 //
 // v0.0.5 真机日志结论(iPhone 15 Pro / iOS 17.0 / relaxin):
 //   ✅ MRUNowPlayingViewController 就是锁屏播放卡片(viewDidLoad/viewWillAppear 正常触发)
@@ -239,6 +239,28 @@ static void HNPMAttachPanIfNeeded(UIView *view) {
     } @catch (NSException *e) {}
 }
 
+static void *kHNPMDumpedKey = &kHNPMDumpedKey;   // 关联对象 key: 标记已 dump 过层级树的 VC
+
+// 递归描述视图树(类名/尺寸/隐藏/透明度/是否可交互/挂了哪些手势)
+static void HNPMDumpViewTree(UIView *view, NSMutableString *out, NSInteger depth, NSInteger *count) {
+    @try {
+        if (!view || *count > 80 || depth > 8) return;
+        (*count)++;
+        NSString *indent = depth > 0 ? [@"" stringByPaddingToLength:(NSUInteger)(depth * 2) withString:@" " startingAtIndex:0] : @"";
+        [out appendFormat:@"%@%@ frame=%@ hidden=%d alpha=%.1f userInt=%d",
+         indent, NSStringFromClass([view class]), NSStringFromCGRect(view.frame),
+         view.hidden ? 1 : 0, view.alpha, view.userInteractionEnabled ? 1 : 0];
+        NSArray *grs = [view gestureRecognizers];
+        if (grs.count > 0) {
+            NSMutableArray *names = [NSMutableArray array];
+            for (UIGestureRecognizer *g in grs) [names addObject:NSStringFromClass([g class])];
+            [out appendFormat:@" GR<%@>", [names componentsJoinedByString:@","]];
+        }
+        [out appendString:@"\n"];
+        for (UIView *sub in [view subviews]) HNPMDumpViewTree(sub, out, depth + 1, count);
+    } @catch (NSException *e) {}
+}
+
 #pragma mark - 类声明(供 logos 编译期使用)
 
 @interface MRUNowPlayingViewController : UIViewController @end
@@ -317,12 +339,31 @@ static void HNPMAttachPanIfNeeded(UIView *view) {
     @try {
         HNPMLogThrottled([NSString stringWithFormat:@"[卡片] VC viewWillAppear view.frame=%@",
                           NSStringFromCGRect(self.view.frame)]);
+        HNPMAttachPanIfNeeded(self.view);   // 兜底: 根视图也挂一份手势
         if (hnpmHidden) self.view.hidden = YES;
     } @catch (NSException *e) {}
 }
 - (void)viewDidLayoutSubviews {
     %orig;
-    @try { if (hnpmHidden) self.view.hidden = YES; } @catch (NSException *e) {}
+    @try {
+        if (hnpmHidden) self.view.hidden = YES;
+        // 布局稳定后, 一次性 dump 卡片视图树 + 上级链(找出真正接收触摸的可见视图)
+        if (self.view.frame.size.width > 50 && !objc_getAssociatedObject(self, kHNPMDumpedKey)) {
+            objc_setAssociatedObject(self, kHNPMDumpedKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+            HNPMAttachPanIfNeeded(self.view);
+            NSMutableString *chain = [NSMutableString stringWithString:@"[层级] 上级链: "];
+            UIView *p = self.view;
+            for (int i = 0; i < 5 && p; i++) {
+                [chain appendFormat:@"%@%@(%@)", i ? @" <- " : @"", NSStringFromClass([p class]), NSStringFromCGRect(p.frame)];
+                p = p.superview;
+            }
+            HNPMAppendLog(chain);
+            NSMutableString *tree = [NSMutableString stringWithString:@"[层级] 卡片视图树:\n"];
+            NSInteger count = 0;
+            HNPMDumpViewTree(self.view, tree, 0, &count);
+            HNPMAppendLog(tree);
+        }
+    } @catch (NSException *e) {}
 }
 %end
 %end
@@ -422,12 +463,12 @@ static void HNPMAttachPanIfNeeded(UIView *view) {
 #pragma mark - 入口
 
 __attribute__((constructor)) static void HNPMRawCtor(void) {
-    HNPMAppendLog(@"v0.0.6: dylib 构造函数已执行(dyld 加载成功)");
+    HNPMAppendLog(@"v0.0.7: dylib 构造函数已执行(dyld 加载成功)");
 }
 
 %ctor {
     @autoreleasepool {
-        HNPMAppendLog(@"v0.0.6: logos %ctor 进入");
+        HNPMAppendLog(@"v0.0.7: logos %ctor 进入");
 
         // 紧急开关
         if ([[NSFileManager defaultManager] fileExistsAtPath:@"/var/mobile/Documents/HideNowPlaying.off"]) {
@@ -462,6 +503,6 @@ __attribute__((constructor)) static void HNPMRawCtor(void) {
         if (objc_getClass("MRUAmbientCompactNowPlayingViewController")) { %init(HNPMAmbientCompact); }
         if (objc_getClass("SBLockScreenNowPlayingController")) { %init(HNPMInspector); }
 
-        HNPMAppendLog(@"v0.0.6: %ctor 正常完成");
+        HNPMAppendLog(@"v0.0.7: %ctor 正常完成");
     }
 }
