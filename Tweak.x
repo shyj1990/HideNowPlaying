@@ -134,6 +134,18 @@ static void HNPMDumpClasses(void) {
 
 #pragma mark - Hook
 
+// 各 iOS 版本的候选类声明(不存在于系统的会在运行时自动跳过)
+@interface MRMediaControlsViewController : UIViewController
+@end
+@interface SBDashBoardAggregatedMusicPlayerViewController : UIViewController
+@end
+@interface SBDashBoardNowPlayingViewController : UIViewController
+@end
+@interface SBLockScreenNowPlayingViewController : UIViewController
+@end
+@interface SBFloatingMediaControlsViewController : UIViewController
+@end
+
 // iOS 16+ 统一媒体控件基类(灵动岛播放器 / 控制中心播放器)
 %hook MRMediaControlsViewController
 - (void)viewDidLayoutSubviews  { %orig; HNPMSetupView(self.view); }
