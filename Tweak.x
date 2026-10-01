@@ -1,17 +1,17 @@
-// HideNowPlaying v0.0.8 — 锁屏结构侦察版
+// HideNowPlaying v0.0.9 — 锁屏结构侦察版 2(全量扫描)
 //
-// v0.0.7 真机日志重大发现(iPhone 15 Pro / iOS 17.0 / relaxin):
-//   MRUNowPlayingViewController 的视图层级链是
-//     MRUNowPlayingView(159x159) <- UIView <- MRUControlCenterView <- CCUIContentModuleContentContainerView
-//   → 它是"控制中心"的正在播放模块磁贴, 不是锁屏播放卡片!
-//   锁屏上真正显示的播放卡片来自其它类(嫌疑: MediaControls* / MPUControlCenterMediaModule*),
-//   只在"媒体播放+锁屏"时才加载, 注销瞬间探测不到。
+// v0.0.8 侦察结论(iPhone 15 Pro / iOS 17.0 / relaxin):
+//   ✅ 放歌+锁屏时, SBCoverSheetWindow(锁屏窗口, key=1)里存在 341x251 的
+//      BSUIVibrancyBackdropView —— 尺寸正好是锁屏播放卡片 → 卡片就在这个窗口里
+//   ❌ 但卡片的内容视图类名不含 v0.0.8 的关键词(Media/Player/NowPlaying/Controls/
+//      Ambient/Backdrop/DashBoard/Island), 所以只拍到背景板
+//   ❌ 侦察触发依赖"播放开始跳变", 只拍了一次; 播放中应持续拍
 //
-// v0.0.8 做法: 插件盯着播放状态, 每当"开始播放"→ 3 秒后自动把 SpringBoard 所有窗口里
-//   媒体相关的可见视图子树写进日志(每 15 秒最多一次, 最多 3 次)。
-//   用户操作: 放歌 → 锁屏 → 等半分钟 → 同步日志, 即可拿到锁屏播放卡片真实类名和层级。
+// v0.0.9 做法:
+//   1. 对锁屏窗口 SBCoverSheetWindow 做全量子树扫描(不靠关键词), 深度6/上限220节点
+//   2. 其它窗口仍按关键词扫描, 但关键词扩充(MPU/Music 等), 命中时连上级3层一起拍
+//   3. 触发改为: 播放期间每 15 秒拍一次(最多 4 次), 首次在开始播放 2 秒后
 //
-// 隐藏/恢复机制本版处于休眠状态(等待侦察结果后在下一版启用)。
 // 日志: /var/mobile/Documents/HideNowPlaying.log
 
 #import <UIKit/UIKit.h>
@@ -61,9 +61,9 @@ static void HNPMLogThrottled(NSString *text) {
 
 static NSTimer *hnpmTimer = nil;             // 1 秒轮询定时器
 static BOOL hnpmPrevPlaying = NO;            // 上一秒是否在播放
-static int hnpmDumpCount = 0;                // 已侦察次数(最多 3 次)
+static int hnpmDumpCount = 0;                // 已侦察次数(最多 4 次)
 static CFAbsoluteTime hnpmLastDump = 0;      // 上次侦察时间
-static NSHashTable *hnpmCardViews = nil;     // 弱引用表: 疑似锁屏卡片视图(下一版用)
+static NSHashTable *hnpmCardViews = nil;     // 弱引用表: 疑似卡片视图(下一版用)
 static NSHashTable *hnpmAmbientViews = nil;  // 弱引用表: 疑似灵动岛视图(下一版用)
 
 #pragma mark - MediaRemote(运行时 dlopen, 无需链接参数)
@@ -73,23 +73,10 @@ static HNPMGetInfoFunc hnpmGetInfo = NULL;
 
 #pragma mark - 视图树侦察
 
-// 是否为"值得侦察"的节点: 可见 + 有实际尺寸 + 类名含媒体关键词
-static BOOL HNPMInteresting(UIView *v) {
-    @try {
-        if (!v || v.hidden || v.alpha < 0.05) return NO;
-        if (v.frame.size.width < 40 || v.frame.size.height < 40) return NO;
-        NSString *n = NSStringFromClass([v class]);
-        return ([n containsString:@"Media"] || [n containsString:@"NowPlaying"] ||
-                [n containsString:@"Controls"] || [n containsString:@"Player"] ||
-                [n containsString:@"Ambient"] || [n containsString:@"Backdrop"] ||
-                [n containsString:@"DashBoard"] || [n containsString:@"Island"]);
-    } @catch (NSException *e) { return NO; }
-}
-
 // 输出一棵子树(带缩进/尺寸/手势列表)
-static void HNPMSubtree(UIView *v, NSMutableString *out, NSInteger depth, NSInteger *count) {
+static void HNPMSubtree(UIView *v, NSMutableString *out, NSInteger depth, NSInteger *count, NSInteger cap, NSInteger maxDepth) {
     @try {
-        if (!v || *count > 100 || depth > 6) return;
+        if (!v || *count > cap || depth > maxDepth) return;
         (*count)++;
         NSString *indent = depth > 0 ? [@"" stringByPaddingToLength:(NSUInteger)(depth * 2) withString:@" " startingAtIndex:0] : @"";
         [out appendFormat:@"%@%@ frame=%@ hidden=%d alpha=%.1f userInt=%d",
@@ -102,17 +89,33 @@ static void HNPMSubtree(UIView *v, NSMutableString *out, NSInteger depth, NSInte
             [out appendFormat:@" GR<%@>", [names componentsJoinedByString:@","]];
         }
         [out appendString:@"\n"];
-        for (UIView *s in [v subviews]) HNPMSubtree(s, out, depth + 1, count);
+        for (UIView *s in [v subviews]) HNPMSubtree(s, out, depth + 1, count, cap, maxDepth);
     } @catch (NSException *e) {}
 }
 
-// 递归搜索: 命中关键词的可见节点 → 输出其子树, 并停止向下重复搜索
+// 关键词命中判定(可见 + 有尺寸)
+static BOOL HNPMInteresting(UIView *v) {
+    @try {
+        if (!v || v.hidden || v.alpha < 0.05) return NO;
+        if (v.frame.size.width < 40 || v.frame.size.height < 40) return NO;
+        NSString *n = NSStringFromClass([v class]);
+        return ([n containsString:@"Media"] || [n containsString:@"NowPlaying"] ||
+                [n containsString:@"Controls"] || [n containsString:@"Player"] ||
+                [n containsString:@"Ambient"] || [n containsString:@"Backdrop"] ||
+                [n containsString:@"DashBoard"] || [n containsString:@"Island"] ||
+                [n containsString:@"MPU"] || [n containsString:@"Music"]);
+    } @catch (NSException *e) { return NO; }
+}
+
+// 递归搜索(其它窗口用): 命中 → 连同上级 3 层的整棵子树一起输出
 static void HNPMSearchTree(UIView *v, NSMutableString *out, NSInteger *count) {
     @try {
-        if (!v || *count > 140) return;
+        if (!v || *count > 300) return;
         if (HNPMInteresting(v)) {
-            HNPMSubtree(v, out, 0, count);
-            [out appendString:@"  ---[子树结束]---\n"];
+            UIView *root = v;
+            for (int i = 0; i < 3 && root.superview; i++) root = root.superview;   // 上溯 3 层
+            HNPMSubtree(root, out, 0, count, 150, 8);
+            [out appendString:@"  ---[周边子树结束]---\n"];
             return;
         }
         for (UIView *s in [v subviews]) HNPMSearchTree(s, out, count);
@@ -124,21 +127,29 @@ static void HNPMReconDump(NSString *reason) {
         hnpmLastDump = CFAbsoluteTimeGetCurrent();
         NSMutableString *out = [NSMutableString stringWithFormat:@"[侦察] 原因=%@ 时间=%@\n", reason, [NSDate date]];
         NSArray *windows = [UIApplication sharedApplication].windows;
-        [out appendFormat:@"[侦察] 窗口数=%lu\n", (unsigned long)windows.count];
         for (UIWindow *w in windows) {
+            if ([w isKindOfClass:[UIWindow class]] == NO) continue;
             [out appendFormat:@"[窗口] %@ frame=%@ hidden=%d alpha=%.1f key=%d\n",
              NSStringFromClass([w class]), NSStringFromCGRect(w.frame),
              w.hidden ? 1 : 0, w.alpha, w.isKeyWindow ? 1 : 0];
         }
         for (UIWindow *w in windows) {
             if (w.hidden) continue;
+            NSString *wc = NSStringFromClass([w class]);
             NSInteger count = 0;
-            NSMutableString *tree = [NSMutableString stringWithFormat:@"[侦察] 窗口 %@ 命中:\n", NSStringFromClass([w class])];
-            HNPMSearchTree(w, tree, &count);
-            if (count > 0) [out appendString:tree];
+            if ([wc containsString:@"CoverSheet"]) {
+                // 锁屏窗口: 全量扫描(不靠关键词)
+                NSMutableString *tree = [NSMutableString stringWithFormat:@"[侦察] 锁屏窗口 %@ 全量树:\n", wc];
+                HNPMSubtree(w, tree, 0, &count, 220, 6);
+                [out appendString:tree];
+            } else {
+                NSMutableString *tree = [NSMutableString stringWithFormat:@"[侦察] 窗口 %@ 命中:\n", wc];
+                HNPMSearchTree(w, tree, &count);
+                if (count > 0) [out appendString:tree];
+            }
         }
         HNPMAppendLog(out);
-        HNPMAppendLog([NSString stringWithFormat:@"[侦察] 本轮完成(已侦察 %d/3 次)", hnpmDumpCount]);
+        HNPMAppendLog([NSString stringWithFormat:@"[侦察] 本轮完成(已侦察 %d/4 次)", hnpmDumpCount]);
     } @catch (NSException *e) {
         HNPMAppendLog(@"[侦察] 执行异常");
     }
@@ -160,13 +171,14 @@ static void HNPMCheckPlayback(void) {
                 BOOL playing = (hasInfo && rate > 0.05);
                 dispatch_async(dispatch_get_main_queue(), ^{
                     @try {
-                        // 检测到"开始播放"的跳变 → 3 秒后侦察一次(最多 3 次, 间隔 15 秒以上)
-                        if (playing && !hnpmPrevPlaying && hnpmDumpCount < 3 &&
+                        // 播放中每 15 秒侦察一次(最多 4 次); 首次在开始播放 2 秒后
+                        if (playing && hnpmDumpCount < 4 &&
                             CFAbsoluteTimeGetCurrent() - hnpmLastDump > 15) {
                             hnpmDumpCount++;
-                            HNPMAppendLog([NSString stringWithFormat:@"[侦察] 检测到开始播放(第 %d 次), 3 秒后侦察视图结构...", hnpmDumpCount]);
-                            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-                                HNPMReconDump(@"开始播放");
+                            BOOL first = (hnpmDumpCount == 1);
+                            NSTimeInterval delay = first ? 2.0 : 0.0;
+                            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delay * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+                                HNPMReconDump(first ? @"开始播放" : @"播放中持续侦察");
                             });
                         }
                         hnpmPrevPlaying = playing;
@@ -189,7 +201,6 @@ static void HNPMCheckPlayback(void) {
 
 #pragma mark - hooks
 
-// 控制中心模块(已确认身份, 保留时间线日志 + 视图登记, 下一版可能复用)
 %group HNPMCardView
 %hook MRUNowPlayingView
 - (void)didMoveToWindow {
@@ -216,28 +227,6 @@ static void HNPMCheckPlayback(void) {
 %end
 %end
 
-%group HNPMContainerView
-%hook MRUNowPlayingContainerView
-- (void)didMoveToWindow {
-    %orig;
-    @try {
-        HNPMLogThrottled([NSString stringWithFormat:@"[跟踪] MRUNowPlayingContainerView 入窗口 frame=%@",
-                          NSStringFromCGRect(self.frame)]);
-    } @catch (NSException *e) {}
-}
-%end
-%end
-
-%group HNPMCard
-%hook MRUNowPlayingViewController
-- (void)viewDidLoad {
-    %orig;
-    @try { HNPMAppendLog(@"[跟踪] MRUNowPlayingViewController(控制中心模块) viewDidLoad"); } @catch (NSException *e) {}
-}
-%end
-%end
-
-// 灵动岛疑似视图(跟踪登记)
 %group HNPMAmbientViewFull
 %hook MRUAmbientNowPlayingView
 - (void)didMoveToWindow {
@@ -303,12 +292,12 @@ static void HNPMCheckPlayback(void) {
 #pragma mark - 入口
 
 __attribute__((constructor)) static void HNPMRawCtor(void) {
-    HNPMAppendLog(@"v0.0.8: dylib 构造函数已执行(dyld 加载成功)");
+    HNPMAppendLog(@"v0.0.9: dylib 构造函数已执行(dyld 加载成功)");
 }
 
 %ctor {
     @autoreleasepool {
-        HNPMAppendLog(@"v0.0.8: logos %ctor 进入");
+        HNPMAppendLog(@"v0.0.9: logos %ctor 进入");
 
         // 紧急开关
         if ([[NSFileManager defaultManager] fileExistsAtPath:@"/var/mobile/Documents/HideNowPlaying.off"]) {
@@ -335,17 +324,14 @@ __attribute__((constructor)) static void HNPMRawCtor(void) {
             }];
             [[NSRunLoop mainRunLoop] addTimer:t forMode:NSRunLoopCommonModes];
             hnpmTimer = t;
-            HNPMAppendLog(@"播放状态轮询已启动(1s), 检测到开始播放将自动侦察视图结构");
+            HNPMAppendLog(@"播放状态轮询已启动(1s), 播放期间每 15 秒侦察一次");
         }
 
-        // 按类存在性注册跟踪 hook
         if (objc_getClass("MRUNowPlayingView"))            { %init(HNPMCardView); }
         if (objc_getClass("MRUNowPlayingCellContentView")) { %init(HNPMCellView); }
-        if (objc_getClass("MRUNowPlayingContainerView"))   { %init(HNPMContainerView); }
-        if (objc_getClass("MRUNowPlayingViewController"))  { %init(HNPMCard); }
         if (objc_getClass("MRUAmbientNowPlayingView"))     { %init(HNPMAmbientViewFull); }
         if (objc_getClass("MRUAmbientCompactNowPlayingView")) { %init(HNPMAmbientViewCompact); }
         if (objc_getClass("SBLockScreenNowPlayingController")) { %init(HNPMInspector); }
-        HNPMAppendLog(@"v0.0.8: %ctor 正常完成(hook 全部按需注册)");
+        HNPMAppendLog(@"v0.0.9: %ctor 正常完成(hook 全部按需注册)");
     }
 }
