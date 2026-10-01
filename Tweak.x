@@ -1,17 +1,19 @@
-// HideNowPlaying v0.0.13 — 精修版(动画 + 恢复修复 + 通知误伤修复)
+// HideNowPlaying v0.0.14 — 灵动岛恢复修复版(透明度方案)
 //
-// v0.0.12 用户反馈:
-//   ✅ 左滑隐藏卡片(音乐继续) / 暂停→播放恢复卡片 均正常
-//   ❌ 灵动岛隐藏后, 暂停→播放没有恢复 → 修复: 恢复时全量扫描所有窗口,
-//      强制恢复所有通知单元格/灵动岛视图的显示(补漏二次修复)
-//   ❌ 其他 app 的通知也消失了 → 修复: 根因是普通通知内容也用 CSActivityItemContentView,
-//      之前全部登记隐藏; 现在只认尺寸 >=300x140 的媒体卡片
-//   ✅ 隐藏灵动岛内容正是想要的, 保留
-//   ➕ 新增: 左滑"向左滑出屏幕"动画, 恢复时淡入
+// v0.0.13 用户反馈:
+//   ✅ 左滑滑出动画正常
+//   ✅ 其他 app 通知恢复正常(尺寸过滤生效)
+//   ❌ 灵动岛恢复后是全黑的(长度对但没内容) → 根因: 灵动岛媒体内容是远程进程
+//      渲染的门户图层(_SAUIPortalView), hidden=YES 把视图从渲染树摘掉后远程进程
+//      停止供给内容, 恢复时只剩黑壳
+//   ✅ 卡片滑出/恢复/暂停再播 全正常
 //
-// 结构(iPhone 15 Pro / iOS 17.0 / relaxin 实测):
-//   锁屏卡片 = NCNotificationListCell(365x167) → PLPlatterView → CSActivityItemContentView(远程渲染)
-//   灵动岛   = SAUIElementView → _SAUIElementViewContentView + _SAUIProvidedViewContainerView(门户)
+// v0.0.14 方案: 灵动岛改用"整体透明"(alpha 0/1), 不再碰 hidden:
+//   - 图层留在渲染树里, 远程内容持续供给, 恢复即显示
+//   - 系统自己切换灵动岛状态也用 alpha 动画, 这是它原生支持的状态
+//   - 隐藏期间每 0.5 秒重申 alpha=0(对抗系统自身动画把透明度改回去)
+//   - 恢复时 alpha 动画回 1, 不需要修复
+//   锁屏卡片维持 v0.0.13 逻辑(滑出动画+hidden, 实测卡片远程场景不受影响)
 //
 // 日志: /var/mobile/Documents/HideNowPlaying.log   紧急开关: /var/mobile/Documents/HideNowPlaying.off
 
@@ -65,8 +67,8 @@ static BOOL hnpmHidden = NO;
 static BOOL hnpmBaseline = NO;
 static BOOL hnpmLastPlaying = NO;
 static int  hnpmPauseStreak = 0;
-static NSHashTable *hnpmCardViews = nil;      // 弱引用: 媒体卡片(单元格+内容)
-static NSHashTable *hnpmIslandViews = nil;    // 弱引用: 灵动岛媒体相关视图
+static NSHashTable *hnpmCardViews = nil;       // 弱引用: 媒体卡片(单元格+内容)
+static NSHashTable *hnpmIslandContainers = nil; // 弱引用: 灵动岛整体容器
 static void *kHNPMPanKey = &kHNPMPanKey;
 
 #pragma mark - MediaRemote
@@ -76,14 +78,13 @@ static HNPMGetInfoFunc hnpmGetInfo = NULL;
 
 #pragma mark - 媒体卡片判定
 
-// 只有媒体实况卡片才有这个尺寸(实测 365x167); 普通通知更矮, 严格过滤防误伤
 static BOOL HNPMIsMediaSized(CGSize size) {
     return size.width >= 300 && size.height >= 140;
 }
 
 #pragma mark - 隐藏 / 恢复(带动画)
 
-// 卡片滑出/滑入
+// 卡片滑出/滑入(卡片是本地场景托管, hidden 方案实测正常)
 static void HNPMAnimateCard(UIView *cell, BOOL hide) {
     @try {
         if (hide) {
@@ -121,50 +122,30 @@ static void HNPMAnimateCard(UIView *cell, BOOL hide) {
     }
 }
 
-// 灵动岛内容淡出/淡入
-static void HNPMAnimateIsland(UIView *v, BOOL hide) {
-    @try {
-        if (hide) {
-            [UIView animateWithDuration:0.25 animations:^{ v.alpha = 0.0; }
-                             completion:^(BOOL finished) {
-                @try {
-                    if (hnpmHidden) v.hidden = YES;
-                    v.alpha = 1.0;
-                } @catch (NSException *e) {}
-            }];
-        } else {
-            v.hidden = NO;
-            v.alpha = 0.0;
-            [UIView animateWithDuration:0.25 animations:^{ v.alpha = 1.0; }
-                             completion:nil];
-        }
-    } @catch (NSException *e) {
-        v.hidden = hide;
-    }
-}
-
-static void HNPMApplyHiddenAnimated(BOOL hide) {
+// 灵动岛: 只动透明度, 不碰 hidden(保住远程渲染内容)
+static void HNPMApplyIslandAlpha(BOOL hide, BOOL animated) {
     dispatch_async(dispatch_get_main_queue(), ^{
         @try {
-            for (UIView *v in hnpmCardViews) {
-                if ([NSStringFromClass([v class]) containsString:@"Cell"]) {
-                    HNPMAnimateCard(v, hide);          // 单元格: 滑出/滑入
+            for (UIView *v in hnpmIslandContainers) {
+                if (hide) {
+                    if (animated && v.alpha > 0.0) {
+                        [UIView animateWithDuration:0.25 animations:^{ v.alpha = 0.0; }];
+                    } else if (!animated) {
+                        v.alpha = 0.0;
+                    }
                 } else {
-                    HNPMAnimateIsland(v, hide);        // 卡片内容视图: 淡出/淡入
+                    if (animated && v.alpha < 1.0) {
+                        [UIView animateWithDuration:0.25 animations:^{ v.alpha = 1.0; }];
+                    } else if (!animated) {
+                        v.alpha = 1.0;
+                    }
                 }
-            }
-            for (UIView *v in hnpmIslandViews) {
-                // 门户只处理媒体尺寸(>=30)的
-                if ([NSStringFromClass([v class]) containsString:@"ProvidedViewContainer"] &&
-                    v.frame.size.width < 30 && v.frame.size.height < 30) continue;
-                HNPMAnimateIsland(v, hide);
             }
         } @catch (NSException *e) {}
     });
 }
 
-// 全量修复: 扫描所有窗口, 把我们可能隐藏过的视图强制恢复显示
-// (解决"灵动岛/通知恢复失败": 视图复用或重建导致弱引用失效的情况)
+// 全量修复: 恢复时把通知列表里可能遗留隐藏的单元格强制恢复
 static void HNPMFullHeal(NSString *reason) {
     dispatch_async(dispatch_get_main_queue(), ^{
         @try {
@@ -175,15 +156,10 @@ static void HNPMFullHeal(NSString *reason) {
                     UIView *v = stack.firstObject;
                     [stack removeObjectAtIndex:0];
                     if (!v) continue;
-                    NSString *n = NSStringFromClass([v class]);
-                    if ([n isEqualToString:@"NCNotificationListCell"] ||
-                        [n isEqualToString:@"_SAUIElementViewContentView"] ||
-                        [n isEqualToString:@"_SAUIProvidedViewContainerView"]) {
+                    if ([NSStringFromClass([v class]) isEqualToString:@"NCNotificationListCell"]) {
                         if (v.hidden) { v.hidden = NO; healed++; }
-                        if ([n isEqualToString:@"NCNotificationListCell"]) {
-                            if (!CGAffineTransformIsIdentity(v.transform)) v.transform = CGAffineTransformIdentity;
-                            if (v.alpha < 1.0) v.alpha = 1.0;
-                        }
+                        if (!CGAffineTransformIsIdentity(v.transform)) { v.transform = CGAffineTransformIdentity; healed++; }
+                        if (v.alpha < 1.0) { v.alpha = 1.0; healed++; }
                     }
                     [stack addObjectsFromArray:[v subviews]];
                 }
@@ -198,12 +174,19 @@ static void HNPMSetHidden(BOOL hide, NSString *reason) {
     hnpmHidden = hide;
     hnpmBaseline = NO;
     hnpmPauseStreak = 0;
-    if (hide) {
-        HNPMApplyHiddenAnimated(YES);
-    } else {
-        HNPMApplyHiddenAnimated(NO);
+    dispatch_async(dispatch_get_main_queue(), ^{
+        @try {
+            for (UIView *v in hnpmCardViews) {
+                if ([NSStringFromClass([v class]) containsString:@"Cell"]) {
+                    HNPMAnimateCard(v, hide);
+                }
+                // 卡片内容视图由单元格整体带动, 不单独处理
+            }
+        } @catch (NSException *e) {}
+    });
+    HNPMApplyIslandAlpha(hide, YES);
+    if (!hide) {
         HNPMFullHeal(@"恢复显示");
-        // 二次补漏: 1 秒后再修复一次(覆盖恢复瞬间重建的视图)
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
             if (!hnpmHidden) HNPMFullHeal(@"恢复补漏");
         });
@@ -212,7 +195,7 @@ static void HNPMSetHidden(BOOL hide, NSString *reason) {
                    reason, hide ? @"已隐藏(音乐继续)" : @"已恢复显示"]);
 }
 
-// 0.5 秒轮询: 隐藏期间检测"暂停→继续播放"
+// 0.5 秒轮询: 隐藏期间 ① 检测"暂停→继续播放"恢复 ② 重申灵动岛透明度
 static void HNPMStartRestorePolling(void) {
     dispatch_async(dispatch_get_main_queue(), ^{
         @try {
@@ -225,6 +208,8 @@ static void HNPMStartRestorePolling(void) {
                         restoreTimer = nil;
                         return;
                     }
+                    // 重申灵动岛透明度(对抗系统自身动画)
+                    HNPMApplyIslandAlpha(YES, NO);
                     if (!hnpmGetInfo) return;
                     hnpmGetInfo(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^(CFDictionaryRef info) {
                         @try {
@@ -325,8 +310,7 @@ static void HNPMAttachPanIfNeeded(UIView *view) {
 #pragma mark - 类声明
 
 @interface CSActivityItemContentView : UIView @end
-@interface _SAUIProvidedViewContainerView : UIView @end
-@interface _SAUIElementViewContentView : UIView @end
+@interface SBSystemApertureContainerView : UIView @end
 @interface NCNotificationListCell : UIView @end
 
 #pragma mark - hooks
@@ -347,7 +331,6 @@ static void HNPMAttachPanIfNeeded(UIView *view) {
                 while (p && ![p isKindOfClass:cellClass]) p = p.superview;
                 if (!p) return;
                 UIView *cell = p;
-                [hnpmCardViews addObject:self];
                 [hnpmCardViews addObject:cell];
                 HNPMAttachPanIfNeeded(cell);
                 HNPMLogThrottled([NSString stringWithFormat:@"[卡片] 媒体卡片已登记 单元格=%@ 内容=%@",
@@ -365,37 +348,16 @@ static void HNPMAttachPanIfNeeded(UIView *view) {
 %end
 %end
 
-// 灵动岛: 元素内容视图(锁图标+媒体图标)
-%group HNPMIslandElement
-%hook _SAUIElementViewContentView
+// 灵动岛整体容器: 只登记, 用透明度控制(不碰 hidden, 保住远程内容)
+%group HNPMIslandContainer
+%hook SBSystemApertureContainerView
 - (void)didMoveToWindow {
     %orig;
     @try {
         if (!self.window) return;
-        [hnpmIslandViews addObject:self];
-        if (self.frame.size.width > 0) {
-            HNPMLogThrottled([NSString stringWithFormat:@"[灵动岛] 元素内容登记 frame=%@",
-                              NSStringFromCGRect(self.frame)]);
-        }
-        if (hnpmHidden) self.hidden = YES;
-    } @catch (NSException *e) {}
-}
-%end
-%end
-
-// 灵动岛: 门户容器(媒体内容远程渲染)
-%group HNPMIslandPortal
-%hook _SAUIProvidedViewContainerView
-- (void)didMoveToWindow {
-    %orig;
-    @try {
-        if (!self.window) return;
-        [hnpmIslandViews addObject:self];
-        if (self.frame.size.width > 0) {
-            HNPMLogThrottled([NSString stringWithFormat:@"[灵动岛] 门户登记 frame=%@",
-                              NSStringFromCGRect(self.frame)]);
-        }
-        if (hnpmHidden) self.hidden = YES;
+        [hnpmIslandContainers addObject:self];
+        HNPMLogThrottled([NSString stringWithFormat:@"[灵动岛] 容器登记 frame=%@", NSStringFromCGRect(self.frame)]);
+        if (hnpmHidden) self.alpha = 0.0;
     } @catch (NSException *e) {}
 }
 %end
@@ -404,12 +366,12 @@ static void HNPMAttachPanIfNeeded(UIView *view) {
 #pragma mark - 入口
 
 __attribute__((constructor)) static void HNPMRawCtor(void) {
-    HNPMAppendLog(@"v0.0.13: dylib 构造函数已执行(dyld 加载成功)");
+    HNPMAppendLog(@"v0.0.14: dylib 构造函数已执行(dyld 加载成功)");
 }
 
 %ctor {
     @autoreleasepool {
-        HNPMAppendLog(@"v0.0.13: logos %ctor 进入");
+        HNPMAppendLog(@"v0.0.14: logos %ctor 进入");
 
         if ([[NSFileManager defaultManager] fileExistsAtPath:@"/var/mobile/Documents/HideNowPlaying.off"]) {
             HNPMAppendLog(@"检测到开关文件 HideNowPlaying.off, 不注册任何 hook");
@@ -417,7 +379,7 @@ __attribute__((constructor)) static void HNPMRawCtor(void) {
         }
 
         hnpmCardViews = [NSHashTable weakObjectsHashTable];
-        hnpmIslandViews = [NSHashTable weakObjectsHashTable];
+        hnpmIslandContainers = [NSHashTable weakObjectsHashTable];
         hnpmPanTarget = [[HNPMPanTarget alloc] init];
 
         void *mr = dlopen("/System/Library/PrivateFrameworks/MediaRemote.framework/MediaRemote", RTLD_LAZY);
@@ -428,9 +390,8 @@ __attribute__((constructor)) static void HNPMRawCtor(void) {
             HNPMAppendLog(@"MediaRemote 加载失败");
         }
 
-        if (objc_getClass("CSActivityItemContentView"))       { %init(HNPMActivityCard); HNPMAppendLog(@"hook 已注册: 媒体卡片(尺寸过滤>=300x140)"); }
-        if (objc_getClass("_SAUIElementViewContentView"))     { %init(HNPMIslandElement); }
-        if (objc_getClass("_SAUIProvidedViewContainerView"))  { %init(HNPMIslandPortal); }
-        HNPMAppendLog(@"v0.0.13: %ctor 正常完成(动画+全量修复+通知保护)");
+        if (objc_getClass("CSActivityItemContentView"))      { %init(HNPMActivityCard); HNPMAppendLog(@"hook 已注册: 媒体卡片(尺寸过滤>=300x140)"); }
+        if (objc_getClass("SBSystemApertureContainerView"))  { %init(HNPMIslandContainer); HNPMAppendLog(@"hook 已注册: 灵动岛容器(透明度方案)"); }
+        HNPMAppendLog(@"v0.0.14: %ctor 正常完成(灵动岛 alpha 方案)");
     }
 }
