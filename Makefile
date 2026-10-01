@@ -8,7 +8,6 @@ include $(THEOS)/makefiles/common.mk
 TWEAK_NAME = HideNowPlaying
 HideNowPlaying_FILES = Tweak.x
 HideNowPlaying_CFLAGS = -fobjc-arc
-HideNowPlaying_LDFLAGS = -Wl,-undefined,dynamic_lookup
 HideNowPlaying_FRAMEWORKS = UIKit Foundation
 
 include $(THEOS_MAKE_PATH)/tweak.mk
