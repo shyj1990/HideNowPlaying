@@ -1,16 +1,16 @@
-// HideNowPlaying v0.0.5 — 功能试验版
+// HideNowPlaying v0.0.6 — 左滑触发修复版
 //
-// 依据 v0.0.4 探针日志(iPhone 15 Pro / iOS 17.0 / relaxin)确认的真实类名:
-//   锁屏播放卡片(推测宿主): MRUNowPlayingViewController
-//   灵动岛播放器:           MRUAmbientNowPlayingViewController / MRUAmbientCompactNowPlayingViewController
-//   锁屏正在播放控制器:      SBLockScreenNowPlayingController(只做一次性 ivar 诊断, 便于下版迭代)
-//   (旧候选 SBDashBoardAggregatedMusicPlayerViewController 等在 iOS 17 上均不存在, 已弃用)
+// v0.0.5 真机日志结论(iPhone 15 Pro / iOS 17.0 / relaxin):
+//   ✅ MRUNowPlayingViewController 就是锁屏播放卡片(viewDidLoad/viewWillAppear 正常触发)
+//   ✅ hook 注册 / MediaRemote 播放速率检测全部正常
+//   ❌ 挂在卡片 VC 根视图上的滑动手势收不到任何触摸(用户"滑不动") → 手势改挂到真实内容视图
+//      MRUNowPlayingView 上, 并通过手势代理 shouldBeRequiredToFail 提升优先级
+//   ❌ 灵动岛两个 VC 的 viewWillAppear 从未触发 → 改为直接跟踪 MRUAmbient*View 视图实例
 //
-// 功能:
-//   1. 锁屏播放卡片上左滑 → 隐藏卡片和灵动岛播放器(音乐不暂停)
-//   2. 隐藏期间每 0.5s 检查播放速率: 出现"暂停(≥1秒)→继续播放"跳变 → 自动恢复显示
-//   3. 安全措施: 只 hook 真实存在的类 / 全部逻辑 @try 包裹 / 只做视图级操作(不改系统布局逻辑)
-//   4. 紧急开关: 存在 /var/mobile/Documents/HideNowPlaying.off 文件时不注册任何 hook
+// 功能(与 v0.0.5 相同):
+//   1. 锁屏播放卡片左滑 → 隐藏卡片和灵动岛播放器(音乐不暂停)
+//   2. 隐藏期间每 0.5s 检查播放速率: "暂停(≥1秒)→继续播放" → 自动恢复显示
+//   3. 安全措施: 只 hook 真实存在的类 / 全部逻辑 @try 包裹 / 紧急开关 HideNowPlaying.off
 //
 // 日志: /var/mobile/Documents/HideNowPlaying.log
 
@@ -25,6 +25,7 @@
 
 static void HNPMSetHidden(BOOL hide, NSString *reason);
 static void HNPMStopPolling(void);
+static void HNPMLogThrottled(NSString *text);
 
 #pragma mark - 日志
 
@@ -49,16 +50,27 @@ static void HNPMAppendLog(NSString *text) {
     }
 }
 
+// 限流日志: 同类高频事件(如触摸回调)每秒最多记一条, 防止日志爆炸
+static void HNPMLogThrottled(NSString *text) {
+    @try {
+        static CFAbsoluteTime last = 0;
+        CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
+        if (now - last < 1.0) return;
+        last = now;
+        HNPMAppendLog(text);
+    } @catch (NSException *e) {}
+}
+
 #pragma mark - 全局状态
 
 static BOOL hnpmHidden = NO;                  // 当前是否处于"已隐藏"状态
 static BOOL hnpmBaseline = NO;                // 是否完成隐藏后的第一次播放状态采样
 static BOOL hnpmLastPlaying = NO;             // 上一次采样的播放状态
-static int  hnpmPauseStreak = 0;              // 连续采样到"未在播放"的次数(防误判切歌瞬间)
+static int  hnpmPauseStreak = 0;              // 连续采样到"未在播放"的次数(防切歌瞬间误判)
 static NSTimer *hnpmTimer = nil;              // 恢复检测定时器
-static __weak UIView *hnpmCardView = nil;     // 锁屏播放卡片视图
-static __weak UIView *hnpmAmbientView = nil;  // 灵动岛播放视图
-static UIPanGestureRecognizer *hnpmPan = nil; // 左滑手势(全局只挂一个)
+static NSHashTable *hnpmCardViews = nil;      // 弱引用表: 锁屏卡片相关视图(MRUNowPlayingView / CellContentView)
+static NSHashTable *hnpmAmbientViews = nil;   // 弱引用表: 灵动岛播放视图(MRUAmbient*View)
+static void *kHNPMPanKey = &kHNPMPanKey;      // 关联对象 key: 标记已挂手势的视图
 
 #pragma mark - MediaRemote(运行时 dlopen, 无需链接参数)
 
@@ -135,8 +147,8 @@ static void HNPMStopPolling(void) {
 
 static void HNPMApplyHiddenToViews(BOOL hide) {
     @try {
-        if (hnpmCardView) hnpmCardView.hidden = hide;
-        if (hnpmAmbientView) hnpmAmbientView.hidden = hide;
+        for (UIView *v in hnpmCardViews)   { v.hidden = hide; }
+        for (UIView *v in hnpmAmbientViews){ v.hidden = hide; }
     } @catch (NSException *e) {}
 }
 
@@ -153,31 +165,79 @@ static void HNPMSetHidden(BOOL hide, NSString *reason) {
     dispatch_async(dispatch_get_main_queue(), ^{
         @try {
             HNPMApplyHiddenToViews(hide);
-            HNPMAppendLog([NSString stringWithFormat:@"%@ → 状态=%@", reason, hide ? @"已隐藏(音乐继续)" : @"已恢复显示"]);
+            HNPMAppendLog([NSString stringWithFormat:@"%@ → 状态=%@ (卡片视图%lu个/灵动岛视图%lu个)",
+                           reason, hide ? @"已隐藏(音乐继续)" : @"已恢复显示",
+                           (unsigned long)hnpmCardViews.count, (unsigned long)hnpmAmbientViews.count]);
         } @catch (NSException *e) {}
     });
 }
 
-#pragma mark - 左滑手势 target(独立对象, 生命周期与进程相同)
+#pragma mark - 左滑手势 target + 代理(独立对象, 生命周期与进程相同)
 
-@interface HNPMPanTarget : NSObject
+@interface HNPMPanTarget : NSObject <UIGestureRecognizerDelegate>
 @end
 
 @implementation HNPMPanTarget
+
 - (void)handlePan:(UIPanGestureRecognizer *)gr {
     @try {
         if (hnpmHidden) return;
-        if (gr.state != UIGestureRecognizerStateChanged) return;
         CGPoint t = [gr translationInView:gr.view];
-        // 左滑超过 60pt 且横向明显大于纵向 → 隐藏
-        if (t.x < -60 && fabs(t.x) > fabs(t.y) * 1.5) {
-            HNPMSetHidden(YES, @"锁屏播放卡片左滑");
+        CGPoint v = [gr velocityInView:gr.view];
+        if (gr.state == UIGestureRecognizerStateChanged) {
+            HNPMLogThrottled([NSString stringWithFormat:@"[手势] 移动中 t=(%.0f,%.0f) v=(%.0f,%.0f)", t.x, t.y, v.x, v.y]);
+            if (t.x < -60 && fabs(t.x) > fabs(t.y) * 1.5) {
+                HNPMSetHidden(YES, @"锁屏播放卡片左滑");
+            }
+        } else if (gr.state == UIGestureRecognizerStateEnded) {
+            // 快速轻扫也认(位移不足但速度够快)
+            if (t.x < -55 && fabs(t.x) > fabs(t.y) * 1.2 && v.x < -300) {
+                HNPMSetHidden(YES, @"锁屏播放卡片左滑(轻扫)");
+            }
         }
     } @catch (NSException *e) {}
 }
+
+// 只有"向左拖"的意图才让我们开始, 其它方向立即放弃, 把触摸还给系统
+- (BOOL)gestureRecognizerShouldBegin:(UIGestureRecognizer *)gr {
+    @try {
+        if (![gr isKindOfClass:[UIPanGestureRecognizer class]]) return NO;
+        UIPanGestureRecognizer *p = (UIPanGestureRecognizer *)gr;
+        CGPoint t = [p translationInView:p.view];
+        CGPoint v = [p velocityInView:p.view];
+        BOOL left = (t.x < 0 || v.x < -100) && fabs(t.x) > fabs(t.y);
+        HNPMLogThrottled([NSString stringWithFormat:@"[手势] shouldBegin t=(%.0f,%.0f) v=(%.0f,%.0f) → %@", t.x, t.y, v.x, v.y, left ? @"YES" : @"NO"]);
+        return left;
+    } @catch (NSException *e) { return NO; }
+}
+
+// 卡片内部的其它手势(按钮等)不受影响; 对卡片外层的手势(锁屏翻页等)我们优先
+- (BOOL)gestureRecognizer:(UIGestureRecognizer *)gr shouldBeRequiredToFailByGestureRecognizer:(UIGestureRecognizer *)other {
+    @try {
+        UIView *otherView = other.view;
+        UIView *card = gr.view;
+        if (!otherView || !card) return NO;
+        return ![otherView isDescendantOfView:card];
+    } @catch (NSException *e) { return NO; }
+}
+
 @end
 
 static HNPMPanTarget *hnpmPanTarget = nil;
+
+// 给视图挂左滑手势(每实例只挂一次)
+static void HNPMAttachPanIfNeeded(UIView *view) {
+    @try {
+        if (!hnpmPanTarget || !view || !view.window) return;
+        if (objc_getAssociatedObject(view, kHNPMPanKey)) return;
+        UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc] initWithTarget:hnpmPanTarget
+                                                                              action:@selector(handlePan:)];
+        pan.delegate = hnpmPanTarget;
+        pan.maximumNumberOfTouches = 1;
+        objc_setAssociatedObject(view, kHNPMPanKey, pan, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        [view addGestureRecognizer:pan];
+    } @catch (NSException *e) {}
+}
 
 #pragma mark - 类声明(供 logos 编译期使用)
 
@@ -185,30 +245,78 @@ static HNPMPanTarget *hnpmPanTarget = nil;
 @interface MRUAmbientNowPlayingViewController : UIViewController @end
 @interface MRUAmbientCompactNowPlayingViewController : UIViewController @end
 @interface SBLockScreenNowPlayingController : NSObject @end
+@interface MRUNowPlayingView : UIView @end
+@interface MRUNowPlayingCellContentView : UIView @end
+@interface MRUNowPlayingContainerView : UIView @end
+@interface MRUAmbientNowPlayingView : UIView @end
+@interface MRUAmbientCompactNowPlayingView : UIView @end
 
 #pragma mark - hooks
 
-// 锁屏播放卡片: 挂左滑手势 + 隐藏期间保持隐藏
+// ===== 锁屏卡片: 真实内容视图(手势挂载点) =====
+%group HNPMCardView
+%hook MRUNowPlayingView
+- (void)didMoveToWindow {
+    %orig;
+    @try {
+        [hnpmCardViews addObject:self];
+        // 若内容视图本身不允许交互, 触摸根本进不来(v0.0.5 滑不动的头号嫌疑) → 打开它
+        if (!self.userInteractionEnabled) {
+            self.userInteractionEnabled = YES;
+            HNPMAppendLog(@"[卡片] MRUNowPlayingView 原本 userInteractionEnabled=NO, 已改为 YES");
+        }
+        HNPMAttachPanIfNeeded(self);
+        HNPMLogThrottled([NSString stringWithFormat:@"[卡片] MRUNowPlayingView 入层级 frame=%@ superview=%@",
+                          NSStringFromCGRect(self.frame),
+                          self.superview ? NSStringFromClass([self.superview class]) : @"(无)"]);
+        if (hnpmHidden) self.hidden = YES;
+    } @catch (NSException *e) {}
+}
+%end
+%end
+
+// ===== 锁屏卡片: 单元内容视图(备用隐藏目标 + 层级诊断) =====
+%group HNPMCellView
+%hook MRUNowPlayingCellContentView
+- (void)didMoveToWindow {
+    %orig;
+    @try {
+        [hnpmCardViews addObject:self];
+        HNPMLogThrottled([NSString stringWithFormat:@"[卡片] MRUNowPlayingCellContentView 入层级 frame=%@",
+                          NSStringFromCGRect(self.frame)]);
+        if (hnpmHidden) self.hidden = YES;
+    } @catch (NSException *e) {}
+}
+%end
+%end
+
+// ===== 锁屏卡片: 容器视图(仅诊断层级, 不做隐藏) =====
+%group HNPMContainerView
+%hook MRUNowPlayingContainerView
+- (void)didMoveToWindow {
+    %orig;
+    @try {
+        HNPMLogThrottled([NSString stringWithFormat:@"[卡片] MRUNowPlayingContainerView 入层级 frame=%@",
+                          NSStringFromCGRect(self.frame)]);
+    } @catch (NSException *e) {}
+}
+%end
+%end
+
+// ===== 锁屏卡片 VC: 隐藏期间保持隐藏(上一版已验证会触发) =====
 %group HNPMCard
 %hook MRUNowPlayingViewController
 - (void)viewDidLoad {
     %orig;
     @try {
-        HNPMAppendLog([NSString stringWithFormat:@"[卡片] MRUNowPlayingViewController 出现 frame=%@",
-                       NSStringFromCGRect(self.view.bounds)]);
+        HNPMAppendLog(@"[卡片] MRUNowPlayingViewController viewDidLoad");
     } @catch (NSException *e) {}
 }
 - (void)viewWillAppear:(BOOL)animated {
     %orig;
     @try {
-        hnpmCardView = self.view;
-        if (!hnpmPan && hnpmPanTarget) {
-            UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc] initWithTarget:hnpmPanTarget
-                                                                                  action:@selector(handlePan:)];
-            [self.view addGestureRecognizer:pan];
-            hnpmPan = pan;
-            HNPMAppendLog(@"[卡片] 左滑手势已挂载");
-        }
+        HNPMLogThrottled([NSString stringWithFormat:@"[卡片] VC viewWillAppear view.frame=%@",
+                          NSStringFromCGRect(self.view.frame)]);
         if (hnpmHidden) self.view.hidden = YES;
     } @catch (NSException *e) {}
 }
@@ -219,17 +327,41 @@ static HNPMPanTarget *hnpmPanTarget = nil;
 %end
 %end
 
-// 灵动岛播放器(完整版): 隐藏期间保持隐藏
+// ===== 灵动岛: 直接跟踪视图实例(v0.0.5 里灵动岛 VC 从未触发, 改用视图层) =====
+%group HNPMAmbientViewFull
+%hook MRUAmbientNowPlayingView
+- (void)didMoveToWindow {
+    %orig;
+    @try {
+        [hnpmAmbientViews addObject:self];
+        HNPMLogThrottled([NSString stringWithFormat:@"[灵动岛] MRUAmbientNowPlayingView 入层级 frame=%@",
+                          NSStringFromCGRect(self.frame)]);
+        if (hnpmHidden) self.hidden = YES;
+    } @catch (NSException *e) {}
+}
+%end
+%end
+
+%group HNPMAmbientViewCompact
+%hook MRUAmbientCompactNowPlayingView
+- (void)didMoveToWindow {
+    %orig;
+    @try {
+        [hnpmAmbientViews addObject:self];
+        HNPMLogThrottled([NSString stringWithFormat:@"[灵动岛] MRUAmbientCompactNowPlayingView 入层级 frame=%@",
+                          NSStringFromCGRect(self.frame)]);
+        if (hnpmHidden) self.hidden = YES;
+    } @catch (NSException *e) {}
+}
+%end
+%end
+
+// ===== 灵动岛 VC: 保留(万一某些场景会触发, 多一层保险) =====
 %group HNPMAmbientFull
 %hook MRUAmbientNowPlayingViewController
 - (void)viewWillAppear:(BOOL)animated {
     %orig;
-    @try {
-        static BOOL logged = NO;
-        if (!logged) { logged = YES; HNPMAppendLog(@"[灵动岛] MRUAmbientNowPlayingViewController 出现"); }
-        hnpmAmbientView = self.view;
-        if (hnpmHidden) self.view.hidden = YES;
-    } @catch (NSException *e) {}
+    @try { if (hnpmHidden) self.view.hidden = YES; } @catch (NSException *e) {}
 }
 - (void)viewDidLayoutSubviews {
     %orig;
@@ -238,17 +370,11 @@ static HNPMPanTarget *hnpmPanTarget = nil;
 %end
 %end
 
-// 灵动岛播放器(紧凑版): 隐藏期间保持隐藏
 %group HNPMAmbientCompact
 %hook MRUAmbientCompactNowPlayingViewController
 - (void)viewWillAppear:(BOOL)animated {
     %orig;
-    @try {
-        static BOOL logged = NO;
-        if (!logged) { logged = YES; HNPMAppendLog(@"[灵动岛] MRUAmbientCompactNowPlayingViewController 出现"); }
-        hnpmAmbientView = self.view;
-        if (hnpmHidden) self.view.hidden = YES;
-    } @catch (NSException *e) {}
+    @try { if (hnpmHidden) self.view.hidden = YES; } @catch (NSException *e) {}
 }
 - (void)viewDidLayoutSubviews {
     %orig;
@@ -257,7 +383,7 @@ static HNPMPanTarget *hnpmPanTarget = nil;
 %end
 %end
 
-// 一次性诊断: SBLockScreenNowPlayingController 的成员变量(若卡片不在上述类里, 从这里找线索)
+// ===== 一次性诊断: SBLockScreenNowPlayingController 成员变量 =====
 %group HNPMInspector
 %hook SBLockScreenNowPlayingController
 - (instancetype)init {
@@ -296,12 +422,12 @@ static HNPMPanTarget *hnpmPanTarget = nil;
 #pragma mark - 入口
 
 __attribute__((constructor)) static void HNPMRawCtor(void) {
-    HNPMAppendLog(@"v0.0.5: dylib 构造函数已执行(dyld 加载成功)");
+    HNPMAppendLog(@"v0.0.6: dylib 构造函数已执行(dyld 加载成功)");
 }
 
 %ctor {
     @autoreleasepool {
-        HNPMAppendLog(@"v0.0.5: logos %ctor 进入");
+        HNPMAppendLog(@"v0.0.6: logos %ctor 进入");
 
         // 紧急开关
         if ([[NSFileManager defaultManager] fileExistsAtPath:@"/var/mobile/Documents/HideNowPlaying.off"]) {
@@ -309,7 +435,11 @@ __attribute__((constructor)) static void HNPMRawCtor(void) {
             return;
         }
 
-        // 左滑手势 target
+        // 弱引用表(对象释放后自动从表里消失, 不会悬挂)
+        hnpmCardViews = [NSHashTable weakObjectsHashTable];
+        hnpmAmbientViews = [NSHashTable weakObjectsHashTable];
+
+        // 手势 target
         hnpmPanTarget = [[HNPMPanTarget alloc] init];
 
         // MediaRemote 动态加载(用于"暂停→继续"恢复检测)
@@ -321,26 +451,17 @@ __attribute__((constructor)) static void HNPMRawCtor(void) {
             HNPMAppendLog(@"MediaRemote 加载失败, 暂停恢复功能不可用");
         }
 
-        // 按"类真实存在"才注册 hook(全部类名来自 v0.0.4 探针在真机上的实测清单)
-        if (objc_getClass("MRUNowPlayingViewController")) {
-            %init(HNPMCard);
-            HNPMAppendLog(@"hook 已注册: 锁屏播放卡片 MRUNowPlayingViewController");
-        } else {
-            HNPMAppendLog(@"跳过: MRUNowPlayingViewController 不存在");
-        }
-        if (objc_getClass("MRUAmbientNowPlayingViewController")) {
-            %init(HNPMAmbientFull);
-            HNPMAppendLog(@"hook 已注册: 灵动岛 MRUAmbientNowPlayingViewController");
-        }
-        if (objc_getClass("MRUAmbientCompactNowPlayingViewController")) {
-            %init(HNPMAmbientCompact);
-            HNPMAppendLog(@"hook 已注册: 灵动岛 MRUAmbientCompactNowPlayingViewController");
-        }
-        if (objc_getClass("SBLockScreenNowPlayingController")) {
-            %init(HNPMInspector);
-            HNPMAppendLog(@"hook 已注册: 诊断 SBLockScreenNowPlayingController");
-        }
+        // 按"类真实存在"才注册 hook
+        if (objc_getClass("MRUNowPlayingView"))            { %init(HNPMCardView); HNPMAppendLog(@"hook 已注册: 卡片视图 MRUNowPlayingView(手势挂载点)"); }
+        if (objc_getClass("MRUNowPlayingCellContentView")) { %init(HNPMCellView); HNPMAppendLog(@"hook 已注册: 卡片单元 MRUNowPlayingCellContentView"); }
+        if (objc_getClass("MRUNowPlayingContainerView"))   { %init(HNPMContainerView); HNPMAppendLog(@"hook 已注册: 卡片容器 MRUNowPlayingContainerView(诊断)"); }
+        if (objc_getClass("MRUNowPlayingViewController"))  { %init(HNPMCard); HNPMAppendLog(@"hook 已注册: 卡片 VC MRUNowPlayingViewController"); }
+        if (objc_getClass("MRUAmbientNowPlayingView"))     { %init(HNPMAmbientViewFull); HNPMAppendLog(@"hook 已注册: 灵动岛视图 MRUAmbientNowPlayingView"); }
+        if (objc_getClass("MRUAmbientCompactNowPlayingView")) { %init(HNPMAmbientViewCompact); HNPMAppendLog(@"hook 已注册: 灵动岛视图 MRUAmbientCompactNowPlayingView"); }
+        if (objc_getClass("MRUAmbientNowPlayingViewController")) { %init(HNPMAmbientFull); }
+        if (objc_getClass("MRUAmbientCompactNowPlayingViewController")) { %init(HNPMAmbientCompact); }
+        if (objc_getClass("SBLockScreenNowPlayingController")) { %init(HNPMInspector); }
 
-        HNPMAppendLog(@"v0.0.5: %ctor 正常完成");
+        HNPMAppendLog(@"v0.0.6: %ctor 正常完成");
     }
 }
