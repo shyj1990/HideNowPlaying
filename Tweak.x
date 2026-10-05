@@ -117,27 +117,6 @@ static BOOL HNPMCellHasLiveMedia(UIView *cell) {
     return NO;
 }
 
-// 递归打印视图树(侦察用), 深度限 6, 叶子节点也打印
-static void HNPMDumpTree(UIView *v, int depth) {
-    if (!v || depth > 6) return;
-    NSMutableString *pad = [NSMutableString string];
-    for (int i = 0; i < depth; i++) [pad appendString:@"  "];
-    HNPMAppendLog([NSString stringWithFormat:@"[岛结构] %@├ %@ %@", pad, NSStringFromClass([v class]),
-                   NSStringFromCGRect(v.frame)]);
-    for (UIView *c in v.subviews) HNPMDumpTree(c, depth + 1);
-}
-
-// 窗口里是否含"展开的媒体胶囊"(宽 160~390 且高 30~220 的元素; 排除 393 全屏容器和 125 紧凑胶囊)
-static BOOL HNPMWindowHasExpandedMedia(UIView *v) {
-    if (!v) return NO;
-    CGFloat w = v.frame.size.width, h = v.frame.size.height;
-    if (w >= 160 && w < 390 && h >= 30 && h <= 220) return YES;
-    for (UIView *c in v.subviews) { if (HNPMWindowHasExpandedMedia(c)) return YES; }
-    return NO;
-}
-
-static int gHNPMIslandDumpCount = 0;
-
 // 灵动岛窗口整体隐藏(基线方案: 实验证明按内容筛选无效——媒体与活动同住一个窗口)
 static void HNPMSetApertureWindowsHidden(BOOL hide, NSString *tag) {
     dispatch_async(dispatch_get_main_queue(), ^{
