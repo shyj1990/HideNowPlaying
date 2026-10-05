@@ -74,14 +74,16 @@ static void HNPMHideCard(UIView *cell);
 static BOOL HNPMIsBottomMostMediaCell(UIView *cell) {
     if (!cell || !cell.window) return NO;
     CGRect r = [cell convertRect:cell.bounds toView:nil];
+    CGFloat myY = r.origin.y + r.size.height;
     CGFloat bestY = -CGFLOAT_MAX;
     for (UIView *c in hnpmCardCells) {
-        if (!c.window || c == cell || c == (UIView *)cell) continue;
+        if (!c.window || c == cell) continue;
         CGRect cr = [c convertRect:c.bounds toView:nil];
-        if (cr.maxY > bestY) bestY = cr.maxY;
+        CGFloat cy = cr.origin.y + cr.size.height;
+        if (cy > bestY) bestY = cy;
     }
     // 有其他登记卡片明显更低(>24pt) → 我不是正在播放卡片
-    return (bestY > 0 && bestY - r.maxY > 24.0) ? NO : YES;
+    return (bestY > 0 && bestY - myY > 24.0) ? NO : YES;
 }
 static NSHashTable *hnpmIslandViews = nil;   // 弱引用: 灵动岛内容视图
 static void *kHNPMPanKey = &kHNPMPanKey;
@@ -172,7 +174,8 @@ static void HNPMShowCards(void) {
                 for (UIView *c in hnpmCardCells) {
                     if (!c.window || !c.hidden || !HNPMCellHasLiveMedia(c)) continue;
                     CGRect cr = [c convertRect:c.bounds toView:nil];
-                    if (cr.maxY > bestY) { bestY = cr.maxY; cell = c; }
+                    CGFloat cy = cr.origin.y + cr.size.height;
+                    if (cy > bestY) { bestY = cy; cell = c; }
                 }
             }
             if (!cell || !cell.window || !HNPMCellHasLiveMedia(cell)) return;
