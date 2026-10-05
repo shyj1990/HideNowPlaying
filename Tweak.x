@@ -112,6 +112,70 @@ static void HNPMSetApertureWindowsHidden(BOOL hide, NSString *tag) {
     });
 }
 
+#pragma mark - 卡片隐藏 / 恢复
+
+static void HNPMHideCards(void) {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        @try {
+            for (UIView *cell in hnpmCardCells) {
+                if (!cell.window) continue;
+                [UIView animateWithDuration:0.35
+                                      delay:0.0
+                                    options:UIViewAnimationOptionCurveEaseIn
+                                 animations:^{
+                    cell.transform = CGAffineTransformTranslate(CGAffineTransformIdentity, -440, 0);
+                    cell.alpha = 0.0;
+                }
+                                 completion:^(BOOL finished) {
+                    @try {
+                        if (hnpmHidden) {
+                            cell.hidden = YES;
+                            cell.transform = CGAffineTransformIdentity;
+                            cell.alpha = 1.0;
+                        }
+                    } @catch (NSException *e) {}
+                }];
+            }
+        } @catch (NSException *e) {}
+    });
+}
+
+static void HNPMShowCards(void) {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        @try {
+            for (UIView *cell in hnpmCardCells) {
+                if (!cell.window) continue;
+                // 只恢复还挂着媒体内容的单元格(空壳永远保持隐藏)
+                if (!HNPMCellHasLiveMedia(cell)) continue;
+                cell.hidden = NO;
+                cell.transform = CGAffineTransformTranslate(CGAffineTransformIdentity, -440, 0);
+                cell.alpha = 0.0;
+                [UIView animateWithDuration:0.35
+                                      delay:0.0
+                                    options:UIViewAnimationOptionCurveEaseOut
+                                 animations:^{
+                    cell.transform = CGAffineTransformIdentity;
+                    cell.alpha = 1.0;
+                }
+                                 completion:nil];
+                HNPMAppendLog(@"[卡片] 恢复显示(带媒体内容的单元格)");
+            }
+        } @catch (NSException *e) {}
+    });
+}
+
+static void HNPMRestoreWithRetries(void) {
+    NSArray *delays = @[@0.0, @0.5, @1.0, @2.0, @3.5, @5.0];
+    for (NSNumber *d in delays) {
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)([d doubleValue] * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            @try {
+                if (!hnpmHidden) HNPMShowCards();
+            } @catch (NSException *e) {}
+        });
+    }
+}
+
 static void HNPMSetHidden(BOOL hide, NSString *reason) {
     if (hide == hnpmHidden) return;
     hnpmHidden = hide;
