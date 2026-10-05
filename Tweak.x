@@ -547,10 +547,13 @@ static void HNPMReconApertureController(void) {
         free(ms);
         id inst = nil;
         SEL sh = NSSelectorFromString(@"sharedInstance");
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Warc-performSelector-leaks"
         if ([c respondsToSelector:sh]) inst = [(id)c performSelector:sh];
         HNPMAppendLog([NSString stringWithFormat:@"[岛控] 单例=%@", inst]);
         if ([inst respondsToSelector:NSSelectorFromString(@"_currentFirstElement")]) {
             id el = [inst performSelector:NSSelectorFromString(@"_currentFirstElement")];
+#pragma clang diagnostic pop
             NSString *desc = [el description];
             if (desc.length > 400) desc = [desc substringToIndex:400];
             HNPMAppendLog([NSString stringWithFormat:@"[岛控] 当前元素(%@)=%@",
