@@ -1,9 +1,9 @@
-// HideNowPlaying v0.0.27 — 岛内容隐藏(塌缩) + 播放信息重推送唤活
+// HideNowPlaying v0.0.28 — 岛内容隐藏(塌缩) + 播放信息重推送唤活
 //
 // v0.0.17 实测结论: 窗口级蒙版应用成功但仍裁不住媒体内容 → 蒙版路线放弃
 //   (容器级蒙版 v0.0.16 失败, 窗口级蒙版 v0.0.17 也失败)
 //
-// v0.0.27 方案(回到实测有效路径 + 修黑壳):
+// v0.0.28 方案(回到实测有效路径 + 修黑壳):
 //   隐藏: 藏岛的内容视图(_SAUIElementViewContentView + 宽>=30 的门户)
 //         → 岛塌缩为待机短胶囊(v0.0.12/13 用户满意的效果)
 //   恢复: ① 取消隐藏(登记表 + 全窗口类扫描兜底)
@@ -179,6 +179,8 @@ static void HNPMShowCards(void) {
                 }
             }
             if (!cell || !cell.window || !HNPMCellHasLiveMedia(cell)) return;
+            // 已在显示中 → 不再重复动画(防恢复重试导致的闪烁)
+            if (!cell.hidden) return;
             cell.hidden = NO;
             cell.transform = CGAffineTransformTranslate(CGAffineTransformIdentity, -440, 0);
             cell.alpha = 0.0;
@@ -402,7 +404,7 @@ static void HNPMAttachPanIfNeeded(UIView *view) {
         [hnpmIslandViews addObject:self];
         HNPMLogThrottled([NSString stringWithFormat:@"[灵动岛] 元素内容登记 frame=%@",
                           NSStringFromCGRect(self.frame)]);
-        // v0.0.27: 不再隐藏内容(藏窗口方案, 内容保持存活)
+        // v0.0.28: 不再隐藏内容(藏窗口方案, 内容保持存活)
     } @catch (NSException *e) {}
 }
 %end
@@ -418,7 +420,7 @@ static void HNPMAttachPanIfNeeded(UIView *view) {
         [hnpmIslandViews addObject:self];
         HNPMLogThrottled([NSString stringWithFormat:@"[灵动岛] 门户登记 frame=%@",
                           NSStringFromCGRect(self.frame)]);
-        // v0.0.27: 不再隐藏内容(藏窗口方案, 内容保持存活)
+        // v0.0.28: 不再隐藏内容(藏窗口方案, 内容保持存活)
     } @catch (NSException *e) {}
 }
 %end
@@ -427,12 +429,12 @@ static void HNPMAttachPanIfNeeded(UIView *view) {
 #pragma mark - 入口
 
 __attribute__((constructor)) static void HNPMRawCtor(void) {
-    HNPMAppendLog(@"v0.0.27: dylib 构造函数已执行(dyld 加载成功)");
+    HNPMAppendLog(@"v0.0.28: dylib 构造函数已执行(dyld 加载成功)");
 }
 
 %ctor {
     @autoreleasepool {
-        HNPMAppendLog(@"v0.0.27: logos %ctor 进入");
+        HNPMAppendLog(@"v0.0.28: logos %ctor 进入");
 
         if ([[NSFileManager defaultManager] fileExistsAtPath:@"/var/mobile/Documents/HideNowPlaying.off"]) {
             HNPMAppendLog(@"检测到开关文件 HideNowPlaying.off, 不注册任何 hook");
@@ -456,6 +458,6 @@ __attribute__((constructor)) static void HNPMRawCtor(void) {
         if (objc_getClass("CSActivityItemContentView"))      { %init(HNPMActivityCard); HNPMAppendLog(@"hook 已注册: 媒体卡片(宽度过滤>=300)"); }
         if (objc_getClass("_SAUIElementViewContentView"))    { %init(HNPMIslandElement); }
         if (objc_getClass("_SAUIProvidedViewContainerView")) { %init(HNPMIslandPortal); }
-        HNPMAppendLog(@"v0.0.27: %ctor 正常完成(灵动岛整窗隐藏方案)");
+        HNPMAppendLog(@"v0.0.28: %ctor 正常完成(灵动岛整窗隐藏方案)");
     }
 }
