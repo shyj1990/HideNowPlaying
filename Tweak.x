@@ -497,6 +497,7 @@ static void HNPMReconApertureManager(void) {
 static id gHNPMIslandController = nil;
 static int gHNPMElementDumped = 0;
 
+%group(HNPMIslandController)
 %hook(SBSystemApertureController)
 - (void)registerElement:(id)el {
     %orig;
@@ -542,6 +543,7 @@ static int gHNPMElementDumped = 0;
     @try { HNPMAppendLog([NSString stringWithFormat:@"[岛控] 系统整岛抑制: %@", r]); } @catch (NSException *e) {}
     %orig;
 }
+%end
 %end
 
 // 侦察: 枚举运行时所有含 Aperture 的类及其方法(找出真正的元素管理器)
