@@ -1,19 +1,12 @@
-// HideNowPlaying v0.0.15 — 灵动岛盖板方案 + 空壳单元格根治
+// HideNowPlaying v0.0.16 — 蒙版收缩灵动岛 + 卡片恢复重试
 //
-// v0.0.14 用户反馈:
-//   ❌ 左滑后灵动岛封面/波纹一闪一闪 → 根因: 系统对灵动岛容器持续做 alpha 动画(媒体脉冲),
-//      我们每 0.5s 压回 0, 双方打架 = 闪烁
-//   ❌ 暂停→播放后卡片变白色一片 → 根因: 日志证实媒体卡片内容每 5~12 秒重建一次,
-//      恢复时把所有登记过的单元格都恢复, 旧的空壳单元格(内容已迁走)也显示 = 白板
-//
-// v0.0.15 方案:
-//   灵动岛: 完全不碰系统视图属性! 用自己的黑色胶囊"盖板"视图盖在岛上方:
-//     - 远程内容图层继续在渲染树里活着渲染(恢复零黑壳)
-//     - 盖板是我们自己的视图, 系统动画碰不到它(零闪烁)
-//     - 恢复时淡出移除盖板, 内容瞬间可见
-//     - 隐藏期间每 0.5s 同步盖板位置(岛尺寸变化时跟随)
-//   卡片: 恢复时只恢复"仍挂着媒体内容(>=300x140 的 CSActivityItemContentView)"的单元格;
-//     空壳单元格永远不碰 → 白板根治
+// v0.0.15 用户反馈:
+//   ✅ 灵动岛盖板: 无闪烁、恢复瞬间内容完整(方案方向正确)
+//   ❌ 盖板比正常岛长(媒体展开宽度) → 改用"蒙版": 只露出容器中间紧凑区域(166pt),
+//      岛视觉上收缩为待机短胶囊, 周围是壁纸; 远程内容图层仍活着, 摘蒙版即恢复
+//   ❌ 卡片暂停→播放后未滑回 → 日志: 恢复跑了但空壳过滤没找到合格单元格
+//      (内容恰在重建/搬家), 且恢复后新登记内容无自动恢复机制
+//      → 修复: 恢复多轮重试(0/0.5/1/2/3.5/5s) + 登记时自动恢复(淡入)
 //
 // 日志: /var/mobile/Documents/HideNowPlaying.log   紧急开关: /var/mobile/Documents/HideNowPlaying.off
 
@@ -67,10 +60,9 @@ static BOOL hnpmHidden = NO;
 static BOOL hnpmBaseline = NO;
 static BOOL hnpmLastPlaying = NO;
 static int  hnpmPauseStreak = 0;
-static NSHashTable *hnpmCardCells = nil;      // 弱引用: 出现过的媒体卡片单元格
+static NSHashTable *hnpmCardCells = nil;        // 弱引用: 出现过的媒体卡片单元格
 static NSHashTable *hnpmIslandContainers = nil; // 弱引用: 灵动岛容器
 static void *kHNPMPanKey = &kHNPMPanKey;
-static void *kHnpmCoverKey = &kHnpmCoverKey;  // 关联对象: 容器 → 盖板
 
 #pragma mark - MediaRemote
 
@@ -79,11 +71,12 @@ static HNPMGetInfoFunc hnpmGetInfo = NULL;
 
 #pragma mark - 媒体卡片判定
 
+// 媒体卡片内容宽度(高度在重建瞬间可能还没布局好, 只按宽度判)
 static BOOL HNPMIsMediaSized(CGSize size) {
-    return size.width >= 300 && size.height >= 140;
+    return size.width >= 300;
 }
 
-// 单元格 subtree 里是否还有"活的"媒体内容(尺寸过滤, 空壳=内容已迁走 → NO)
+// 单元格 subtree 里是否还有媒体内容视图(空壳=内容已迁走 → NO)
 static BOOL HNPMCellHasLiveMedia(UIView *cell) {
     @try {
         if (!cell) return NO;
@@ -102,56 +95,44 @@ static BOOL HNPMCellHasLiveMedia(UIView *cell) {
     return NO;
 }
 
-#pragma mark - 灵动岛盖板
+#pragma mark - 灵动岛蒙版(收缩为紧凑胶囊)
 
-static void HNPMSyncCover(UIView *container, BOOL create) {
+// 只露出容器中间 166pt 的紧凑胶囊区域, 其余(媒体展开部分)被裁掉;
+// 纯渲染树操作, 远程内容图层不受影响, 摘掉蒙版即恢复
+static void HNPMApplyIslandMask(UIView *container) {
     @try {
         if (!container || !container.window) return;
-        UIView *cover = objc_getAssociatedObject(container, kHnpmCoverKey);
-        CGRect frame = [container convertRect:container.bounds toView:nil];
-        if (!cover && create) {
-            cover = [[UIView alloc] initWithFrame:frame];
-            cover.backgroundColor = [UIColor blackColor];
-            cover.layer.cornerRadius = 19.0;
-            cover.userInteractionEnabled = NO;
-            objc_setAssociatedObject(container, kHnpmCoverKey, cover, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-            [container.window addSubview:cover];
-            HNPMLogThrottled([NSString stringWithFormat:@"[灵动岛] 盖板已放置 frame=%@", NSStringFromCGRect(frame)]);
+        CGSize bs = container.bounds.size;
+        if (bs.width < 100 || bs.height < 20) return;   // 尺寸未就绪
+        CAShapeLayer *mask = (CAShapeLayer *)container.layer.mask;
+        if (![mask isKindOfClass:[CAShapeLayer class]]) {
+            mask = [[CAShapeLayer alloc] init];
+            mask.fillColor = [UIColor whiteColor].CGColor;
+            container.layer.mask = mask;
+            HNPMLogThrottled(@"[灵动岛] 蒙版已应用(收缩为紧凑胶囊)");
         }
-        if (cover) {
-            if (!CGRectEqualToRect(cover.frame, frame)) {
-                [UIView performWithoutAnimation:^{
-                    cover.frame = frame;
-                    cover.layer.cornerRadius = fmin(24.0, fmax(10.0, frame.size.height / 2.0));
-                }];
-            }
-        }
+        CGFloat compactW = 166.0;
+        CGRect pill = CGRectMake((bs.width - compactW) / 2.0, 0, compactW, bs.height);
+        mask.frame = container.bounds;
+        mask.path = [UIBezierPath bezierPathWithRoundedRect:pill cornerRadius:bs.height / 2.0].CGPath;
     } @catch (NSException *e) {}
 }
 
-static void HNPMRemoveCovers(BOOL animated) {
+static void HNPMRemoveIslandMasks(void) {
     dispatch_async(dispatch_get_main_queue(), ^{
         @try {
             for (UIView *container in hnpmIslandContainers) {
-                UIView *cover = objc_getAssociatedObject(container, kHnpmCoverKey);
-                if (!cover) continue;
-                objc_setAssociatedObject(container, kHnpmCoverKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-                if (animated && cover.superview) {
-                    [UIView animateWithDuration:0.25 animations:^{ cover.alpha = 0.0; }
-                                     completion:^(BOOL finished) {
-                        [cover removeFromSuperview];
-                    }];
-                } else {
-                    [cover removeFromSuperview];
+                if (container.layer.mask) {
+                    container.layer.mask = nil;
+                    HNPMLogThrottled(@"[灵动岛] 蒙版已摘除");
                 }
             }
         } @catch (NSException *e) {}
     });
 }
 
-#pragma mark - 隐藏 / 恢复
+#pragma mark - 卡片隐藏 / 恢复
 
-// 隐藏: 当前活的媒体卡片全部滑出
 static void HNPMHideCards(void) {
     dispatch_async(dispatch_get_main_queue(), ^{
         @try {
@@ -178,7 +159,7 @@ static void HNPMHideCards(void) {
     });
 }
 
-// 恢复: 只恢复"仍挂着媒体内容"的单元格(空壳不碰 → 白板根治)
+// 恢复: 只恢复"仍挂着媒体内容"的单元格(空壳不碰); 幂等, 供多轮重试调用
 static void HNPMShowCards(void) {
     dispatch_async(dispatch_get_main_queue(), ^{
         @try {
@@ -215,6 +196,19 @@ static void HNPMShowCards(void) {
     });
 }
 
+// 恢复多轮重试: 内容重建/搬家发生在恢复瞬间, 首轮可能找不到, 反复尝试兜底
+static void HNPMRestoreWithRetries(void) {
+    NSArray *delays = @[@0.0, @0.5, @1.0, @2.0, @3.5, @5.0];
+    for (NSNumber *d in delays) {
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)([d doubleValue] * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            @try {
+                if (!hnpmHidden) HNPMShowCards();
+            } @catch (NSException *e) {}
+        });
+    }
+}
+
 static void HNPMSetHidden(BOOL hide, NSString *reason) {
     if (hide == hnpmHidden) return;
     hnpmHidden = hide;
@@ -224,18 +218,18 @@ static void HNPMSetHidden(BOOL hide, NSString *reason) {
         HNPMHideCards();
         dispatch_async(dispatch_get_main_queue(), ^{
             @try {
-                for (UIView *c in hnpmIslandContainers) HNPMSyncCover(c, YES);
+                for (UIView *c in hnpmIslandContainers) HNPMApplyIslandMask(c);
             } @catch (NSException *e) {}
         });
     } else {
-        HNPMShowCards();
-        HNPMRemoveCovers(YES);
+        HNPMRestoreWithRetries();
+        HNPMRemoveIslandMasks();
     }
     HNPMAppendLog([NSString stringWithFormat:@"%@ → 状态=%@",
                    reason, hide ? @"已隐藏(音乐继续)" : @"已恢复显示"]);
 }
 
-// 0.5 秒轮询: ① 隐藏期间同步盖板位置 ② 检测"暂停→继续播放"
+// 0.5 秒轮询: ① 隐藏期间同步蒙版(容器尺寸变化) ② 检测"暂停→继续播放"
 static void HNPMStartRestorePolling(void) {
     dispatch_async(dispatch_get_main_queue(), ^{
         @try {
@@ -248,10 +242,9 @@ static void HNPMStartRestorePolling(void) {
                         restoreTimer = nil;
                         return;
                     }
-                    // 盖板跟随岛的位置/尺寸
                     dispatch_async(dispatch_get_main_queue(), ^{
                         @try {
-                            for (UIView *c in hnpmIslandContainers) HNPMSyncCover(c, YES);
+                            for (UIView *c in hnpmIslandContainers) HNPMApplyIslandMask(c);
                         } @catch (NSException *e) {}
                     });
                     if (!hnpmGetInfo) return;
@@ -381,8 +374,15 @@ static void HNPMAttachPanIfNeeded(UIView *view) {
                     // 隐藏期间新出现的卡片: 直接隐藏(无动画)
                     self.hidden = YES;
                     cell.hidden = YES;
+                } else if (cell.hidden || self.hidden) {
+                    // 恢复期(或历史遗留)登记 → 自动恢复显示(淡入)
+                    self.hidden = NO;
+                    cell.transform = CGAffineTransformIdentity;
+                    cell.alpha = 0.0;
+                    cell.hidden = NO;
+                    [UIView animateWithDuration:0.35 animations:^{ cell.alpha = 1.0; }];
+                    HNPMAppendLog(@"[卡片] 恢复期登记 → 自动恢复显示");
                 }
-                // 注意: 不在此处恢复显示(恢复统一走 HNPMShowCards 的空壳过滤)
             } @catch (NSException *e) {}
         });
     } @catch (NSException *e) {}
@@ -390,7 +390,7 @@ static void HNPMAttachPanIfNeeded(UIView *view) {
 %end
 %end
 
-// 灵动岛容器: 只登记位置(盖板方案, 不碰任何系统属性)
+// 灵动岛容器: 只登记(蒙版方案, 不碰系统视图属性)
 %group HNPMIslandContainer
 %hook SBSystemApertureContainerView
 - (void)didMoveToWindow {
@@ -401,7 +401,7 @@ static void HNPMAttachPanIfNeeded(UIView *view) {
         HNPMLogThrottled([NSString stringWithFormat:@"[灵动岛] 容器登记 frame=%@", NSStringFromCGRect(self.frame)]);
         if (hnpmHidden) {
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.1 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-                @try { HNPMSyncCover(self, YES); } @catch (NSException *e) {}
+                @try { HNPMApplyIslandMask(self); } @catch (NSException *e) {}
             });
         }
     } @catch (NSException *e) {}
@@ -412,12 +412,12 @@ static void HNPMAttachPanIfNeeded(UIView *view) {
 #pragma mark - 入口
 
 __attribute__((constructor)) static void HNPMRawCtor(void) {
-    HNPMAppendLog(@"v0.0.15: dylib 构造函数已执行(dyld 加载成功)");
+    HNPMAppendLog(@"v0.0.16: dylib 构造函数已执行(dyld 加载成功)");
 }
 
 %ctor {
     @autoreleasepool {
-        HNPMAppendLog(@"v0.0.15: logos %ctor 进入");
+        HNPMAppendLog(@"v0.0.16: logos %ctor 进入");
 
         if ([[NSFileManager defaultManager] fileExistsAtPath:@"/var/mobile/Documents/HideNowPlaying.off"]) {
             HNPMAppendLog(@"检测到开关文件 HideNowPlaying.off, 不注册任何 hook");
@@ -436,8 +436,8 @@ __attribute__((constructor)) static void HNPMRawCtor(void) {
             HNPMAppendLog(@"MediaRemote 加载失败");
         }
 
-        if (objc_getClass("CSActivityItemContentView"))      { %init(HNPMActivityCard); HNPMAppendLog(@"hook 已注册: 媒体卡片(尺寸过滤>=300x140)"); }
-        if (objc_getClass("SBSystemApertureContainerView"))  { %init(HNPMIslandContainer); HNPMAppendLog(@"hook 已注册: 灵动岛容器(盖板方案)"); }
-        HNPMAppendLog(@"v0.0.15: %ctor 正常完成(盖板+空壳过滤)");
+        if (objc_getClass("CSActivityItemContentView"))      { %init(HNPMActivityCard); HNPMAppendLog(@"hook 已注册: 媒体卡片(宽度过滤>=300)"); }
+        if (objc_getClass("SBSystemApertureContainerView"))  { %init(HNPMIslandContainer); HNPMAppendLog(@"hook 已注册: 灵动岛容器(蒙版方案)"); }
+        HNPMAppendLog(@"v0.0.16: %ctor 正常完成(蒙版+恢复重试)");
     }
 }
