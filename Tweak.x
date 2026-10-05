@@ -115,7 +115,8 @@ static void HNPMApplyIslandMask(UIView *container) {
             HNPMLogThrottled(@"[灵动岛] 窗口蒙版已应用(收缩为紧凑胶囊)");
         }
         CGFloat compactW = 166.0, compactH = 37.0;
-        CGRect pill = CGRectMake(cf.midX - compactW / 2.0, cf.midY - compactH / 2.0, compactW, compactH);
+        CGFloat midX = CGRectGetMidX(cf), midY = CGRectGetMidY(cf);
+        CGRect pill = CGRectMake(midX - compactW / 2.0, midY - compactH / 2.0, compactW, compactH);
         mask.frame = win.bounds;
         mask.path = [UIBezierPath bezierPathWithRoundedRect:pill cornerRadius:compactH / 2.0].CGPath;
     } @catch (NSException *e) {}
