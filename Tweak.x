@@ -1,9 +1,9 @@
-// HideNowPlaying v0.0.18 — 岛内容隐藏(塌缩) + 播放信息重推送唤活
+// HideNowPlaying v0.0.19 — 岛内容隐藏(塌缩) + 播放信息重推送唤活
 //
 // v0.0.17 实测结论: 窗口级蒙版应用成功但仍裁不住媒体内容 → 蒙版路线放弃
 //   (容器级蒙版 v0.0.16 失败, 窗口级蒙版 v0.0.17 也失败)
 //
-// v0.0.18 方案(回到实测有效路径 + 修黑壳):
+// v0.0.19 方案(回到实测有效路径 + 修黑壳):
 //   隐藏: 藏岛的内容视图(_SAUIElementViewContentView + 宽>=30 的门户)
 //         → 岛塌缩为待机短胶囊(v0.0.12/13 用户满意的效果)
 //   恢复: ① 取消隐藏(登记表 + 全窗口类扫描兜底)
@@ -76,25 +76,84 @@ static HNPMGetInfoFunc hnpmGetInfo = NULL;
 typedef void (*HNPMSetInfoFunc)(CFDictionaryRef, dispatch_queue_t, void (^)(void));
 static HNPMSetInfoFunc hnpmSetInfo = NULL;
 
-// "唤活": 取当前播放信息并原样推回, 触发媒体实况重新渲染(治恢复黑壳)
+// "唤活": 取当前播放信息, 修改播放进度(+1s)后推回 —— 相同信息会被系统忽略,
+// 只有变化的信息才能触发媒体实况重新渲染(治恢复黑壳)
 static void HNPMReviveIslandContent(NSString *tag) {
     @try {
         if (!hnpmGetInfo || !hnpmSetInfo) return;
+        HNPMLogThrottled([NSString stringWithFormat:@"[唤活] %@ 开始取播放信息", tag]);
         hnpmGetInfo(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^(CFDictionaryRef info) {
             @try {
-                if (!info || hnpmHidden) return;
-                CFDictionaryRef dict = CFRetain(info);
-                hnpmSetInfo(dict, dispatch_get_main_queue(), ^{
+                if (hnpmHidden) return;
+                if (!info || CFDictionaryGetCount(info) == 0) {
+                    HNPMLogThrottled(@"[唤活] 取到的播放信息为空, 跳过");
+                    return;
+                }
+                CFMutableDictionaryRef dict = CFDictionaryCreateMutableCopy(kCFAllocatorDefault, 0, info);
+                double newTime = 0;
+                CFNumberRef tRef = (CFNumberRef)CFDictionaryGetValue(dict, CFSTR("kMRMediaRemoteNowPlayingInfoElapsedTime"));
+                if (tRef) CFNumberGetValue(tRef, kCFNumberDoubleType, &newTime);
+                newTime += 1.0;
+                CFNumberRef newRef = CFNumberCreate(kCFAllocatorDefault, kCFNumberDoubleType, &newTime);
+                CFDictionarySetValue(dict, CFSTR("kMRMediaRemoteNowPlayingInfoElapsedTime"), newRef);
+                CFRelease(newRef);
+                HNPMLogThrottled(@"[唤活] 已构造变更信息, 推送中...");
+                hnpmSetInfo((CFDictionaryRef)dict, dispatch_get_main_queue(), ^{
                     @try {
-                        CFRelease(dict);
-                        HNPMLogThrottled([NSString stringWithFormat:@"[唤活] %@ 播放信息已重推送", tag]);
-                    } @catch (NSException *e) {
-                        @try { CFRelease(dict); } @catch (NSException *e2) {}
-                    }
+                        HNPMLogThrottled(@"[唤活] 推送完成回调已触发");
+                    } @catch (NSException *e) {}
                 });
+                CFRelease(dict);
             } @catch (NSException *e) {}
         });
     } @catch (NSException *e) {}
+}
+
+#pragma mark - 展开态侦察
+
+// 隐藏瞬间灵动岛必处于媒体展开态 —— 拍下窗口完整视图树, 找出长胶囊的真身
+static void HNPMReconExpandedWindow(UIWindow *win) {
+    @try {
+        if (!win) return;
+        NSMutableString *out = [NSMutableString stringWithFormat:@"[侦察-展开态] 窗口%@ 全量树:\n", NSStringFromClass([win class])];
+        NSMutableArray *stack = [NSMutableArray arrayWithObject:win];
+        NSMutableArray *depths = [NSMutableArray arrayWithObject:@0];
+        int count = 0;
+        while (stack.count > 0 && count < 400) {
+            UIView *v = stack.firstObject;
+            int depth = [depths.firstObject intValue];
+            [stack removeObjectAtIndex:0];
+            [depths removeObjectAtIndex:0];
+            if (!v) continue;
+            count++;
+            NSMutableString *line = [NSMutableString string];
+            for (int i = 0; i < depth && i < 14; i++) [line appendString:@"  "];
+            [line appendFormat:@"%@ f=%@", NSStringFromClass([v class]), NSStringFromCGRect(v.frame)];
+            if (v.isHidden) [line appendString:@" 隐藏"];
+            if (v.alpha < 0.99) [line appendFormat:@" a=%.2f", v.alpha];
+            if ([v isKindOfClass:[UILabel class]]) [line appendFormat:@" 文本=\"%@\"", [(UILabel *)v text]];
+            [out appendFormat:@"%@\n", line];
+            NSArray *kids = [v subviews];
+            for (UIView *k in kids) {
+                [stack insertObject:k atIndex:0];
+                [depths insertObject:@(depth + 1) atIndex:0];
+            }
+        }
+        // 分段写日志(防单行过长)
+        NSUInteger pos = 0;
+        int seg = 1;
+        while (pos < out.length) {
+            NSUInteger len = MIN((NSUInteger)1400, out.length - pos);
+            if (pos + len < out.length) {
+                NSRange r = [out rangeOfString:@"\n" options:0 range:NSMakeRange(pos + len - 200, 200)];
+                if (r.location != NSNotFound) len = r.location - pos + 1;
+            }
+            HNPMAppendLog([NSString stringWithFormat:@"%@ (段%d)", [out substringWithRange:NSMakeRange(pos, len)], seg++]);
+            pos += len;
+        }
+    } @catch (NSException *e) {
+        HNPMAppendLog(@"[侦察-展开态] 异常");
+    }
 }
 
 #pragma mark - 媒体卡片判定
@@ -268,6 +327,20 @@ static void HNPMSetHidden(BOOL hide, NSString *reason) {
     if (hide) {
         HNPMHideCards();
         HNPMHideIslandViews();
+        // 展开态侦察: 隐藏后 0.5s 拍灵动岛窗口全量树(此时必为媒体展开态)
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            @try {
+                if (!hnpmHidden) return;
+                for (UIWindow *w in [UIApplication sharedApplication].windows) {
+                    NSString *n = NSStringFromClass([w class]);
+                    if ([n containsString:@"Aperture"]) {
+                        HNPMReconExpandedWindow(w);
+                        break;
+                    }
+                }
+            } @catch (NSException *e) {}
+        });
     } else {
         HNPMRestoreWithRetries();
         HNPMShowIslandViews();
@@ -483,12 +556,12 @@ static void HNPMAttachPanIfNeeded(UIView *view) {
 #pragma mark - 入口
 
 __attribute__((constructor)) static void HNPMRawCtor(void) {
-    HNPMAppendLog(@"v0.0.18: dylib 构造函数已执行(dyld 加载成功)");
+    HNPMAppendLog(@"v0.0.19: dylib 构造函数已执行(dyld 加载成功)");
 }
 
 %ctor {
     @autoreleasepool {
-        HNPMAppendLog(@"v0.0.18: logos %ctor 进入");
+        HNPMAppendLog(@"v0.0.19: logos %ctor 进入");
 
         if ([[NSFileManager defaultManager] fileExistsAtPath:@"/var/mobile/Documents/HideNowPlaying.off"]) {
             HNPMAppendLog(@"检测到开关文件 HideNowPlaying.off, 不注册任何 hook");
@@ -513,6 +586,6 @@ __attribute__((constructor)) static void HNPMRawCtor(void) {
         if (objc_getClass("CSActivityItemContentView"))      { %init(HNPMActivityCard); HNPMAppendLog(@"hook 已注册: 媒体卡片(宽度过滤>=300)"); }
         if (objc_getClass("_SAUIElementViewContentView"))    { %init(HNPMIslandElement); }
         if (objc_getClass("_SAUIProvidedViewContainerView")) { %init(HNPMIslandPortal); }
-        HNPMAppendLog(@"v0.0.18: %ctor 正常完成(岛内容隐藏+唤活)");
+        HNPMAppendLog(@"v0.0.19: %ctor 正常完成(岛内容隐藏+唤活)");
     }
 }
