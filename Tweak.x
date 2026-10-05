@@ -1,9 +1,9 @@
-// HideNowPlaying v0.0.36 — 岛内容隐藏(塌缩) + 播放信息重推送唤活
+// HideNowPlaying v0.0.37 — 岛内容隐藏(塌缩) + 播放信息重推送唤活
 //
 // v0.0.17 实测结论: 窗口级蒙版应用成功但仍裁不住媒体内容 → 蒙版路线放弃
 //   (容器级蒙版 v0.0.16 失败, 窗口级蒙版 v0.0.17 也失败)
 //
-// v0.0.36 方案(回到实测有效路径 + 修黑壳):
+// v0.0.37 方案(回到实测有效路径 + 修黑壳):
 //   隐藏: 藏岛的内容视图(_SAUIElementViewContentView + 宽>=30 的门户)
 //         → 岛塌缩为待机短胶囊(v0.0.12/13 用户满意的效果)
 //   恢复: ① 取消隐藏(登记表 + 全窗口类扫描兜底)
@@ -426,7 +426,7 @@ static void HNPMAttachPanIfNeeded(UIView *view) {
         [hnpmIslandViews addObject:self];
         HNPMLogThrottled([NSString stringWithFormat:@"[灵动岛] 元素内容登记 frame=%@",
                           NSStringFromCGRect(self.frame)]);
-        // v0.0.36: 不再隐藏内容(藏窗口方案, 内容保持存活)
+        // v0.0.37: 不再隐藏内容(藏窗口方案, 内容保持存活)
     } @catch (NSException *e) {}
 }
 %end
@@ -442,7 +442,7 @@ static void HNPMAttachPanIfNeeded(UIView *view) {
         [hnpmIslandViews addObject:self];
         HNPMLogThrottled([NSString stringWithFormat:@"[灵动岛] 门户登记 frame=%@",
                           NSStringFromCGRect(self.frame)]);
-        // v0.0.36: 不再隐藏内容(藏窗口方案, 内容保持存活)
+        // v0.0.37: 不再隐藏内容(藏窗口方案, 内容保持存活)
     } @catch (NSException *e) {}
 }
 %end
@@ -451,7 +451,7 @@ static void HNPMAttachPanIfNeeded(UIView *view) {
 #pragma mark - 入口
 
 __attribute__((constructor)) static void HNPMRawCtor(void) {
-    HNPMAppendLog(@"v0.0.36: dylib 构造函数已执行(dyld 加载成功)");
+    HNPMAppendLog(@"v0.0.37: dylib 构造函数已执行(dyld 加载成功)");
 }
 
 // 侦察: 灵动岛"元素管理器"是否存在及其方法签名(模型级方案的前提)
@@ -527,9 +527,54 @@ static void HNPMReconApertureClasses(void) {
     }
 }
 
+// 侦察: SBSystemApertureController 完整方法表 + 单例 + 当前元素 + 抑制断言类
+static void HNPMReconApertureController(void) {
+    @try {
+        Class c = NSClassFromString(@"SBSystemApertureController");
+        if (!c) { HNPMAppendLog(@"[岛控] SBSystemApertureController 不存在"); return; }
+        unsigned int mc = 0;
+        Method *ms = class_copyMethodList(object_getClass(c), &mc);
+        for (unsigned int i = 0; i < mc; i++) {
+            NSString *s = NSStringFromSelector(method_getName(ms[i]));
+            if ([s containsString:@"shared"] || [s containsString:@"Instance"])
+                HNPMAppendLog([NSString stringWithFormat:@"[岛控] 类方法 %@", s]);
+        }
+        free(ms);
+        ms = class_copyMethodList(c, &mc);
+        for (unsigned int i = 0; i < mc; i++)
+            HNPMAppendLog([NSString stringWithFormat:@"[岛控] 方法 %@",
+                           NSStringFromSelector(method_getName(ms[i]))]);
+        free(ms);
+        id inst = nil;
+        SEL sh = NSSelectorFromString(@"sharedInstance");
+        if ([c respondsToSelector:sh]) inst = [(id)c performSelector:sh];
+        HNPMAppendLog([NSString stringWithFormat:@"[岛控] 单例=%@", inst]);
+        if ([inst respondsToSelector:NSSelectorFromString(@"_currentFirstElement")]) {
+            id el = [inst performSelector:NSSelectorFromString(@"_currentFirstElement")];
+            NSString *desc = [el description];
+            if (desc.length > 400) desc = [desc substringToIndex:400];
+            HNPMAppendLog([NSString stringWithFormat:@"[岛控] 当前元素(%@)=%@",
+                           NSStringFromClass([el class]), desc]);
+        }
+        for (NSString *nm in @[@"_SBSystemApertureRepresentationSuppressionAssertion",
+                               @"SBRequestSystemApertureElementSuppressionEventResponse"]) {
+            Class sc = NSClassFromString(nm);
+            if (!sc) { HNPMAppendLog([NSString stringWithFormat:@"[岛控] %@ 不存在", nm]); continue; }
+            unsigned int sc2 = 0;
+            Method *sm = class_copyMethodList(sc, &sc2);
+            for (unsigned int i = 0; i < sc2; i++)
+                HNPMAppendLog([NSString stringWithFormat:@"[岛控] %@ 方法 %@", nm,
+                               NSStringFromSelector(method_getName(sm[i]))]);
+            free(sm);
+        }
+    } @catch (NSException *e) {
+        HNPMAppendLog([NSString stringWithFormat:@"[岛控] 侦察异常: %@", e.reason]);
+    }
+}
+
 %ctor {
     @autoreleasepool {
-        HNPMAppendLog(@"v0.0.36: logos %ctor 进入");
+        HNPMAppendLog(@"v0.0.37: logos %ctor 进入");
 
         if ([[NSFileManager defaultManager] fileExistsAtPath:@"/var/mobile/Documents/HideNowPlaying.off"]) {
             HNPMAppendLog(@"检测到开关文件 HideNowPlaying.off, 不注册任何 hook");
@@ -555,6 +600,9 @@ static void HNPMReconApertureClasses(void) {
         if (objc_getClass("_SAUIProvidedViewContainerView")) { %init(HNPMIslandPortal); }
         HNPMReconApertureManager();
         HNPMReconApertureClasses();
-        HNPMAppendLog(@"v0.0.36: %ctor 正常完成");
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            HNPMReconApertureController();
+        });
+        HNPMAppendLog(@"v0.0.37: %ctor 正常完成");
     }
 }
