@@ -1,9 +1,9 @@
-// HideNowPlaying v0.0.21 — 岛内容隐藏(塌缩) + 播放信息重推送唤活
+// HideNowPlaying v0.0.22 — 岛内容隐藏(塌缩) + 播放信息重推送唤活
 //
 // v0.0.17 实测结论: 窗口级蒙版应用成功但仍裁不住媒体内容 → 蒙版路线放弃
 //   (容器级蒙版 v0.0.16 失败, 窗口级蒙版 v0.0.17 也失败)
 //
-// v0.0.21 方案(回到实测有效路径 + 修黑壳):
+// v0.0.22 方案(回到实测有效路径 + 修黑壳):
 //   隐藏: 藏岛的内容视图(_SAUIElementViewContentView + 宽>=30 的门户)
 //         → 岛塌缩为待机短胶囊(v0.0.12/13 用户满意的效果)
 //   恢复: ① 取消隐藏(登记表 + 全窗口类扫描兜底)
@@ -321,6 +321,49 @@ static void HNPMRestoreWithRetries(void) {
     }
 }
 
+// 胶囊底板控制: 隐藏期间把 MagiciansCurtainView(岛的黑色胶囊背景)强制压回待机尺寸
+// (v0.0.22 侦察: 内容隐藏后系统会重新展开胶囊 → 长黑条; 每次轮询再压回去)
+static BOOL hnpmCurtainSavedExpanded = NO;
+static CGRect hnpmCurtainExpandedFrame;
+
+static void HNPMApplyCurtain(BOOL toHide, NSString *tag) {
+    @try {
+        for (UIWindow *w in [UIApplication sharedApplication].windows) {
+            if (![NSStringFromClass([w class]) containsString:@"Aperture"]) continue;
+            NSMutableArray *stack = [NSMutableArray arrayWithObject:w];
+            while (stack.count > 0) {
+                UIView *v = stack.firstObject;
+                [stack removeObjectAtIndex:0];
+                if (!v) continue;
+                NSString *cn = NSStringFromClass([v class]);
+                if ([cn containsString:@"MagiciansCurtainView"]) {
+                    CGRect f = v.frame;
+                    if (toHide) {
+                        if (f.size.width > 170) {
+                            if (!hnpmCurtainSavedExpanded) {
+                                hnpmCurtainSavedExpanded = YES;
+                                hnpmCurtainExpandedFrame = f;
+                            }
+                            CGFloat W = w.frame.size.width;
+                            CGRect compact = CGRectMake((W - 125.0) / 2.0, 11.333, 125.0, 36.667);
+                            [UIView animateWithDuration:0.3 animations:^{ v.frame = compact; }];
+                            HNPMAppendLog([NSString stringWithFormat:@"[岛底] %@ 压缩胶囊底板(%@, 原 %@)",
+                                           tag, NSStringFromCGRect(compact), NSStringFromCGRect(f)]);
+                        }
+                    } else {
+                        if (hnpmCurtainSavedExpanded && f.size.width < 170) {
+                            CGRect ex = hnpmCurtainExpandedFrame;
+                            [UIView animateWithDuration:0.3 animations:^{ v.frame = ex; }];
+                            HNPMAppendLog([NSString stringWithFormat:@"[岛底] %@ 恢复底板(%@)", tag, NSStringFromCGRect(ex)]);
+                        }
+                    }
+                }
+                for (UIView *k in [v subviews]) [stack addObject:k];
+            }
+        }
+    } @catch (NSException *e) {}
+}
+
 static void HNPMSetHidden(BOOL hide, NSString *reason) {
     if (hide == hnpmHidden) return;
     hnpmHidden = hide;
@@ -329,6 +372,7 @@ static void HNPMSetHidden(BOOL hide, NSString *reason) {
     if (hide) {
         HNPMHideCards();
         HNPMHideIslandViews();
+        dispatch_async(dispatch_get_main_queue(), ^{ HNPMApplyCurtain(YES, @"隐藏"); });
         // 最后一轮侦察: 锁屏窗口/通用窗口/根场景窗口的顶部区域 + 灵动岛窗口对照
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)),
                        dispatch_get_main_queue(), ^{
@@ -348,6 +392,7 @@ static void HNPMSetHidden(BOOL hide, NSString *reason) {
     } else {
         HNPMRestoreWithRetries();
         HNPMShowIslandViews();
+        dispatch_async(dispatch_get_main_queue(), ^{ HNPMApplyCurtain(NO, @"恢复"); });
         // 唤活: 视图已可见后重推播放信息, 逼远程内容重新渲染(治黑壳)
         NSArray *delays = @[@0.5, @1.5, @3.0];
         for (NSNumber *d in delays) {
@@ -381,6 +426,8 @@ static void HNPMStartRestorePolling(void) {
                             for (UIView *v in hnpmIslandViews) {
                                 if (v.window && HNPMShouldTouchIslandView(v) && !v.hidden) v.hidden = YES;
                             }
+                            // 底板维持压缩: 系统重新展开就再压回去(记录打架)
+                            HNPMApplyCurtain(YES, @"轮询");
                         } @catch (NSException *e) {}
                     });
                     if (!hnpmGetInfo) return;
@@ -560,12 +607,12 @@ static void HNPMAttachPanIfNeeded(UIView *view) {
 #pragma mark - 入口
 
 __attribute__((constructor)) static void HNPMRawCtor(void) {
-    HNPMAppendLog(@"v0.0.21: dylib 构造函数已执行(dyld 加载成功)");
+    HNPMAppendLog(@"v0.0.22: dylib 构造函数已执行(dyld 加载成功)");
 }
 
 %ctor {
     @autoreleasepool {
-        HNPMAppendLog(@"v0.0.21: logos %ctor 进入");
+        HNPMAppendLog(@"v0.0.22: logos %ctor 进入");
 
         if ([[NSFileManager defaultManager] fileExistsAtPath:@"/var/mobile/Documents/HideNowPlaying.off"]) {
             HNPMAppendLog(@"检测到开关文件 HideNowPlaying.off, 不注册任何 hook");
@@ -590,6 +637,6 @@ __attribute__((constructor)) static void HNPMRawCtor(void) {
         if (objc_getClass("CSActivityItemContentView"))      { %init(HNPMActivityCard); HNPMAppendLog(@"hook 已注册: 媒体卡片(宽度过滤>=300)"); }
         if (objc_getClass("_SAUIElementViewContentView"))    { %init(HNPMIslandElement); }
         if (objc_getClass("_SAUIProvidedViewContainerView")) { %init(HNPMIslandPortal); }
-        HNPMAppendLog(@"v0.0.21: %ctor 正常完成(岛内容隐藏+唤活)");
+        HNPMAppendLog(@"v0.0.22: %ctor 正常完成(岛内容隐藏+唤活)");
     }
 }
