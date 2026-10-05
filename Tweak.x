@@ -681,7 +681,12 @@ static void HNPMReconWindows(void) {
             HNPMAppendLog([NSString stringWithFormat:@"[岛窗口] %@", wn]);
             HNPMWalkIvars(w, @"岛窗口");
             HNPMWalkIvars([w rootViewController], @"岛窗口VC");
-            HNPMWalkIvars([w rootViewIfLoaded], @"岛窗口根视图");
+            if ([w respondsToSelector:NSSelectorFromString(@"rootViewIfLoaded")]) {
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Warc-performSelector-leaks"
+                HNPMWalkIvars([w performSelector:NSSelectorFromString(@"rootViewIfLoaded")], @"岛窗口根视图");
+#pragma clang diagnostic pop
+            }
         }
         HNPMAppendLog(@"[岛窗口] 遍历完成");
     } @catch (NSException *e) {
