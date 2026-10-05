@@ -95,26 +95,29 @@ static BOOL HNPMCellHasLiveMedia(UIView *cell) {
     return NO;
 }
 
-#pragma mark - 灵动岛蒙版(收缩为紧凑胶囊)
+#pragma mark - 灵动岛蒙版(窗口级, 收缩为紧凑胶囊)
 
-// 只露出容器中间 166pt 的紧凑胶囊区域, 其余(媒体展开部分)被裁掉;
-// 纯渲染树操作, 远程内容图层不受影响, 摘掉蒙版即恢复
+// v0.0.16 教训: 展开的媒体内容不在 SBSystemApertureContainerView 里面,
+// 而是同窗口的兄弟视图(盖板能盖住/容器蒙版裁不住 → 互相印证)。
+// 因此把蒙版加到整个窗口的 layer 上: 窗口里所有内容(容器+兄弟远程内容)
+// 都被裁剪为只露出中间 166pt 紧凑胶囊; 纯渲染树操作, 远程图层不受影响。
 static void HNPMApplyIslandMask(UIView *container) {
     @try {
-        if (!container || !container.window) return;
-        CGSize bs = container.bounds.size;
-        if (bs.width < 100 || bs.height < 20) return;   // 尺寸未就绪
-        CAShapeLayer *mask = (CAShapeLayer *)container.layer.mask;
+        UIWindow *win = container.window;
+        if (!win) return;
+        CGRect cf = [container convertRect:container.bounds toView:nil];   // 窗口坐标
+        if (cf.size.width < 100 || cf.size.height < 20) return;            // 尺寸未就绪
+        CAShapeLayer *mask = (CAShapeLayer *)win.layer.mask;
         if (![mask isKindOfClass:[CAShapeLayer class]]) {
             mask = [[CAShapeLayer alloc] init];
             mask.fillColor = [UIColor whiteColor].CGColor;
-            container.layer.mask = mask;
-            HNPMLogThrottled(@"[灵动岛] 蒙版已应用(收缩为紧凑胶囊)");
+            win.layer.mask = mask;
+            HNPMLogThrottled(@"[灵动岛] 窗口蒙版已应用(收缩为紧凑胶囊)");
         }
-        CGFloat compactW = 166.0;
-        CGRect pill = CGRectMake((bs.width - compactW) / 2.0, 0, compactW, bs.height);
-        mask.frame = container.bounds;
-        mask.path = [UIBezierPath bezierPathWithRoundedRect:pill cornerRadius:bs.height / 2.0].CGPath;
+        CGFloat compactW = 166.0, compactH = 37.0;
+        CGRect pill = CGRectMake(cf.midX - compactW / 2.0, cf.midY - compactH / 2.0, compactW, compactH);
+        mask.frame = win.bounds;
+        mask.path = [UIBezierPath bezierPathWithRoundedRect:pill cornerRadius:compactH / 2.0].CGPath;
     } @catch (NSException *e) {}
 }
 
@@ -122,9 +125,10 @@ static void HNPMRemoveIslandMasks(void) {
     dispatch_async(dispatch_get_main_queue(), ^{
         @try {
             for (UIView *container in hnpmIslandContainers) {
-                if (container.layer.mask) {
-                    container.layer.mask = nil;
-                    HNPMLogThrottled(@"[灵动岛] 蒙版已摘除");
+                UIWindow *win = container.window;
+                if (win && [win.layer.mask isKindOfClass:[CAShapeLayer class]]) {
+                    win.layer.mask = nil;
+                    HNPMLogThrottled(@"[灵动岛] 窗口蒙版已摘除");
                 }
             }
         } @catch (NSException *e) {}
