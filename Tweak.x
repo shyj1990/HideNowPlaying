@@ -1,9 +1,9 @@
-// HideNowPlaying v0.0.26 — 岛内容隐藏(塌缩) + 播放信息重推送唤活
+// HideNowPlaying v0.0.27 — 岛内容隐藏(塌缩) + 播放信息重推送唤活
 //
 // v0.0.17 实测结论: 窗口级蒙版应用成功但仍裁不住媒体内容 → 蒙版路线放弃
 //   (容器级蒙版 v0.0.16 失败, 窗口级蒙版 v0.0.17 也失败)
 //
-// v0.0.26 方案(回到实测有效路径 + 修黑壳):
+// v0.0.27 方案(回到实测有效路径 + 修黑壳):
 //   隐藏: 藏岛的内容视图(_SAUIElementViewContentView + 宽>=30 的门户)
 //         → 岛塌缩为待机短胶囊(v0.0.12/13 用户满意的效果)
 //   恢复: ① 取消隐藏(登记表 + 全窗口类扫描兜底)
@@ -66,6 +66,23 @@ static BOOL hnpmLastPlaying = NO;
 static int  hnpmPauseStreak = 0;
 static NSHashTable *hnpmCardCells = nil;     // 弱引用: 媒体卡片单元格
 static NSHashTable *hnpmCardContents = nil;  // 弱引用: 卡片内容视图(恢复时需一并显示)
+static __weak UIView *hnpmHiddenCard = nil;  // 被左滑隐藏的那张"正在播放"卡片
+
+static void HNPMHideCard(UIView *cell);
+
+// 媒体(正在播放)卡片永远位于通知列表最底部 —— 只认最底下那张, 其他 App 的实时活动不碰
+static BOOL HNPMIsBottomMostMediaCell(UIView *cell) {
+    if (!cell || !cell.window) return NO;
+    CGRect r = [cell convertRect:cell.bounds toView:nil];
+    CGFloat bestY = -CGFLOAT_MAX;
+    for (UIView *c in hnpmCardCells) {
+        if (!c.window || c == cell || c == (UIView *)cell) continue;
+        CGRect cr = [c convertRect:c.bounds toView:nil];
+        if (cr.maxY > bestY) bestY = cr.maxY;
+    }
+    // 有其他登记卡片明显更低(>24pt) → 我不是正在播放卡片
+    return (bestY > 0 && bestY - r.maxY > 24.0) ? NO : YES;
+}
 static NSHashTable *hnpmIslandViews = nil;   // 弱引用: 灵动岛内容视图
 static void *kHNPMPanKey = &kHNPMPanKey;
 
@@ -115,28 +132,28 @@ static void HNPMSetApertureWindowsHidden(BOOL hide, NSString *tag) {
 
 #pragma mark - 卡片隐藏 / 恢复
 
-static void HNPMHideCards(void) {
+// 只隐藏被左滑的那张"正在播放"卡片(不动其他实时活动)
+static void HNPMHideCard(UIView *cell) {
+    if (!cell || !cell.window) return;
+    hnpmHiddenCard = cell;
     dispatch_async(dispatch_get_main_queue(), ^{
         @try {
-            for (UIView *cell in hnpmCardCells) {
-                if (!cell.window) continue;
-                [UIView animateWithDuration:0.35
+            [UIView animateWithDuration:0.35
                                       delay:0.0
                                     options:UIViewAnimationOptionCurveEaseIn
                                  animations:^{
-                    cell.transform = CGAffineTransformTranslate(CGAffineTransformIdentity, -440, 0);
-                    cell.alpha = 0.0;
-                }
-                                 completion:^(BOOL finished) {
-                    @try {
-                        if (hnpmHidden) {
-                            cell.hidden = YES;
-                            cell.transform = CGAffineTransformIdentity;
-                            cell.alpha = 1.0;
-                        }
-                    } @catch (NSException *e) {}
-                }];
+                cell.transform = CGAffineTransformTranslate(CGAffineTransformIdentity, -440, 0);
+                cell.alpha = 0.0;
             }
+                                 completion:^(BOOL finished) {
+                @try {
+                    if (hnpmHidden) {
+                        cell.hidden = YES;
+                        cell.transform = CGAffineTransformIdentity;
+                        cell.alpha = 1.0;
+                    }
+                } @catch (NSException *e) {}
+            }];
         } @catch (NSException *e) {}
     });
 }
@@ -148,25 +165,29 @@ static void HNPMShowCards(void) {
             for (UIView *content in hnpmCardContents) {
                 if (content.window && content.isHidden) content.hidden = NO;
             }
-            for (UIView *cell in hnpmCardCells) {
-                if (!cell.window) continue;
-                // 已在显示中的不再重复动画(防止恢复重试导致的闪烁)
-                if (!cell.hidden) continue;
-                // 只恢复还挂着媒体内容的单元格(空壳永远保持隐藏)
-                if (!HNPMCellHasLiveMedia(cell)) continue;
-                cell.hidden = NO;
-                cell.transform = CGAffineTransformTranslate(CGAffineTransformIdentity, -440, 0);
-                cell.alpha = 0.0;
-                [UIView animateWithDuration:0.35
+            // 找要恢复的卡片: 优先被左滑那张; 系统重建过就找最底部的隐藏媒体卡片
+            UIView *cell = hnpmHiddenCard;
+            if (!cell || !cell.window) {
+                CGFloat bestY = -CGFLOAT_MAX;
+                for (UIView *c in hnpmCardCells) {
+                    if (!c.window || !c.hidden || !HNPMCellHasLiveMedia(c)) continue;
+                    CGRect cr = [c convertRect:c.bounds toView:nil];
+                    if (cr.maxY > bestY) { bestY = cr.maxY; cell = c; }
+                }
+            }
+            if (!cell || !cell.window || !HNPMCellHasLiveMedia(cell)) return;
+            cell.hidden = NO;
+            cell.transform = CGAffineTransformTranslate(CGAffineTransformIdentity, -440, 0);
+            cell.alpha = 0.0;
+            [UIView animateWithDuration:0.35
                                       delay:0.0
                                     options:UIViewAnimationOptionCurveEaseOut
                                  animations:^{
-                    cell.transform = CGAffineTransformIdentity;
-                    cell.alpha = 1.0;
-                }
-                                 completion:nil];
-                HNPMAppendLog(@"[卡片] 恢复显示(带媒体内容的单元格)");
+                cell.transform = CGAffineTransformIdentity;
+                cell.alpha = 1.0;
             }
+                                 completion:nil];
+            HNPMAppendLog(@"[卡片] 恢复显示(带媒体内容的单元格)");
         } @catch (NSException *e) {}
     });
 }
@@ -189,8 +210,7 @@ static void HNPMSetHidden(BOOL hide, NSString *reason) {
     hnpmBaseline = NO;
     hnpmPauseStreak = 0;
     if (hide) {
-        HNPMHideCards();
-        // 灵动岛: 整窗隐藏(内容视图零接触, 远程渲染存活)
+        // 卡片已由 handlePan 单独隐藏(只动"正在播放"那张)
         HNPMSetApertureWindowsHidden(YES, @"隐藏");
     } else {
         HNPMRestoreWithRetries();
@@ -266,15 +286,22 @@ static void HNPMStartRestorePolling(void) {
 - (void)handlePan:(UIPanGestureRecognizer *)gr {
     @try {
         if (hnpmHidden) return;
+        // 只认"正在播放"卡片(通知列表最底部的媒体卡片); 其他 App 的实时活动不响应
+        Class cellClass = NSClassFromString(@"NCNotificationListCell");
+        UIView *p = gr.view;
+        while (p && ![p isKindOfClass:cellClass]) p = p.superview;
+        if (!p || !HNPMIsBottomMostMediaCell(p)) return;
         CGPoint t = [gr translationInView:gr.view];
         CGPoint v = [gr velocityInView:gr.view];
         if (gr.state == UIGestureRecognizerStateChanged) {
             if (t.x < -60 && fabs(t.x) > fabs(t.y) * 1.5) {
+                HNPMHideCard(p);
                 HNPMSetHidden(YES, @"锁屏播放卡片左滑");
                 HNPMStartRestorePolling();
             }
         } else if (gr.state == UIGestureRecognizerStateEnded) {
             if (t.x < -55 && fabs(t.x) > fabs(t.y) * 1.2 && v.x < -300) {
+                HNPMHideCard(p);
                 HNPMSetHidden(YES, @"锁屏播放卡片左滑(轻扫)");
                 HNPMStartRestorePolling();
             }
@@ -343,10 +370,11 @@ static void HNPMAttachPanIfNeeded(UIView *view) {
                 HNPMAttachPanIfNeeded(cell);
                 HNPMLogThrottled([NSString stringWithFormat:@"[卡片] 媒体卡片登记 单元格=%@ 内容=%@",
                                   NSStringFromCGRect(cell.frame), NSStringFromCGRect(self.frame)]);
-                if (hnpmHidden) {
+                if (hnpmHidden && HNPMIsBottomMostMediaCell(cell)) {
+                    // 隐藏期"正在播放"卡片被系统重建 → 保持隐藏; 其他实时活动不受影响
                     self.hidden = YES;
                     cell.hidden = YES;
-                } else if (cell.hidden || self.hidden) {
+                } else if (HNPMIsBottomMostMediaCell(cell) && (cell.hidden || self.hidden)) {
                     self.hidden = NO;
                     cell.transform = CGAffineTransformIdentity;
                     cell.alpha = 0.0;
@@ -371,7 +399,7 @@ static void HNPMAttachPanIfNeeded(UIView *view) {
         [hnpmIslandViews addObject:self];
         HNPMLogThrottled([NSString stringWithFormat:@"[灵动岛] 元素内容登记 frame=%@",
                           NSStringFromCGRect(self.frame)]);
-        // v0.0.26: 不再隐藏内容(藏窗口方案, 内容保持存活)
+        // v0.0.27: 不再隐藏内容(藏窗口方案, 内容保持存活)
     } @catch (NSException *e) {}
 }
 %end
@@ -387,7 +415,7 @@ static void HNPMAttachPanIfNeeded(UIView *view) {
         [hnpmIslandViews addObject:self];
         HNPMLogThrottled([NSString stringWithFormat:@"[灵动岛] 门户登记 frame=%@",
                           NSStringFromCGRect(self.frame)]);
-        // v0.0.26: 不再隐藏内容(藏窗口方案, 内容保持存活)
+        // v0.0.27: 不再隐藏内容(藏窗口方案, 内容保持存活)
     } @catch (NSException *e) {}
 }
 %end
@@ -396,12 +424,12 @@ static void HNPMAttachPanIfNeeded(UIView *view) {
 #pragma mark - 入口
 
 __attribute__((constructor)) static void HNPMRawCtor(void) {
-    HNPMAppendLog(@"v0.0.26: dylib 构造函数已执行(dyld 加载成功)");
+    HNPMAppendLog(@"v0.0.27: dylib 构造函数已执行(dyld 加载成功)");
 }
 
 %ctor {
     @autoreleasepool {
-        HNPMAppendLog(@"v0.0.26: logos %ctor 进入");
+        HNPMAppendLog(@"v0.0.27: logos %ctor 进入");
 
         if ([[NSFileManager defaultManager] fileExistsAtPath:@"/var/mobile/Documents/HideNowPlaying.off"]) {
             HNPMAppendLog(@"检测到开关文件 HideNowPlaying.off, 不注册任何 hook");
@@ -425,6 +453,6 @@ __attribute__((constructor)) static void HNPMRawCtor(void) {
         if (objc_getClass("CSActivityItemContentView"))      { %init(HNPMActivityCard); HNPMAppendLog(@"hook 已注册: 媒体卡片(宽度过滤>=300)"); }
         if (objc_getClass("_SAUIElementViewContentView"))    { %init(HNPMIslandElement); }
         if (objc_getClass("_SAUIProvidedViewContainerView")) { %init(HNPMIslandPortal); }
-        HNPMAppendLog(@"v0.0.26: %ctor 正常完成(灵动岛整窗隐藏方案)");
+        HNPMAppendLog(@"v0.0.27: %ctor 正常完成(灵动岛整窗隐藏方案)");
     }
 }
