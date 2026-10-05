@@ -1,9 +1,9 @@
-// HideNowPlaying v0.0.22 — 岛内容隐藏(塌缩) + 播放信息重推送唤活
+// HideNowPlaying v0.0.23 — 岛内容隐藏(塌缩) + 播放信息重推送唤活
 //
 // v0.0.17 实测结论: 窗口级蒙版应用成功但仍裁不住媒体内容 → 蒙版路线放弃
 //   (容器级蒙版 v0.0.16 失败, 窗口级蒙版 v0.0.17 也失败)
 //
-// v0.0.22 方案(回到实测有效路径 + 修黑壳):
+// v0.0.23 方案(回到实测有效路径 + 修黑壳):
 //   隐藏: 藏岛的内容视图(_SAUIElementViewContentView + 宽>=30 的门户)
 //         → 岛塌缩为待机短胶囊(v0.0.12/13 用户满意的效果)
 //   恢复: ① 取消隐藏(登记表 + 全窗口类扫描兜底)
@@ -75,6 +75,23 @@ static HNPMGetInfoFunc hnpmGetInfo = NULL;
 // void MRMediaRemoteSetNowPlayingInfo(CFDictionaryRef, dispatch_queue_t, id completion)
 typedef void (*HNPMSetInfoFunc)(CFDictionaryRef, dispatch_queue_t, void (^)(void));
 static HNPMSetInfoFunc hnpmSetInfo = NULL;
+// void MRMediaRemoteSetNowPlayingApplicationIsPlaying(BOOL, dispatch_queue_t, void(^)(void))
+// 系统级开关: 告诉系统"有没有 App 正在播放" → 让系统自己收起/重建媒体光圈(UIKit 动不了 CA 层光圈)
+typedef void (*HNPMSetPlayingFunc)(BOOL, dispatch_queue_t, void (^)(void));
+static HNPMSetPlayingFunc hnpmSetPlaying = NULL;
+
+static void HNPMSetAppPlaying(BOOL playing, NSString *tag, BOOL quiet) {
+    @try {
+        if (!hnpmSetPlaying) return;
+        dispatch_queue_t q = dispatch_get_global_queue(QOS_CLASS_UTILITY, 0);
+        if (!quiet) HNPMAppendLog([NSString stringWithFormat:@"[岛状态] %@ 调用 SetAppPlaying(%@)", tag, playing ? @"YES" : @"NO"]);
+        hnpmSetPlaying(playing, q, ^{
+            if (!quiet) HNPMAppendLog([NSString stringWithFormat:@"[岛状态] %@ 完成回调触发(%@)", tag, playing ? @"YES" : @"NO"]);
+        });
+    } @catch (NSException *e) {
+        HNPMAppendLog(@"[岛状态] 调用异常");
+    }
+}
 
 // "唤活": 取当前播放信息, 修改播放进度(+1s)后推回 —— 相同信息会被系统忽略,
 // 只有变化的信息才能触发媒体实况重新渲染(治恢复黑壳)
@@ -322,7 +339,7 @@ static void HNPMRestoreWithRetries(void) {
 }
 
 // 胶囊底板控制: 隐藏期间把 MagiciansCurtainView(岛的黑色胶囊背景)强制压回待机尺寸
-// (v0.0.22 侦察: 内容隐藏后系统会重新展开胶囊 → 长黑条; 每次轮询再压回去)
+// (v0.0.23 侦察: 内容隐藏后系统会重新展开胶囊 → 长黑条; 每次轮询再压回去)
 static BOOL hnpmCurtainSavedExpanded = NO;
 static CGRect hnpmCurtainExpandedFrame;
 
@@ -373,6 +390,8 @@ static void HNPMSetHidden(BOOL hide, NSString *reason) {
         HNPMHideCards();
         HNPMHideIslandViews();
         dispatch_async(dispatch_get_main_queue(), ^{ HNPMApplyCurtain(YES, @"隐藏"); });
+        // 系统级开关: 告诉系统没有 App 在播放 → 让 CA 光圈自己收起(音频不受影响)
+        HNPMSetAppPlaying(NO, @"隐藏", NO);
         // 最后一轮侦察: 锁屏窗口/通用窗口/根场景窗口的顶部区域 + 灵动岛窗口对照
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)),
                        dispatch_get_main_queue(), ^{
@@ -393,6 +412,16 @@ static void HNPMSetHidden(BOOL hide, NSString *reason) {
         HNPMRestoreWithRetries();
         HNPMShowIslandViews();
         dispatch_async(dispatch_get_main_queue(), ^{ HNPMApplyCurtain(NO, @"恢复"); });
+        // 光圈恢复: 设回"有 App 在播放" → 系统重建全新岛内容(治黑壳)
+        NSArray *restoreDelays = @[@0.3, @1.0, @3.0];
+        for (NSNumber *d in restoreDelays) {
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)([d doubleValue] * NSEC_PER_SEC)),
+                           dispatch_get_main_queue(), ^{
+                @try {
+                    if (!hnpmHidden) HNPMSetAppPlaying(YES, [NSString stringWithFormat:@"恢复+%.1fs", [d doubleValue]], NO);
+                } @catch (NSException *e) {}
+            });
+        }
         // 唤活: 视图已可见后重推播放信息, 逼远程内容重新渲染(治黑壳)
         NSArray *delays = @[@0.5, @1.5, @3.0];
         for (NSNumber *d in delays) {
@@ -428,6 +457,8 @@ static void HNPMStartRestorePolling(void) {
                             }
                             // 底板维持压缩: 系统重新展开就再压回去(记录打架)
                             HNPMApplyCurtain(YES, @"轮询");
+                            // 光圈维持收起: App 重新上报播放状态就再压一次(静默)
+                            HNPMSetAppPlaying(NO, @"轮询", YES);
                         } @catch (NSException *e) {}
                     });
                     if (!hnpmGetInfo) return;
@@ -607,12 +638,12 @@ static void HNPMAttachPanIfNeeded(UIView *view) {
 #pragma mark - 入口
 
 __attribute__((constructor)) static void HNPMRawCtor(void) {
-    HNPMAppendLog(@"v0.0.22: dylib 构造函数已执行(dyld 加载成功)");
+    HNPMAppendLog(@"v0.0.23: dylib 构造函数已执行(dyld 加载成功)");
 }
 
 %ctor {
     @autoreleasepool {
-        HNPMAppendLog(@"v0.0.22: logos %ctor 进入");
+        HNPMAppendLog(@"v0.0.23: logos %ctor 进入");
 
         if ([[NSFileManager defaultManager] fileExistsAtPath:@"/var/mobile/Documents/HideNowPlaying.off"]) {
             HNPMAppendLog(@"检测到开关文件 HideNowPlaying.off, 不注册任何 hook");
@@ -627,9 +658,11 @@ __attribute__((constructor)) static void HNPMRawCtor(void) {
         if (mr) {
             hnpmGetInfo = (HNPMGetInfoFunc)dlsym(mr, "MRMediaRemoteGetNowPlayingInfo");
             hnpmSetInfo = (HNPMSetInfoFunc)dlsym(mr, "MRMediaRemoteSetNowPlayingInfo");
-            HNPMAppendLog([NSString stringWithFormat:@"MediaRemote 已加载, 播放检测%@ / 唤活%@",
+            hnpmSetPlaying = (HNPMSetPlayingFunc)dlsym(mr, "MRMediaRemoteSetNowPlayingApplicationIsPlaying");
+            HNPMAppendLog([NSString stringWithFormat:@"MediaRemote 已加载, 播放检测%@ / 唤活%@ / 光圈开关%@",
                            hnpmGetInfo ? @"可用" : @"不可用",
-                           hnpmSetInfo ? @"可用" : @"不可用"]);
+                           hnpmSetInfo ? @"可用" : @"不可用",
+                           hnpmSetPlaying ? @"可用" : @"不可用"]);
         } else {
             HNPMAppendLog(@"MediaRemote 加载失败");
         }
@@ -637,6 +670,6 @@ __attribute__((constructor)) static void HNPMRawCtor(void) {
         if (objc_getClass("CSActivityItemContentView"))      { %init(HNPMActivityCard); HNPMAppendLog(@"hook 已注册: 媒体卡片(宽度过滤>=300)"); }
         if (objc_getClass("_SAUIElementViewContentView"))    { %init(HNPMIslandElement); }
         if (objc_getClass("_SAUIProvidedViewContainerView")) { %init(HNPMIslandPortal); }
-        HNPMAppendLog(@"v0.0.22: %ctor 正常完成(岛内容隐藏+唤活)");
+        HNPMAppendLog(@"v0.0.23: %ctor 正常完成(岛内容隐藏+唤活)");
     }
 }
