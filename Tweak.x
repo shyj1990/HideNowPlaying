@@ -497,8 +497,8 @@ static void HNPMReconApertureManager(void) {
 static id gHNPMIslandController = nil;
 static int gHNPMElementDumped = 0;
 
-%group(HNPMIslandController)
-%hook(SBSystemApertureController)
+%group HNPMIslandController
+%hook SBSystemApertureController
 - (void)registerElement:(id)el {
     %orig;
     @try {
