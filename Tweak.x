@@ -1,9 +1,9 @@
-// HideNowPlaying v0.0.40 — 岛内容隐藏(塌缩) + 播放信息重推送唤活
+// HideNowPlaying v0.0.41 — 岛内容隐藏(塌缩) + 播放信息重推送唤活
 //
 // v0.0.17 实测结论: 窗口级蒙版应用成功但仍裁不住媒体内容 → 蒙版路线放弃
 //   (容器级蒙版 v0.0.16 失败, 窗口级蒙版 v0.0.17 也失败)
 //
-// v0.0.40 方案(回到实测有效路径 + 修黑壳):
+// v0.0.41 方案(回到实测有效路径 + 修黑壳):
 //   隐藏: 藏岛的内容视图(_SAUIElementViewContentView + 宽>=30 的门户)
 //         → 岛塌缩为待机短胶囊(v0.0.12/13 用户满意的效果)
 //   恢复: ① 取消隐藏(登记表 + 全窗口类扫描兜底)
@@ -426,7 +426,7 @@ static void HNPMAttachPanIfNeeded(UIView *view) {
         [hnpmIslandViews addObject:self];
         HNPMLogThrottled([NSString stringWithFormat:@"[灵动岛] 元素内容登记 frame=%@",
                           NSStringFromCGRect(self.frame)]);
-        // v0.0.40: 不再隐藏内容(藏窗口方案, 内容保持存活)
+        // v0.0.41: 不再隐藏内容(藏窗口方案, 内容保持存活)
     } @catch (NSException *e) {}
 }
 %end
@@ -442,7 +442,7 @@ static void HNPMAttachPanIfNeeded(UIView *view) {
         [hnpmIslandViews addObject:self];
         HNPMLogThrottled([NSString stringWithFormat:@"[灵动岛] 门户登记 frame=%@",
                           NSStringFromCGRect(self.frame)]);
-        // v0.0.40: 不再隐藏内容(藏窗口方案, 内容保持存活)
+        // v0.0.41: 不再隐藏内容(藏窗口方案, 内容保持存活)
     } @catch (NSException *e) {}
 }
 %end
@@ -451,7 +451,7 @@ static void HNPMAttachPanIfNeeded(UIView *view) {
 #pragma mark - 入口
 
 __attribute__((constructor)) static void HNPMRawCtor(void) {
-    HNPMAppendLog(@"v0.0.40: dylib 构造函数已执行(dyld 加载成功)");
+    HNPMAppendLog(@"v0.0.41: dylib 构造函数已执行(dyld 加载成功)");
 }
 
 // 侦察: 灵动岛"元素管理器"是否存在及其方法签名(模型级方案的前提)
@@ -632,9 +632,66 @@ static void HNPMReconLockManager(void) {
     }
 }
 
+// 通用: 只读遍历对象属性, 记录含关键类名的引用
+static void HNPMWalkIvars(id obj, NSString *tag) {
+    @try {
+        unsigned int ic = 0;
+        Ivar *ivs = class_copyIvarList([obj class], &ic);
+        for (unsigned int i = 0; i < ic; i++) {
+            const char *ty = ivar_getTypeEncoding(ivs[i]);
+            if (!ty || ty[0] != '@') continue;
+            id v = object_getIvar(obj, ivs[i]);
+            if (!v) continue;
+            NSString *cls = NSStringFromClass([v class]);
+            if ([cls containsString:@"Aperture"] || [cls containsString:@"LockElement"]
+                || [cls containsString:@"Magician"] || [cls containsString:@"Controller"]
+                || [cls containsString:@"Provider"] || [cls containsString:@"Element"])
+                HNPMAppendLog([NSString stringWithFormat:@"[%@] 属性 %s = %@", tag, ivar_getName(ivs[i]), cls]);
+        }
+        free(ivs);
+    } @catch (NSException *e) {}
+}
+
+// 侦察: 从岛窗口/锁元素提供者侧免钩子定位 Aperture 控制器实例
+static void HNPMReconWindows(void) {
+    @try {
+        Class m = NSClassFromString(@"SBLockScreenManager");
+        id mgr = nil;
+        SEL sh = NSSelectorFromString(@"sharedInstance");
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Warc-performSelector-leaks"
+        if (m && [m respondsToSelector:sh]) mgr = [(id)m performSelector:sh];
+#pragma clang diagnostic pop
+        if (mgr) {
+            unsigned int ic = 0;
+            Ivar *ivs = class_copyIvarList([mgr class], &ic);
+            for (unsigned int i = 0; i < ic; i++) {
+                const char *ty = ivar_getTypeEncoding(ivs[i]);
+                if (!ty || ty[0] != '@') continue;
+                id v = object_getIvar(mgr, ivs[i]);
+                if (v && [NSStringFromClass([v class]) containsString:@"LockElement"]) {
+                    HNPMWalkIvars(v, @"锁元素");
+                }
+            }
+            free(ivs);
+        }
+        for (UIWindow *w in [UIApplication sharedApplication].windows) {
+            NSString *wn = NSStringFromClass([w class]);
+            if (![wn containsString:@"Aperture"]) continue;
+            HNPMAppendLog([NSString stringWithFormat:@"[岛窗口] %@", wn]);
+            HNPMWalkIvars(w, @"岛窗口");
+            HNPMWalkIvars([w rootViewController], @"岛窗口VC");
+            HNPMWalkIvars([w rootViewIfLoaded], @"岛窗口根视图");
+        }
+        HNPMAppendLog(@"[岛窗口] 遍历完成");
+    } @catch (NSException *e) {
+        HNPMAppendLog([NSString stringWithFormat:@"[岛窗口] 侦察异常: %@", e.reason]);
+    }
+}
+
 %ctor {
     @autoreleasepool {
-        HNPMAppendLog(@"v0.0.40: logos %ctor 进入");
+        HNPMAppendLog(@"v0.0.41: logos %ctor 进入");
 
         if ([[NSFileManager defaultManager] fileExistsAtPath:@"/var/mobile/Documents/HideNowPlaying.off"]) {
             HNPMAppendLog(@"检测到开关文件 HideNowPlaying.off, 不注册任何 hook");
@@ -663,7 +720,8 @@ static void HNPMReconLockManager(void) {
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
             HNPMReconApertureController();
             HNPMReconLockManager();
+            HNPMReconWindows();
         });
-        HNPMAppendLog(@"v0.0.40: %ctor 正常完成");
+        HNPMAppendLog(@"v0.0.41: %ctor 正常完成");
     }
 }
