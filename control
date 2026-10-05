@@ -1,6 +1,6 @@
 Package: com.aha.hidenowplaying
 Name: HideNowPlaying
-Version: 0.0.20
+Version: 0.0.21
 Architecture: iphoneos-arm
 Description: 左滑隐藏锁屏音乐播放器，灵动岛同步隐藏；音乐不暂停，暂停再继续播放后恢复显示。
 Author: AHA
