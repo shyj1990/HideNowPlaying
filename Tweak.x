@@ -1,13 +1,11 @@
-// HideNowPlaying v0.0.48 — 视觉隐藏已完成(v0.0.47: 岛塌短胶囊+封面波纹消失) + 模型级实验
+// HideNowPlaying v0.0.49 — 视觉隐藏保持 v0.0.47 成果 + 模型级侦察二轮(方法表倾倒)
 //
-// v0.0.47 实测: 全家桶隐藏奏效 — 外壳/容器/内容全藏, 岛=待机短胶囊, 封面/波纹消失。
-// 剩余问题: 信号图标没恢复 — 两个 Aperture 窗口内无本地信号视图(树倾实锤), 信号图标由
-//   系统按元素模型远程合成, 媒体元素在模型层仍"在"→系统持续压制信号图标。
-// v0.0.48: 修复控制器定位(rootVC→_contentViewController 子VC递归找 ivar), 调官方
-//   stateDump 前后对比; 实验调 restrictSystemApertureToDefaultLayoutWithReason:
-//   (限制岛为默认布局=短胶囊+信号图标), 恢复时 restrict(nil)+重新评估尝试解除。
-//   风险预案: 若限制无法解除→暂停播放后岛不亮, 注销(respring)即恢复, 日志会给出去向。
-// 以下 v0.0.47 方案不变: 全家桶隐藏(内容+祖先+尺寸带外壳) + 0.5s 轮询 + 恢复点亮/重挂。
+// v0.0.48 实测: 恢复正常/无崩溃; stateDump 实锤媒体元素身份 = NowPlaying(client
+//   com.apple.MediaRemoteUI, compact); restrict 前后 stateDump 无变化且带来"状态栏周期性
+//   消失"副作用 → 已撤销 restrict 及解除逻辑。
+// v0.0.49: +2s 倾倒 SBSystemApertureController 完整方法表 + _currentFirstElement 元素对象的
+//   类/方法表/变量表 → 找到真正的"移除/抑制 NowPlaying 元素"API, 下轮精准调用。
+// 保持不变: 全家桶视觉隐藏(v0.0.47) + 0.5s 轮询 + 恢复点亮/重挂 + 树倾(3/10/20s)。
 //
 // 日志: /var/mobile/Documents/HideNowPlaying.log   紧急开关: /var/mobile/Documents/HideNowPlaying.off
 
@@ -243,6 +241,46 @@ static void HNPMDumpControllerState(id ctrl, NSString *tag) {
     }
 }
 
+// v0.0.49: 模型级侦察二轮 — v0.0.48 实测 restrict 前后 stateDump 无变化且带来"状态栏周期性
+// 消失"副作用 → 已撤销。本轮: 倾倒 SBSystemApertureController 完整方法表 + _currentFirstElement
+// 元素对象的类/方法表/变量表, 找到真正的"移除/抑制 NowPlaying 元素"API → 下轮精准调用。
+static void HNPMDumpMethodList(id obj, NSString *tag) {
+    @try {
+        unsigned int mc = 0;
+        Method *ms = class_copyMethodList([obj class], &mc);
+        NSMutableString *all = [NSMutableString string];
+        for (unsigned int i = 0; i < mc; i++)
+            [all appendFormat:@"%@,", NSStringFromSelector(method_getName(ms[i]))];
+        free(ms);
+        int chunk = 0;
+        for (NSUInteger pos = 0; pos < all.length && chunk < 14; pos += 1200, chunk++) {
+            NSUInteger len = MIN((NSUInteger)1200, all.length - pos);
+            HNPMAppendLog([NSString stringWithFormat:@"[%@] 方法%02d(%u个): %@",
+                           tag, chunk + 1, mc, [all substringWithRange:NSMakeRange(pos, len)]]);
+        }
+        if (all.length > (NSUInteger)14 * 1200)
+            HNPMAppendLog([NSString stringWithFormat:@"[%@] 方法表截断", tag]);
+    } @catch (NSException *e) {}
+}
+
+static void HNPMDumpIvarList(id obj, NSString *tag) {
+    @try {
+        unsigned int ic = 0;
+        Ivar *ivs = class_copyIvarList([obj class], &ic);
+        NSMutableString *all = [NSMutableString string];
+        for (unsigned int i = 0; i < ic; i++)
+            [all appendFormat:@"%@(%s),", ivar_getName(ivs[i]),
+             ivar_getTypeEncoding(ivs[i]) ? ivar_getTypeEncoding(ivs[i]) : "?"];
+        free(ivs);
+        int chunk = 0;
+        for (NSUInteger pos = 0; pos < all.length && chunk < 6; pos += 1200, chunk++) {
+            NSUInteger len = MIN((NSUInteger)1200, all.length - pos);
+            HNPMAppendLog([NSString stringWithFormat:@"[%@] 变量%02d(%u个): %@",
+                           tag, chunk + 1, ic, [all substringWithRange:NSMakeRange(pos, len)]]);
+        }
+    } @catch (NSException *e) {}
+}
+
 static void HNPMReconControllerState(void) {
     dispatch_async(dispatch_get_main_queue(), ^{
         @try {
@@ -250,45 +288,26 @@ static void HNPMReconControllerState(void) {
             if (!ctrl) { HNPMAppendLog(@"[岛态] 未定位到 SBSystemApertureController 实例"); return; }
             HNPMAppendLog(@"[岛态] 控制器实例已定位(经窗口VC链)");
             HNPMDumpControllerState(ctrl, @"·前");
-            // 实验: 模型级抑制 — 请求系统把岛限制在默认布局(待机短胶囊+信号图标)
+            HNPMDumpMethodList(ctrl, @"岛法·控");
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Warc-performSelector-leaks"
-            SEL rl = NSSelectorFromString(@"restrictSystemApertureToDefaultLayoutWithReason:");
-            if ([ctrl respondsToSelector:rl]) {
-                [ctrl performSelector:rl withObject:@"HideNowPlaying"];
-                HNPMAppendLog(@"[岛态] 已调 restrictSystemApertureToDefaultLayout(HideNowPlaying)");
-            } else {
-                HNPMAppendLog(@"[岛态] 无 restrictSystemApertureToDefaultLayoutWithReason: 方法");
+            SEL fe = NSSelectorFromString(@"_currentFirstElement");
+            if ([ctrl respondsToSelector:fe]) {
+                id el = [ctrl performSelector:fe];
+                if (el) {
+                    NSString *desc = [el description];
+                    if (desc.length > 800) desc = [desc substringToIndex:800];
+                    HNPMAppendLog([NSString stringWithFormat:@"[岛素] 首元素(%@)= %@",
+                                   NSStringFromClass([el class]), desc]);
+                    HNPMDumpMethodList(el, @"岛法·素");
+                    HNPMDumpIvarList(el, @"岛素变量");
+                } else {
+                    HNPMAppendLog(@"[岛素] 当前无首元素(nil)");
+                }
             }
 #pragma clang diagnostic pop
-            HNPMDumpControllerState(ctrl, @"·后");
         } @catch (NSException *e) {
             HNPMAppendLog([NSString stringWithFormat:@"[岛态] 侦察异常: %@", e.reason]);
-        }
-    });
-}
-
-// 恢复时解除模型级限制: restrict(nil) + 重新评估抑制状态
-static void HNPMReleaseIslandRestriction(void) {
-    dispatch_async(dispatch_get_main_queue(), ^{
-        @try {
-            id ctrl = HNPMIslandController();
-            if (!ctrl) { HNPMAppendLog(@"[岛态·解除] 未定位到控制器实例"); return; }
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Warc-performSelector-leaks"
-            SEL rl = NSSelectorFromString(@"restrictSystemApertureToDefaultLayoutWithReason:");
-            if ([ctrl respondsToSelector:rl]) {
-                [ctrl performSelector:rl withObject:nil];
-                HNPMAppendLog(@"[岛态·解除] 已调 restrict(nil)");
-            }
-            SEL re = NSSelectorFromString(@"_reevaluateSystemApertureCompleteSuppression");
-            if ([ctrl respondsToSelector:re]) {
-                [ctrl performSelector:re];
-                HNPMAppendLog(@"[岛态·解除] 已调 _reevaluateSystemApertureCompleteSuppression");
-            }
-#pragma clang diagnostic pop
-        } @catch (NSException *e) {
-            HNPMAppendLog([NSString stringWithFormat:@"[岛态·解除] 异常: %@", e.reason]);
         }
     });
 }
@@ -481,7 +500,6 @@ static void HNPMSetHidden(BOOL hide, NSString *reason) {
             });
         }
     } else {
-        HNPMReleaseIslandRestriction();   // v0.0.48: 先发模型级解除请求(restrict(nil)+重新评估)
         HNPMRestoreWithRetries();
         HNPMSetIslandContentHidden(NO, @"恢复");
     }
@@ -766,7 +784,7 @@ static void HNPMWalkIvars(id obj, NSString *tag);
 #pragma mark - 入口
 
 __attribute__((constructor)) static void HNPMRawCtor(void) {
-    HNPMAppendLog(@"v0.0.48: dylib 构造函数已执行(dyld 加载成功)");
+    HNPMAppendLog(@"v0.0.49: dylib 构造函数已执行(dyld 加载成功)");
 }
 
 // 侦察: 灵动岛"元素管理器"是否存在及其方法签名(模型级方案的前提)
@@ -1094,7 +1112,7 @@ static void HNPMReconDeep(void) {
 
 %ctor {
     @autoreleasepool {
-        HNPMAppendLog(@"v0.0.48: logos %ctor 进入");
+        HNPMAppendLog(@"v0.0.49: logos %ctor 进入");
 
         if ([[NSFileManager defaultManager] fileExistsAtPath:@"/var/mobile/Documents/HideNowPlaying.off"]) {
             HNPMAppendLog(@"检测到开关文件 HideNowPlaying.off, 不注册任何 hook");
@@ -1126,6 +1144,6 @@ static void HNPMReconDeep(void) {
             HNPMReconWindows();
             HNPMReconDeep();
         });
-        HNPMAppendLog(@"v0.0.48: %ctor 正常完成");
+        HNPMAppendLog(@"v0.0.49: %ctor 正常完成");
     }
 }
