@@ -417,6 +417,9 @@ static void HNPMAttachPanIfNeeded(UIView *view) {
 %end
 
 // 灵动岛: 元素内容视图(锁图标+媒体图标)
+static void HNPMWalkIvarsFull(id obj, NSString *tag);
+static void HNPMWalkIvars(id obj, NSString *tag);
+
 %group HNPMIslandElement
 %hook _SAUIElementViewContentView
 - (void)didMoveToWindow {
