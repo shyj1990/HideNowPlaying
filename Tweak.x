@@ -1,16 +1,16 @@
-// HideNowPlaying v0.0.44 — 灵动岛整窗隐藏 + 恢复时修复岛内部(找回信号/WiFi/电池)
+// HideNowPlaying v0.0.45 — 岛内媒体内容级隐藏(窗口保持存活, 原生待机观感)
 //
-// v0.0.43 实测: 整窗隐藏/恢复后媒体正常, 但信号/WiFi/电池图标不回来
-//   (它们是岛的"尾部元素", 与媒体同住 Aperture 窗口, 恢复后被系统冻结不上屏)
+// v0.0.44 实测: 整窗隐藏/恢复后媒体正常, 但信号/WiFi/电池与媒体同窗被"陪葬",
+//   隐藏期间状态栏不完整。用户要求与原生一致:
+//   隐藏期 = 待机观感(信号图标可见) / 恢复后 = 播放观感(媒体展开, 信号让位)。
 //
-// v0.0.44 方案:
-//   隐藏: 整体隐藏名字含 Aperture 的窗口(音乐不暂停; 0.5s 轮询维持隐藏)
-//   恢复: 重新显示窗口 + "修复巡检"(0s/0.3s/1.2s/3s 共四次):
-//         ① 遍历窗口内部, 把类名含 SAUI/Portal/Status/Signal/Trailing/Provided/Package
-//           且被隐藏(hidden 或 alpha<0.05)的系统视图恢复显示
-//         ② 强制窗口重新布局(setNeedsLayout + layoutIfNeeded)
-//         ③ 0.5pt 位置抖动, 逼 WindowServer 重新合成上屏
-//         巡检同时记录窗口内所有隐藏视图(类名+原因), 修复无效时用于下一步定位
+// v0.0.45 方案(内容级隐藏, 回归 v0.0.12/13 路线 + 新抗黑壳手段):
+//   隐藏: 只藏岛内媒体内容视图(_SAUIElementViewContentView / _SAUIProvidedViewContainerView
+//         且宽>=80 —— 紧凑胶囊约126宽, 展开态160~390, 活动图标一般<50), 窗口不藏
+//         → 系统自动回到待机布局: 短胶囊 + 信号图标 + 其他活动图标保留
+//   维持: 0.5s 轮询重申隐藏(对抗系统动画), 隐藏期新建的媒体内容由钩子延迟判定拦截
+//   恢复: 点亮内容视图 + "原位重新挂载"(摘下再装回, 逼远程渲染重新 attach, 抗黑壳)
+//         + 多次重试兜底
 //   卡片: 维持原逻辑(实测可靠: 滑出动画 + 恢复重试 + 登记自愈)
 //
 // 日志: /var/mobile/Documents/HideNowPlaying.log   紧急开关: /var/mobile/Documents/HideNowPlaying.off
@@ -118,76 +118,61 @@ static BOOL HNPMCellHasLiveMedia(UIView *cell) {
     return NO;
 }
 
-// v0.0.44: 恢复时修复岛内部被"冻结"的系统内容(信号/WiFi/电池 = 尾部元素, 与媒体同窗)
-// 做法: 找回被藏起来的系统视图 + 强制重排 + 微抖窗口逼 WindowServer 重新上屏
-static void HNPMRepairWindowInterior(UIWindow *w) {
-    @try {
-        int fixed = 0, hiddenSeen = 0;
-        NSMutableArray *hiddenDescs = [NSMutableArray array];
-        NSMutableArray *stack = [NSMutableArray arrayWithObject:w];
-        int guard = 0;
-        while (stack.count > 0 && guard++ < 600) {
-            UIView *v = stack.firstObject;
-            [stack removeObjectAtIndex:0];
-            if (!v) continue;
-            NSString *cls = NSStringFromClass([v class]);
-            BOOL sysPart = [cls containsString:@"SAUI"] || [cls containsString:@"Portal"]
-                        || [cls containsString:@"Status"] || [cls containsString:@"Signal"]
-                        || [cls containsString:@"Trailing"] || [cls containsString:@"Provided"]
-                        || [cls containsString:@"Package"] || [cls containsString:@"Magician"];
-            if (v.isHidden || v.alpha < 0.05) {
-                hiddenSeen++;
-                if (hiddenDescs.count < 12) {
-                    [hiddenDescs addObject:[NSString stringWithFormat:@"%@%@",
-                                            cls, v.isHidden ? @"(隐藏)" : @"(透明)"]];
-                }
-                if (sysPart && v != w) {
-                    v.hidden = NO;
-                    v.alpha = 1.0;
-                    fixed++;
-                }
-            }
-            [stack addObjectsFromArray:v.subviews];
-        }
-        // 强制窗口重新布局 + 0.5pt 微抖逼 WindowServer 重新合成(肉眼不可见)
-        [w setNeedsLayout];
-        [w layoutIfNeeded];
-        UIViewController *vc = w.rootViewController;
-        UIView *rv = vc.viewIfLoaded;
-        if (rv) { [rv setNeedsLayout]; [rv layoutIfNeeded]; }
-        CGRect f = w.frame;
-        w.frame = CGRectOffset(f, 0, 0.5);
-        w.frame = f;
-        if (fixed > 0 || hiddenSeen > 0) {
-            HNPMAppendLog([NSString stringWithFormat:@"[岛窗] 修复巡检 隐藏视图=%d 修复=%d [%@]",
-                           hiddenSeen, fixed, [hiddenDescs componentsJoinedByString:@", "]]);
-        }
-    } @catch (NSException *e) {}
+// v0.0.45: 内容级隐藏 —— 只藏岛内的"媒体内容视图", 窗口保持存活
+// 信号/WiFi/电池(尾部元素)与媒体同窗, 整窗隐藏会陪葬 → 内容级隐藏让系统自动回到待机布局
+// (隐藏期 = 原生待机观感: 短胶囊 + 信号图标 + 其他活动图标; 恢复后 = 原生播放观感)
+static BOOL HNPMIsIslandMediaView(UIView *v) {
+    if (!v) return NO;
+    NSString *cls = NSStringFromClass([v class]);
+    if (![cls isEqualToString:@"_SAUIElementViewContentView"]
+        && ![cls isEqualToString:@"_SAUIProvidedViewContainerView"]) return NO;
+    return v.bounds.size.width >= 80.0;
 }
 
-static void HNPMRepairAllApertureWindows(void) {
+static void HNPMSetIslandContentHidden(BOOL hide, NSString *tag) {
     dispatch_async(dispatch_get_main_queue(), ^{
         @try {
+            int n = 0, kicked = 0;
+            NSMutableArray *descs = [NSMutableArray array];
             for (UIWindow *w in [UIApplication sharedApplication].windows) {
                 if (![NSStringFromClass([w class]) containsString:@"Aperture"]) continue;
-                HNPMRepairWindowInterior(w);
+                NSMutableArray *stack = [NSMutableArray arrayWithObject:w];
+                int guard = 0;
+                while (stack.count > 0 && guard++ < 600) {
+                    UIView *v = stack.firstObject;
+                    [stack removeObjectAtIndex:0];
+                    if (!v) continue;
+                    [stack addObjectsFromArray:v.subviews];
+                    if (!HNPMIsIslandMediaView(v)) continue;
+                    if (hide) {
+                        if (!v.isHidden) {
+                            v.hidden = YES;
+                            n++;
+                            if (descs.count < 8)
+                                [descs addObject:[NSString stringWithFormat:@"%@ %@",
+                                                  NSStringFromClass([v class]), NSStringFromCGRect(v.frame)]];
+                        }
+                    } else if (v.isHidden || v.alpha < 0.05) {
+                        v.hidden = NO;
+                        v.alpha = 1.0;
+                        n++;
+                        // 原位重新挂载(摘下再装回) → 逼远程渲染管线重新 attach, 抗黑壳
+                        UIView *sp = v.superview;
+                        if (sp) {
+                            NSUInteger idx = [sp.subviews indexOfObject:v];
+                            [v removeFromSuperview];
+                            [sp insertSubview:v atIndex:idx];
+                            kicked++;
+                        }
+                    }
+                }
             }
-        } @catch (NSException *e) {}
-    });
-}
-
-// 灵动岛窗口整体隐藏(基线方案: 实验证明按内容筛选无效——媒体与活动同住一个窗口)
-static void HNPMSetApertureWindowsHidden(BOOL hide, NSString *tag) {
-    dispatch_async(dispatch_get_main_queue(), ^{
-        @try {
-            int n = 0;
-            for (UIWindow *w in [UIApplication sharedApplication].windows) {
-                if (![NSStringFromClass([w class]) containsString:@"Aperture"]) continue;
-                if (w.isHidden != hide) { w.hidden = hide; n++; }
-                if (!hide) HNPMRepairWindowInterior(w);
+            if (n > 0 || [tag isEqualToString:@"隐藏"] || [tag isEqualToString:@"恢复"]) {
+                NSString *kick = kicked > 0 ? [NSString stringWithFormat:@"(重新挂载 %d)", kicked] : @"";
+                HNPMAppendLog([NSString stringWithFormat:@"[岛内] %@ 媒体内容 %d 个→%@%@ %@",
+                               tag, n, hide ? @"隐藏" : @"显示", kick,
+                               [descs componentsJoinedByString:@" | "]]);
             }
-            if (n > 0) HNPMAppendLog([NSString stringWithFormat:@"[岛窗] %@ %d 个灵动岛窗口→%@",
-                                      tag, n, hide ? @"隐藏" : @"显示"]);
         } @catch (NSException *e) {}
     });
 }
@@ -263,7 +248,7 @@ static void HNPMRestoreWithRetries(void) {
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)([d doubleValue] * NSEC_PER_SEC)),
                        dispatch_get_main_queue(), ^{
             @try {
-                if (!hnpmHidden) HNPMShowCards();
+                if (!hnpmHidden) { HNPMShowCards(); HNPMSetIslandContentHidden(NO, @"重试"); }
             } @catch (NSException *e) {}
         });
     }
@@ -276,25 +261,16 @@ static void HNPMSetHidden(BOOL hide, NSString *reason) {
     hnpmPauseStreak = 0;
     if (hide) {
         // 卡片已由 handlePan 单独隐藏(只动"正在播放"那张)
-        HNPMSetApertureWindowsHidden(YES, @"隐藏");
+        HNPMSetIslandContentHidden(YES, @"隐藏");
     } else {
         HNPMRestoreWithRetries();
-        HNPMSetApertureWindowsHidden(NO, @"恢复");
-        // 延迟补巡检: 系统可能在窗口显示后才冻结尾部内容(信号/WiFi/电池)
-        for (NSNumber *d in @[@0.3, @1.2, @3.0]) {
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)([d doubleValue] * NSEC_PER_SEC)),
-                           dispatch_get_main_queue(), ^{
-                @try {
-                    if (!hnpmHidden) HNPMRepairAllApertureWindows();
-                } @catch (NSException *e) {}
-            });
-        }
+        HNPMSetIslandContentHidden(NO, @"恢复");
     }
     HNPMAppendLog([NSString stringWithFormat:@"%@ → 状态=%@",
                    reason, hide ? @"已隐藏(音乐继续)" : @"已恢复显示"]);
 }
 
-// 0.5 秒轮询: 隐藏期间检测"暂停→继续播放"; 维持灵动岛窗口隐藏(系统重开就再藏)
+// 0.5 秒轮询: 隐藏期间检测"暂停→继续播放"; 维持岛内媒体内容隐藏(系统重开就再藏)
 static void HNPMStartRestorePolling(void) {
     dispatch_async(dispatch_get_main_queue(), ^{
         @try {
@@ -309,7 +285,7 @@ static void HNPMStartRestorePolling(void) {
                     }
                     dispatch_async(dispatch_get_main_queue(), ^{
                         @try {
-                            HNPMSetApertureWindowsHidden(YES, @"轮询");
+                            HNPMSetIslandContentHidden(YES, @"轮询");
                         } @catch (NSException *e) {}
                     });
                     if (!hnpmGetInfo) return;
@@ -498,6 +474,15 @@ static void HNPMWalkIvars(id obj, NSString *tag);
         [hnpmIslandViews addObject:self];
         HNPMLogThrottled([NSString stringWithFormat:@"[灵动岛] 元素内容登记 frame=%@",
                           NSStringFromCGRect(self.frame)]);
+        // v0.0.45: 隐藏期间系统新建的媒体内容 → 延迟 0.3s 待宽度稳定后判定并保持隐藏
+        if (hnpmHidden) {
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.3 * NSEC_PER_SEC)),
+                           dispatch_get_main_queue(), ^{
+                @try {
+                    if (hnpmHidden && self.window && HNPMIsIslandMediaView(self)) self.hidden = YES;
+                } @catch (NSException *e) {}
+            });
+        }
         // 一次性: 翻内容视图的属性链找元素模型
         static BOOL walked = NO;
         if (!walked) {
@@ -545,7 +530,15 @@ static void HNPMWalkIvars(id obj, NSString *tag);
         [hnpmIslandViews addObject:self];
         HNPMLogThrottled([NSString stringWithFormat:@"[灵动岛] 门户登记 frame=%@",
                           NSStringFromCGRect(self.frame)]);
-        // v0.0.43: 不再隐藏内容(藏窗口方案, 内容保持存活)
+        // v0.0.45: 隐藏期间系统新建的媒体内容 → 延迟 0.3s 待宽度稳定后判定并保持隐藏
+        if (hnpmHidden) {
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.3 * NSEC_PER_SEC)),
+                           dispatch_get_main_queue(), ^{
+                @try {
+                    if (hnpmHidden && self.window && HNPMIsIslandMediaView(self)) self.hidden = YES;
+                } @catch (NSException *e) {}
+            });
+        }
     } @catch (NSException *e) {}
 }
 %end
@@ -554,7 +547,7 @@ static void HNPMWalkIvars(id obj, NSString *tag);
 #pragma mark - 入口
 
 __attribute__((constructor)) static void HNPMRawCtor(void) {
-    HNPMAppendLog(@"v0.0.44: dylib 构造函数已执行(dyld 加载成功)");
+    HNPMAppendLog(@"v0.0.45: dylib 构造函数已执行(dyld 加载成功)");
 }
 
 // 侦察: 灵动岛"元素管理器"是否存在及其方法签名(模型级方案的前提)
