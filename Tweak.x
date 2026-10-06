@@ -1,15 +1,16 @@
-// HideNowPlaying v0.0.46 — 内容级隐藏(同 v0.0.45) + 隐藏期岛窗口视图树倾倒(侦察)
+// HideNowPlaying v0.0.47 — 隐藏升级为"媒体元素全家桶"(内容+祖先+外壳) + 岛控制器模型态侦察
 //
-// v0.0.45 实测: 左滑瞬间岛内无可藏内容(0个, 锁屏时岛是空的), 媒体内容在 1~11s 后
-//   才被系统创建并被轮询藏掉(189×36 紧凑 / 328×62 展开都藏到了); 但解锁后封面/波纹
-//   仍可见 → 可见媒体渲染在**其他视图**里(不是我们藏的两类, 或宽度<80 漏网)。
-//
-// v0.0.46 新增: 隐藏后 3s(锁屏态)/10s(解锁后态) 各倾倒一次两个 Aperture 窗口的
-//   完整视图树(类名/frame/hidden/alpha), 定位封面/波纹到底住在哪些视图 → 定过滤线。
-// 以下 v0.0.45 方案保持不变:
-//   隐藏: 只藏岛内媒体内容视图(_SAUIElementViewContentView / _SAUIProvidedViewContainerView
-//         且宽>=80), 窗口不藏 → 系统自动回待机布局: 信号图标 + 活动图标保留
-//   维持: 0.5s 轮询重申隐藏; 恢复: 点亮 + 原位重新挂载(抗黑壳) + 重试兜底
+// v0.0.46 树倾结论: 内容视图(_SAUIElementViewContentView)藏到了(h=1)但封面/波纹仍可见;
+//   可见物 = ①媒体元素外壳(宽189/325.67的UIView: LumaTracking背景+KeyLine描边+GainMap)
+//           ②元素容器链(SBSystemApertureContainerView→Scaling→Rotating→SAUIElementView, 全部h=0)
+//           ③可疑快照叶视图(324×61 / 187×34 纯UIView叶子, 可能持 layer.contents 画面)
+//   待机短胶囊(125宽 MagiciansCurtain 幕帘)一直都在 → 藏掉外壳即呈现待机观感。
+// v0.0.47 隐藏范围: 媒体内容视图 + 其全部祖先 + "尺寸带(宽150~350, 高30~80)且与媒体
+//   frame 重叠"的外壳视图; 幕帘(125宽)/信号/活动图标不在尺寸带内不受影响。
+//   若像素仍可见 = 远程渲染无视本地 hidden → 下轮走模型级(已备 stateDump 侦察)。
+// 新增: 隐藏后 +2s 经岛窗口VC链(_backlightSessionAggregator)定位 SBSystemApertureController
+//   实例(免钩子), 调 stateDump 输出元素模型/断言状态, 为模型级方案铺路。
+// 其余 v0.0.45 方案不变: 0.5s 轮询维持 + 钩子拦截新建 + 恢复点亮/原位重挂/重试兜底。
 //
 // 日志: /var/mobile/Documents/HideNowPlaying.log   紧急开关: /var/mobile/Documents/HideNowPlaying.off
 
@@ -151,9 +152,10 @@ static void HNPMDumpApertureTrees(NSString *tag) {
                         lines++;
                         NSMutableString *indent = [NSMutableString string];
                         for (int i = 0; i < d; i++) [indent appendString:@"  "];
-                        HNPMAppendLog([NSString stringWithFormat:@"[树倾%@] %@%@ f=%@ h=%d a=%.2f",
+                        HNPMAppendLog([NSString stringWithFormat:@"[树倾%@] %@%@ f=%@ h=%d a=%.2f c=%d",
                                        tag, indent, NSStringFromClass([v class]),
-                                       NSStringFromCGRect(v.frame), v.isHidden ? 1 : 0, v.alpha]);
+                                       NSStringFromCGRect(v.frame), v.isHidden ? 1 : 0, v.alpha,
+                                       v.layer.contents ? 1 : 0]);
                     }
                     NSArray *subs = [v subviews];
                     NSUInteger cnt = subs.count;
@@ -171,26 +173,113 @@ static void HNPMDumpApertureTrees(NSString *tag) {
     });
 }
 
+// v0.0.47: 模型级侦察 — 经岛窗口VC链定位 SBSystemApertureController 实例(免钩子, 不碰方法实现),
+// 调官方调试方法 stateDump 输出元素模型/断言状态, 为模型级隐藏方案铺路
+static void HNPMReconControllerState(void) {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        @try {
+            id ctrl = nil;
+            for (UIWindow *w in [UIApplication sharedApplication].windows) {
+                if (![NSStringFromClass([w class]) containsString:@"Aperture"]) continue;
+                UIViewController *rvc = w.rootViewController;
+                if (!rvc) continue;
+                unsigned int ic = 0;
+                Ivar *ivs = class_copyIvarList([rvc class], &ic);
+                for (unsigned int i = 0; i < ic && !ctrl; i++) {
+                    const char *ty = ivar_getTypeEncoding(ivs[i]);
+                    if (!ty || ty[0] != '@') continue;
+                    id v = object_getIvar(rvc, ivs[i]);
+                    if (!v) continue;
+                    if ([NSStringFromClass([v class]) isEqualToString:@"SBSystemApertureController"]) ctrl = v;
+                }
+                free(ivs);
+                if (ctrl) break;
+            }
+            if (!ctrl) { HNPMAppendLog(@"[岛态] 未定位到 SBSystemApertureController 实例"); return; }
+            HNPMAppendLog(@"[岛态] 控制器实例已定位(经窗口VC链)");
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Warc-performSelector-leaks"
+            SEL sd = NSSelectorFromString(@"stateDump");
+            if ([ctrl respondsToSelector:sd]) {
+                id dump = [ctrl performSelector:sd];
+                NSString *s = [dump description];
+                if (s.length > 4000) s = [s substringToIndex:4000];
+                HNPMAppendLog([NSString stringWithFormat:@"[岛态] stateDump:\n%@", s]);
+            } else {
+                HNPMAppendLog(@"[岛态] 无 stateDump 方法");
+            }
+            SEL fe = NSSelectorFromString(@"_currentFirstElement");
+            if ([ctrl respondsToSelector:fe]) {
+                id el = [ctrl performSelector:fe];
+                NSString *desc = el ? [el description] : @"(nil)";
+                if (desc.length > 600) desc = [desc substringToIndex:600];
+                HNPMAppendLog([NSString stringWithFormat:@"[岛态] 当前首元素(%@)= %@",
+                               el ? NSStringFromClass([el class]) : @"无", desc]);
+            }
+#pragma clang diagnostic pop
+        } @catch (NSException *e) {
+            HNPMAppendLog([NSString stringWithFormat:@"[岛态] 侦察异常: %@", e.reason]);
+        }
+    });
+}
+
+// 尺寸带: 媒体元素的外壳/容器/快照视图都落在 宽150~350 × 高30~80
+// (幕帘125宽、待机元素126宽、活动小图标22~30宽、全屏容器393宽 都不在带内)
+static BOOL HNPMInMediaSizeBand(CGSize size) {
+    return (size.width >= 150.0 && size.width <= 350.0
+            && size.height >= 30.0 && size.height <= 80.0);
+}
+
+// v0.0.47: "媒体元素全家桶"隐藏 —— 内容视图 + 其全部祖先 + 尺寸带内与媒体 frame 重叠的外壳
+// 恢复时同一套判定反向点亮; 只对内容视图做原位重新挂载(抗黑壳)
 static void HNPMSetIslandContentHidden(BOOL hide, NSString *tag) {
     dispatch_async(dispatch_get_main_queue(), ^{
         @try {
-            int n = 0, kicked = 0;
-            NSMutableArray *descs = [NSMutableArray array];
+            NSMutableArray *t1 = [NSMutableArray array];       // 媒体内容视图(两类)
+            NSMutableArray *t1Frames = [NSMutableArray array]; // 内容视图窗口坐标(外扩12pt)
+            NSMutableSet *family = [NSMutableSet set];         // 内容视图的全部祖先
+            // 第一遍: 收集媒体内容视图 + 祖先链 + frame
             for (UIWindow *w in [UIApplication sharedApplication].windows) {
                 if (![NSStringFromClass([w class]) containsString:@"Aperture"]) continue;
                 NSMutableArray *stack = [NSMutableArray arrayWithObject:w];
                 int guard = 0;
-                while (stack.count > 0 && guard++ < 600) {
+                while (stack.count > 0 && guard++ < 800) {
                     UIView *v = stack.firstObject;
                     [stack removeObjectAtIndex:0];
                     if (!v) continue;
                     [stack addObjectsFromArray:v.subviews];
                     if (!HNPMIsIslandMediaView(v)) continue;
+                    [t1 addObject:v];
+                    [t1Frames addObject:[NSValue valueWithCGRect:CGRectInset([v convertRect:v.bounds toView:nil], -12, -12)]];
+                    for (UIView *p = v.superview; p && p != w; p = p.superview) [family addObject:p];
+                }
+            }
+            int n = 0, kicked = 0, shells = 0;
+            NSMutableArray *descs = [NSMutableArray array];
+            // 第二遍: 应用(内容视图 / 祖先 / 与媒体 frame 重叠的尺寸带外壳)
+            for (UIWindow *w in [UIApplication sharedApplication].windows) {
+                if (![NSStringFromClass([w class]) containsString:@"Aperture"]) continue;
+                NSMutableArray *stack = [NSMutableArray arrayWithObject:w];
+                int guard = 0;
+                while (stack.count > 0 && guard++ < 800) {
+                    UIView *v = stack.firstObject;
+                    [stack removeObjectAtIndex:0];
+                    if (!v) continue;
+                    [stack addObjectsFromArray:v.subviews];
+                    BOOL isT1 = HNPMIsIslandMediaView(v);
+                    BOOL linked = isT1 || [family containsObject:v];
+                    if (!linked && HNPMInMediaSizeBand(v.frame)) {
+                        CGRect wf = [v convertRect:v.bounds toView:nil];
+                        for (NSValue *fv in t1Frames) {
+                            if (CGRectIntersectsRect(wf, [fv CGRectValue])) { linked = YES; shells++; break; }
+                        }
+                    }
+                    if (!linked) continue;
                     if (hide) {
                         if (!v.isHidden) {
                             v.hidden = YES;
                             n++;
-                            if (descs.count < 8)
+                            if (descs.count < 6)
                                 [descs addObject:[NSString stringWithFormat:@"%@ %@",
                                                   NSStringFromClass([v class]), NSStringFromCGRect(v.frame)]];
                         }
@@ -198,21 +287,23 @@ static void HNPMSetIslandContentHidden(BOOL hide, NSString *tag) {
                         v.hidden = NO;
                         v.alpha = 1.0;
                         n++;
-                        // 原位重新挂载(摘下再装回) → 逼远程渲染管线重新 attach, 抗黑壳
-                        UIView *sp = v.superview;
-                        if (sp) {
-                            NSUInteger idx = [sp.subviews indexOfObject:v];
-                            [v removeFromSuperview];
-                            [sp insertSubview:v atIndex:idx];
-                            kicked++;
+                        // 内容视图原位重新挂载(摘下再装回) → 逼远程渲染管线重新 attach, 抗黑壳
+                        if (isT1) {
+                            UIView *sp = v.superview;
+                            if (sp) {
+                                NSUInteger idx = [sp.subviews indexOfObject:v];
+                                [v removeFromSuperview];
+                                [sp insertSubview:v atIndex:idx];
+                                kicked++;
+                            }
                         }
                     }
                 }
             }
             if (n > 0 || [tag isEqualToString:@"隐藏"] || [tag isEqualToString:@"恢复"]) {
                 NSString *kick = kicked > 0 ? [NSString stringWithFormat:@"(重新挂载 %d)", kicked] : @"";
-                HNPMAppendLog([NSString stringWithFormat:@"[岛内] %@ 媒体内容 %d 个→%@%@ %@",
-                               tag, n, hide ? @"隐藏" : @"显示", kick,
+                HNPMAppendLog([NSString stringWithFormat:@"[岛内] %@ 命中 %d 个→%@%@ 外壳%d %@",
+                               tag, n, hide ? @"隐藏" : @"显示", kick, shells,
                                [descs componentsJoinedByString:@" | "]]);
             }
         } @catch (NSException *e) {}
@@ -304,8 +395,14 @@ static void HNPMSetHidden(BOOL hide, NSString *reason) {
     if (hide) {
         // 卡片已由 handlePan 单独隐藏(只动"正在播放"那张)
         HNPMSetIslandContentHidden(YES, @"隐藏");
-        // v0.0.46: 隐藏后 3s(锁屏态)/10s(解锁后态) 各倾倒一次岛窗口视图树
-        for (NSNumber *d in @[@3.0, @10.0]) {
+        // v0.0.47: +2s 岛控制器模型态侦察; +3s(锁屏态)/10s(解锁后态)/20s(稳定态) 视图树倾倒
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            @try {
+                if (hnpmHidden) HNPMReconControllerState();
+            } @catch (NSException *e) {}
+        });
+        for (NSNumber *d in @[@3.0, @10.0, @20.0]) {
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)([d doubleValue] * NSEC_PER_SEC)),
                            dispatch_get_main_queue(), ^{
                 @try {
@@ -598,7 +695,7 @@ static void HNPMWalkIvars(id obj, NSString *tag);
 #pragma mark - 入口
 
 __attribute__((constructor)) static void HNPMRawCtor(void) {
-    HNPMAppendLog(@"v0.0.46: dylib 构造函数已执行(dyld 加载成功)");
+    HNPMAppendLog(@"v0.0.47: dylib 构造函数已执行(dyld 加载成功)");
 }
 
 // 侦察: 灵动岛"元素管理器"是否存在及其方法签名(模型级方案的前提)
@@ -926,7 +1023,7 @@ static void HNPMReconDeep(void) {
 
 %ctor {
     @autoreleasepool {
-        HNPMAppendLog(@"v0.0.43: logos %ctor 进入");
+        HNPMAppendLog(@"v0.0.47: logos %ctor 进入");
 
         if ([[NSFileManager defaultManager] fileExistsAtPath:@"/var/mobile/Documents/HideNowPlaying.off"]) {
             HNPMAppendLog(@"检测到开关文件 HideNowPlaying.off, 不注册任何 hook");
@@ -958,6 +1055,6 @@ static void HNPMReconDeep(void) {
             HNPMReconWindows();
             HNPMReconDeep();
         });
-        HNPMAppendLog(@"v0.0.43: %ctor 正常完成");
+        HNPMAppendLog(@"v0.0.47: %ctor 正常完成");
     }
 }
