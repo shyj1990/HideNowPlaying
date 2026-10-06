@@ -1084,6 +1084,7 @@ static void HNPMReconDeep(void) {
 
 // v0.0.50: 岛元素抑制策略钩子 — 隐藏期让系统把 NowPlaying 元素当作"应被抑制",
 // 沿用苹果自己的抑制机制 → 岛回默认布局(待机短胶囊+信号图标), 活动元素不受影响
+%group HNPMIslandSuppression
 %hook SBSystemApertureSceneElement
 
 - (BOOL)requiresSuppressionFromSystemAperture {
@@ -1112,6 +1113,7 @@ static void HNPMReconDeep(void) {
 }
 
 %end
+%end
 
 %ctor {
     @autoreleasepool {
@@ -1139,6 +1141,7 @@ static void HNPMReconDeep(void) {
         if (objc_getClass("CSActivityItemContentView"))      { %init(HNPMActivityCard); HNPMAppendLog(@"hook 已注册: 媒体卡片(高度>=150 过滤)"); }
         if (objc_getClass("_SAUIElementViewContentView"))    { %init(HNPMIslandElement); }
         if (objc_getClass("_SAUIProvidedViewContainerView")) { %init(HNPMIslandPortal); }
+        if (objc_getClass("SBSystemApertureSceneElement"))   { %init(HNPMIslandSuppression); HNPMAppendLog(@"hook 已注册: 岛元素抑制策略(NowPlaying)"); }
         HNPMReconApertureManager();
         HNPMReconApertureClasses();
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
