@@ -1,17 +1,15 @@
-// HideNowPlaying v0.0.45 — 岛内媒体内容级隐藏(窗口保持存活, 原生待机观感)
+// HideNowPlaying v0.0.46 — 内容级隐藏(同 v0.0.45) + 隐藏期岛窗口视图树倾倒(侦察)
 //
-// v0.0.44 实测: 整窗隐藏/恢复后媒体正常, 但信号/WiFi/电池与媒体同窗被"陪葬",
-//   隐藏期间状态栏不完整。用户要求与原生一致:
-//   隐藏期 = 待机观感(信号图标可见) / 恢复后 = 播放观感(媒体展开, 信号让位)。
+// v0.0.45 实测: 左滑瞬间岛内无可藏内容(0个, 锁屏时岛是空的), 媒体内容在 1~11s 后
+//   才被系统创建并被轮询藏掉(189×36 紧凑 / 328×62 展开都藏到了); 但解锁后封面/波纹
+//   仍可见 → 可见媒体渲染在**其他视图**里(不是我们藏的两类, 或宽度<80 漏网)。
 //
-// v0.0.45 方案(内容级隐藏, 回归 v0.0.12/13 路线 + 新抗黑壳手段):
+// v0.0.46 新增: 隐藏后 3s(锁屏态)/10s(解锁后态) 各倾倒一次两个 Aperture 窗口的
+//   完整视图树(类名/frame/hidden/alpha), 定位封面/波纹到底住在哪些视图 → 定过滤线。
+// 以下 v0.0.45 方案保持不变:
 //   隐藏: 只藏岛内媒体内容视图(_SAUIElementViewContentView / _SAUIProvidedViewContainerView
-//         且宽>=80 —— 紧凑胶囊约126宽, 展开态160~390, 活动图标一般<50), 窗口不藏
-//         → 系统自动回到待机布局: 短胶囊 + 信号图标 + 其他活动图标保留
-//   维持: 0.5s 轮询重申隐藏(对抗系统动画), 隐藏期新建的媒体内容由钩子延迟判定拦截
-//   恢复: 点亮内容视图 + "原位重新挂载"(摘下再装回, 逼远程渲染重新 attach, 抗黑壳)
-//         + 多次重试兜底
-//   卡片: 维持原逻辑(实测可靠: 滑出动画 + 恢复重试 + 登记自愈)
+//         且宽>=80), 窗口不藏 → 系统自动回待机布局: 信号图标 + 活动图标保留
+//   维持: 0.5s 轮询重申隐藏; 恢复: 点亮 + 原位重新挂载(抗黑壳) + 重试兜底
 //
 // 日志: /var/mobile/Documents/HideNowPlaying.log   紧急开关: /var/mobile/Documents/HideNowPlaying.off
 
@@ -127,6 +125,50 @@ static BOOL HNPMIsIslandMediaView(UIView *v) {
     if (![cls isEqualToString:@"_SAUIElementViewContentView"]
         && ![cls isEqualToString:@"_SAUIProvidedViewContainerView"]) return NO;
     return v.bounds.size.width >= 80.0;
+}
+
+// v0.0.46: 倾倒两个 Aperture 窗口的完整视图树(类名/frame/hidden/alpha)
+// 目的: 定位"封面/波纹画面到底渲染在哪些视图"——v0.0.45 藏了 SAUI 视图但画面仍可见
+static void HNPMDumpApertureTrees(NSString *tag) {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        @try {
+            int winIdx = 0;
+            for (UIWindow *w in [UIApplication sharedApplication].windows) {
+                if (![NSStringFromClass([w class]) containsString:@"Aperture"]) continue;
+                winIdx++;
+                HNPMAppendLog([NSString stringWithFormat:@"[树倾%@] 窗口%d 开始 %@",
+                               tag, winIdx, NSStringFromClass([w class])]);
+                NSMutableArray *stack = [NSMutableArray arrayWithObject:w];
+                NSMutableArray *depths = [NSMutableArray arrayWithObject:@0];
+                int lines = 0, guard = 0;
+                while (stack.count > 0 && guard++ < 900 && lines < 160) {
+                    UIView *v = stack.firstObject;
+                    int d = [depths.firstObject intValue];
+                    [stack removeObjectAtIndex:0];
+                    [depths removeObjectAtIndex:0];
+                    if (!v) continue;
+                    if (v != w) {
+                        lines++;
+                        NSMutableString *indent = [NSMutableString string];
+                        for (int i = 0; i < d; i++) [indent appendString:@"  "];
+                        HNPMAppendLog([NSString stringWithFormat:@"[树倾%@] %@%@ f=%@ h=%d a=%.2f",
+                                       tag, indent, NSStringFromClass([v class]),
+                                       NSStringFromCGRect(v.frame), v.isHidden ? 1 : 0, v.alpha]);
+                    }
+                    NSArray *subs = [v subviews];
+                    NSUInteger cnt = subs.count;
+                    for (NSUInteger i = 0; i < cnt; i++) {
+                        [stack insertObject:subs[cnt - 1 - i] atIndex:0];
+                        [depths insertObject:@(d + 1) atIndex:0];
+                    }
+                }
+                if (lines >= 160)
+                    HNPMAppendLog([NSString stringWithFormat:@"[树倾%@] 窗口%d 行数截断", tag, winIdx]);
+                else
+                    HNPMAppendLog([NSString stringWithFormat:@"[树倾%@] 窗口%d 结束 共%d行", tag, winIdx, lines]);
+            }
+        } @catch (NSException *e) {}
+    });
 }
 
 static void HNPMSetIslandContentHidden(BOOL hide, NSString *tag) {
@@ -262,6 +304,15 @@ static void HNPMSetHidden(BOOL hide, NSString *reason) {
     if (hide) {
         // 卡片已由 handlePan 单独隐藏(只动"正在播放"那张)
         HNPMSetIslandContentHidden(YES, @"隐藏");
+        // v0.0.46: 隐藏后 3s(锁屏态)/10s(解锁后态) 各倾倒一次岛窗口视图树
+        for (NSNumber *d in @[@3.0, @10.0]) {
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)([d doubleValue] * NSEC_PER_SEC)),
+                           dispatch_get_main_queue(), ^{
+                @try {
+                    if (hnpmHidden) HNPMDumpApertureTrees([NSString stringWithFormat:@"+%@", d]);
+                } @catch (NSException *e) {}
+            });
+        }
     } else {
         HNPMRestoreWithRetries();
         HNPMSetIslandContentHidden(NO, @"恢复");
@@ -547,7 +598,7 @@ static void HNPMWalkIvars(id obj, NSString *tag);
 #pragma mark - 入口
 
 __attribute__((constructor)) static void HNPMRawCtor(void) {
-    HNPMAppendLog(@"v0.0.45: dylib 构造函数已执行(dyld 加载成功)");
+    HNPMAppendLog(@"v0.0.46: dylib 构造函数已执行(dyld 加载成功)");
 }
 
 // 侦察: 灵动岛"元素管理器"是否存在及其方法签名(模型级方案的前提)
