@@ -268,9 +268,11 @@ static void HNPMDumpIvarList(id obj, NSString *tag) {
         unsigned int ic = 0;
         Ivar *ivs = class_copyIvarList([obj class], &ic);
         NSMutableString *all = [NSMutableString string];
-        for (unsigned int i = 0; i < ic; i++)
-            [all appendFormat:@"%@(%s),", ivar_getName(ivs[i]),
-             ivar_getTypeEncoding(ivs[i]) ? ivar_getTypeEncoding(ivs[i]) : "?"];
+        for (unsigned int i = 0; i < ic; i++) {
+            const char *nm = ivar_getName(ivs[i]);
+            const char *te = ivar_getTypeEncoding(ivs[i]);
+            [all appendFormat:@"%@(%@),", nm ? @(nm) : @"?", te ? @(te) : @"?"];
+        }
         free(ivs);
         int chunk = 0;
         for (NSUInteger pos = 0; pos < all.length && chunk < 6; pos += 1200, chunk++) {
