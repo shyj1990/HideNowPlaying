@@ -268,7 +268,7 @@ static void HNPMSetIslandContentHidden(BOOL hide, NSString *tag) {
                     [stack addObjectsFromArray:v.subviews];
                     BOOL isT1 = HNPMIsIslandMediaView(v);
                     BOOL linked = isT1 || [family containsObject:v];
-                    if (!linked && HNPMInMediaSizeBand(v.frame)) {
+                    if (!linked && HNPMInMediaSizeBand(v.frame.size)) {
                         CGRect wf = [v convertRect:v.bounds toView:nil];
                         for (NSValue *fv in t1Frames) {
                             if (CGRectIntersectsRect(wf, [fv CGRectValue])) { linked = YES; shells++; break; }
