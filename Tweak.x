@@ -1,12 +1,13 @@
-// HideNowPlaying v0.0.50 — 模型级抑制 NowPlaying 元素(信号图标回归的正路)
+// HideNowPlaying v0.0.51 — 修复恢复侧: 解除抑制必须触发控制器重评估
 //
-// v0.0.49 方法表侦察成果: SBSystemApertureSceneElement 有 245 个方法, 其中自带抑制策略
-//   requiresSuppressionFromSystemAperture + shouldSuppressElementWhile*(4个查询点) +
-//   setRequiresSuppressionFromSystemAperture: 属性setter; 控制器有 _reevaluate...
-// v0.0.50: %hook 元素策略方法(仅对 elementIdentifier 含 NowPlaying 的元素生效) +
-//   hide/restore 时置属性并触发控制器重评估 → 系统自己撤下/恢复媒体元素。
-//   预期: 隐藏期 = 待机短胶囊 + 信号图标原生回归; 恢复期 = 媒体原生点亮。
-// 保持不变: 全家桶视觉隐藏兜底(v0.0.47) + 0.5s 轮询 + 恢复点亮/重挂 + 树倾(3/10/20s)。
+// v0.0.50 实测: 隐藏侧成功(信号图标原生回归), 恢复侧失败(黑色长胶囊)。
+//   根因: 元素被抑制后 _currentFirstElement 变 nil → HNPMSetElementSuppression 提前
+//   return, _reevaluateSystemApertureCompleteSuppression 从未执行 → 恢复时模型层仍处
+//   抑制态, 系统不重新驱动媒体内容管线 → 只剩黑壳长胶囊。
+// v0.0.51: ①钩 elementIdentifier 跟踪 NowPlaying 元素实例(抑制后唯一稳定定位来源);
+//   ②解除时对跟踪表全部元素置 requiresSuppressionFromSystemAperture=NO + 必定触发重评估;
+//   ③恢复 +1s/+3s 重申解除; ④恢复 +3s 元素态+树倾诊断; ⑤恢复命中时抖动岛窗口逼重合成。
+// 保持不变: 策略钩子(5个) + 全家桶视觉兜底(v0.0.47) + 0.5s 轮询 + 恢复重试。
 //
 // 日志: /var/mobile/Documents/HideNowPlaying.log   紧急开关: /var/mobile/Documents/HideNowPlaying.off
 
@@ -63,6 +64,7 @@ static BOOL hnpmLastPlaying = NO;
 static int  hnpmPauseStreak = 0;
 static NSHashTable *hnpmCardCells = nil;     // 弱引用: 媒体卡片单元格
 static NSHashTable *hnpmCardContents = nil;  // 弱引用: 卡片内容视图(恢复时需一并显示)
+static NSHashTable *hnpmElementTable = nil;  // 弱引用: 见过的 NowPlaying 岛元素(抑制后 _currentFirstElement 变 nil, 此表是唯一稳定定位来源)
 static __weak UIView *hnpmHiddenCard = nil;  // 被左滑隐藏的那张"正在播放"卡片
 
 static void HNPMHideCard(UIView *cell);
@@ -245,40 +247,72 @@ static BOOL HNPMIsNowPlayingElement(id el) {
 static void HNPMSetElementSuppression(BOOL suppress, NSString *tag) {
     dispatch_async(dispatch_get_main_queue(), ^{
         @try {
+            NSMutableArray *targets = [NSMutableArray array];
+            // 跟踪表(元素被抑制后 _currentFirstElement 会变 nil, 跟踪表是唯一稳定来源)
+            if (hnpmElementTable) {
+                NSArray *snap = nil;
+                @synchronized(hnpmElementTable) { snap = [[hnpmElementTable allObjects] copy]; }
+                for (id e in snap) {
+                    if (e && HNPMIsNowPlayingElement(e) && ![targets containsObject:e]) [targets addObject:e];
+                }
+            }
+            // 兜底: 控制器当前首元素
             id ctrl = HNPMIslandController();
-            if (!ctrl) { HNPMAppendLog([NSString stringWithFormat:@"[抑制%@] 控制器未定位", tag]); return; }
-            id el = nil;
+            if (ctrl) {
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Warc-performSelector-leaks"
-            SEL fe = NSSelectorFromString(@"_currentFirstElement");
-            if ([ctrl respondsToSelector:fe]) el = [ctrl performSelector:fe];
-            if (!el) { HNPMAppendLog([NSString stringWithFormat:@"[抑制%@] 无首元素", tag]); return; }
-            NSString *eid = nil;
-            SEL gi = NSSelectorFromString(@"elementIdentifier");
-            if ([el respondsToSelector:gi]) {
-                id v = [el performSelector:gi];
-                if ([v isKindOfClass:[NSString class]]) eid = v;
+                SEL fe = NSSelectorFromString(@"_currentFirstElement");
+                if ([ctrl respondsToSelector:fe]) {
+                    id el = [ctrl performSelector:fe];
+                    if (el && HNPMIsNowPlayingElement(el) && ![targets containsObject:el]) [targets addObject:el];
+                }
+#pragma clang diagnostic pop
             }
             SEL rs = NSSelectorFromString(@"setRequiresSuppressionFromSystemAperture:");
-            if ([el respondsToSelector:rs]) {
-                void (*setSup)(id, SEL, BOOL) = (void (*)(id, SEL, BOOL))objc_msgSend;
-                setSup(el, rs, suppress);
+            int set = 0;
+            for (id el in targets) {
+                @try {
+                    if ([el respondsToSelector:rs]) {
+                        void (*setSup)(id, SEL, BOOL) = (void (*)(id, SEL, BOOL))objc_msgSend;
+                        setSup(el, rs, suppress);
+                        set++;
+                    }
+                } @catch (NSException *e) {}
             }
-            SEL re = NSSelectorFromString(@"_reevaluateSystemApertureCompleteSuppression");
-            if ([ctrl respondsToSelector:re]) [ctrl performSelector:re];
-            SEL st = NSSelectorFromString(@"stateDump");
-            NSString *after = @"(无)";
-            if ([ctrl respondsToSelector:st]) {
-                id d = [ctrl performSelector:st];
-                after = d ? [d description] : @"(nil)";
-                if (after.length > 400) after = [after substringToIndex:400];
-            }
-            HNPMAppendLog([NSString stringWithFormat:@"[抑制%@] id=%@ →抑制%d; 态=%@",
-                           tag, eid ?: @"?", suppress ? 1 : 0, after]);
+            // v0.0.50 教训: 无论是否拿到元素, 重评估都必须触发 — 否则模型层永远停在抑制态
+            int ree = 0;
+            if (ctrl) {
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Warc-performSelector-leaks"
+                SEL re = NSSelectorFromString(@"_reevaluateSystemApertureCompleteSuppression");
+                if ([ctrl respondsToSelector:re]) { [ctrl performSelector:re]; ree = 1; }
 #pragma clang diagnostic pop
+            }
+            HNPMAppendLog([NSString stringWithFormat:@"[抑制%@] 目标%d 置%d 重评估%d 控制器%@",
+                           tag, (int)targets.count, set, ree, ctrl ? @"已定位" : @"未定位"]);
         } @catch (NSException *e) {
             HNPMAppendLog([NSString stringWithFormat:@"[抑制%@] 异常: %@", tag, e.reason]);
         }
+    });
+}
+
+// 诊断: 倾倒跟踪表中 NowPlaying 元素的当前状态(isActivated 等)
+static void HNPMLogElementState(void) {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        @try {
+            if (!hnpmElementTable) return;
+            NSArray *snap = nil;
+            @synchronized(hnpmElementTable) { snap = [[hnpmElementTable allObjects] copy]; }
+            int i = 0;
+            for (id e in snap) {
+                if (!e || !HNPMIsNowPlayingElement(e)) continue;
+                i++;
+                NSString *desc = [e description];
+                if (desc.length > 300) desc = [desc substringToIndex:300];
+                HNPMAppendLog([NSString stringWithFormat:@"[元素态%d] %@", i, desc]);
+            }
+            HNPMAppendLog([NSString stringWithFormat:@"[元素态] 共%d个", i]);
+        } @catch (NSException *e) {}
     });
 }
 
@@ -359,6 +393,20 @@ static void HNPMSetIslandContentHidden(BOOL hide, NSString *tag) {
                     }
                 }
             }
+            // v0.0.51: 恢复且确实点亮了东西时, 轻微抖动岛窗口逼系统重新合成画面(v0.0.44 抗黑壳老招)
+            if (!hide && (n > 0 || kicked > 0)) {
+                for (UIWindow *w in [UIApplication sharedApplication].windows) {
+                    if (![NSStringFromClass([w class]) containsString:@"Aperture"]) continue;
+                    @try {
+                        CGRect f = w.frame;
+                        w.frame = CGRectOffset(f, 0.5, 0);
+                        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.08 * NSEC_PER_SEC)),
+                                       dispatch_get_main_queue(), ^{
+                            @try { w.frame = f; } @catch (NSException *e) {}
+                        });
+                    } @catch (NSException *e) {}
+                }
+            }
             if (n > 0 || [tag isEqualToString:@"隐藏"] || [tag isEqualToString:@"恢复"]) {
                 NSString *kick = kicked > 0 ? [NSString stringWithFormat:@"(重新挂载 %d)", kicked] : @"";
                 HNPMAppendLog([NSString stringWithFormat:@"[岛内] %@ 命中 %d 个→%@%@ 外壳%d %@",
@@ -435,7 +483,7 @@ static void HNPMShowCards(void) {
 }
 
 static void HNPMRestoreWithRetries(void) {
-    NSArray *delays = @[@0.0, @0.5, @1.0, @2.0, @3.5, @5.0];
+    NSArray *delays = @[@0.0, @0.5, @1.0, @2.0, @3.5, @5.0, @7.0];
     for (NSNumber *d in delays) {
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)([d doubleValue] * NSEC_PER_SEC)),
                        dispatch_get_main_queue(), ^{
@@ -454,7 +502,7 @@ static void HNPMSetHidden(BOOL hide, NSString *reason) {
     if (hide) {
         // 卡片已由 handlePan 单独隐藏(只动"正在播放"那张)
         HNPMSetIslandContentHidden(YES, @"隐藏");
-        // v0.0.50: 模型级抑制 NowPlaying 元素(立即 + +2s 重申), 系统自己回默认布局
+        // v0.0.51: 模型级抑制(置属性+触发重评估, 应即时生效; +2s 重申兜底)
         HNPMSetElementSuppression(YES, @"·隐");
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)),
                        dispatch_get_main_queue(), ^{
@@ -462,18 +510,44 @@ static void HNPMSetHidden(BOOL hide, NSString *reason) {
                 if (hnpmHidden) HNPMSetElementSuppression(YES, @"·隐2");
             } @catch (NSException *e) {}
         });
-        for (NSNumber *d in @[@3.0, @10.0, @20.0]) {
+        for (NSNumber *d in @[@3.0, @20.0]) {
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)([d doubleValue] * NSEC_PER_SEC)),
                            dispatch_get_main_queue(), ^{
                 @try {
-                    if (hnpmHidden) HNPMDumpApertureTrees([NSString stringWithFormat:@"+%@", d]);
+                    if (hnpmHidden) {
+                        HNPMLogElementState();
+                        HNPMDumpApertureTrees([NSString stringWithFormat:@"+%@", d]);
+                    }
                 } @catch (NSException *e) {}
             });
         }
     } else {
-        HNPMSetElementSuppression(NO, @"·解");   // v0.0.50: 解除模型级抑制, 媒体元素原生回归
+        // v0.0.51: 先解除模型级抑制并触发重评估 → 系统重新呈现媒体元素(内容管线复活);
+        // 视图点亮立即一次 + 延迟重试, 避免把系统尚未重建的陈旧视图提前点亮成黑壳
+        HNPMSetElementSuppression(NO, @"·解");
         HNPMRestoreWithRetries();
         HNPMSetIslandContentHidden(NO, @"恢复");
+        // +1s/+3s 重申解除(防竞态) + 恢复期元素态/树倾诊断
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            @try {
+                if (!hnpmHidden) {
+                    HNPMSetElementSuppression(NO, @"·解2");
+                    HNPMSetIslandContentHidden(NO, @"恢复2");
+                }
+            } @catch (NSException *e) {}
+        });
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            @try {
+                if (!hnpmHidden) {
+                    HNPMSetElementSuppression(NO, @"·解3");
+                    HNPMSetIslandContentHidden(NO, @"恢复3");
+                    HNPMLogElementState();
+                    HNPMDumpApertureTrees(@"恢复+3");
+                }
+            } @catch (NSException *e) {}
+        });
     }
     HNPMAppendLog([NSString stringWithFormat:@"%@ → 状态=%@",
                    reason, hide ? @"已隐藏(音乐继续)" : @"已恢复显示"]);
@@ -672,7 +746,6 @@ static void HNPMAttachPanIfNeeded(UIView *view) {
 
 // 灵动岛: 元素内容视图(锁图标+媒体图标)
 static void HNPMWalkIvarsFull(id obj, NSString *tag);
-static void HNPMWalkIvars(id obj, NSString *tag);
 
 %group HNPMIslandElement
 %hook _SAUIElementViewContentView
@@ -756,247 +829,7 @@ static void HNPMWalkIvars(id obj, NSString *tag);
 #pragma mark - 入口
 
 __attribute__((constructor)) static void HNPMRawCtor(void) {
-    HNPMAppendLog(@"v0.0.50: dylib 构造函数已执行(dyld 加载成功)");
-}
-
-// 侦察: 灵动岛"元素管理器"是否存在及其方法签名(模型级方案的前提)
-static void HNPMReconApertureManager(void) {
-    @try {
-        NSArray *names = @[@"SBSystemApertureElementManager", @"SBApertureElementManager",
-                           @"SBSystemApertureModel", @"SBSystemApertureClient",
-                           @"SBSystemApertureStateManager", @"SBFApertureManager"];
-        for (NSString *nm in names) {
-            Class c = NSClassFromString(nm);
-            if (!c) { HNPMAppendLog([NSString stringWithFormat:@"[岛管理] %@ 不存在", nm]); continue; }
-            HNPMAppendLog([NSString stringWithFormat:@"[岛管理] %@ 存在", nm]);
-            unsigned int pc = 0;
-            objc_property_t *props = class_copyPropertyList(c, &pc);
-            for (unsigned int i = 0; i < pc; i++) {
-                NSString *p = [NSString stringWithCString:property_getName(props[i]) encoding:NSUTF8StringEncoding];
-                HNPMAppendLog([NSString stringWithFormat:@"[岛管理] %@ 属性 %@", nm, p]);
-            }
-            free(props);
-            unsigned int mc = 0;
-            Method *ms = class_copyMethodList(object_getClass(c), &mc);
-            for (unsigned int i = 0; i < mc; i++) {
-                NSString *s = NSStringFromSelector(method_getName(ms[i]));
-                if ([s containsString:@"shared"] || [s containsString:@"instance"] || [s containsString:@"anager"])
-                    HNPMAppendLog([NSString stringWithFormat:@"[岛管理] %@ 类方法 %@", nm, s]);
-            }
-            free(ms);
-            mc = 0;
-            ms = class_copyMethodList(c, &mc);
-            for (unsigned int i = 0; i < mc; i++) {
-                NSString *s = NSStringFromSelector(method_getName(ms[i]));
-                if ([s containsString:@"lement"] || [s containsString:@"ctivity"] || [s containsString:@"edia"]
-                    || [s containsString:@"playing"] || [s containsString:@"isplay"] || [s containsString:@"resent"])
-                    HNPMAppendLog([NSString stringWithFormat:@"[岛管理] %@ 实例方法 %@", nm, s]);
-            }
-            free(ms);
-        }
-    } @catch (NSException *e) {
-        HNPMAppendLog(@"[岛管理] 侦察异常");
-    }
-}
-
-// 侦察: 枚举运行时所有含 Aperture 的类及其方法(找出真正的元素管理器)
-static void HNPMReconApertureClasses(void) {
-    @try {
-        unsigned int count = 0;
-        Class *classes = objc_copyClassList(&count);
-        if (!classes) return;
-        int hits = 0;
-        for (unsigned int i = 0; i < count && hits < 40; i++) {
-            NSString *nm = NSStringFromClass(classes[i]);
-            if (![nm containsString:@"Aperture"]) continue;
-            hits++;
-            HNPMAppendLog([NSString stringWithFormat:@"[岛类] %@", nm]);
-            // 只对 Manager/Model/Controller/State 类深挖方法
-            if (![nm containsString:@"Manager"] && ![nm containsString:@"Model"]
-                && ![nm containsString:@"Controller"] && ![nm containsString:@"State"]
-                && ![nm containsString:@"Coordinator"]) continue;
-            unsigned int mc = 0;
-            Method *ms = class_copyMethodList(classes[i], &mc);
-            for (unsigned int j = 0; j < mc; j++) {
-                NSString *s = NSStringFromSelector(method_getName(ms[j]));
-                if ([s containsString:@"lement"] || [s containsString:@"ctivity"] || [s containsString:@"edia"]
-                    || [s containsString:@"playing"] || [s containsString:@"resent"] || [s containsString:@"isplay"])
-                    HNPMAppendLog([NSString stringWithFormat:@"[岛类]   方法 %@", s]);
-            }
-            free(ms);
-        }
-        free(classes);
-        HNPMAppendLog([NSString stringWithFormat:@"[岛类] 枚举完成, 命中 %d 个", hits]);
-    } @catch (NSException *e) {
-        HNPMAppendLog(@"[岛类] 枚举异常");
-    }
-}
-
-// 侦察: SBSystemApertureController 完整方法表 + 单例 + 当前元素 + 抑制断言类
-static void HNPMReconApertureController(void) {
-    @try {
-        Class c = NSClassFromString(@"SBSystemApertureController");
-        if (!c) { HNPMAppendLog(@"[岛控] SBSystemApertureController 不存在"); return; }
-        unsigned int mc = 0;
-        Method *ms = class_copyMethodList(object_getClass(c), &mc);
-        for (unsigned int i = 0; i < mc; i++) {
-            NSString *s = NSStringFromSelector(method_getName(ms[i]));
-            if ([s containsString:@"shared"] || [s containsString:@"Instance"])
-                HNPMAppendLog([NSString stringWithFormat:@"[岛控] 类方法 %@", s]);
-        }
-        free(ms);
-        ms = class_copyMethodList(c, &mc);
-        for (unsigned int i = 0; i < mc; i++)
-            HNPMAppendLog([NSString stringWithFormat:@"[岛控] 方法 %@",
-                           NSStringFromSelector(method_getName(ms[i]))]);
-        free(ms);
-        id inst = nil;
-        SEL sh = NSSelectorFromString(@"sharedInstance");
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Warc-performSelector-leaks"
-        if ([c respondsToSelector:sh]) inst = [(id)c performSelector:sh];
-        HNPMAppendLog([NSString stringWithFormat:@"[岛控] 单例=%@", inst]);
-        if ([inst respondsToSelector:NSSelectorFromString(@"_currentFirstElement")]) {
-            id el = [inst performSelector:NSSelectorFromString(@"_currentFirstElement")];
-#pragma clang diagnostic pop
-            NSString *desc = [el description];
-            if (desc.length > 400) desc = [desc substringToIndex:400];
-            HNPMAppendLog([NSString stringWithFormat:@"[岛控] 当前元素(%@)=%@",
-                           NSStringFromClass([el class]), desc]);
-        }
-        for (NSString *nm in @[@"_SBSystemApertureRepresentationSuppressionAssertion",
-                               @"SBRequestSystemApertureElementSuppressionEventResponse"]) {
-            Class sc = NSClassFromString(nm);
-            if (!sc) { HNPMAppendLog([NSString stringWithFormat:@"[岛控] %@ 不存在", nm]); continue; }
-            unsigned int sc2 = 0;
-            Method *sm = class_copyMethodList(sc, &sc2);
-            for (unsigned int i = 0; i < sc2; i++)
-                HNPMAppendLog([NSString stringWithFormat:@"[岛控] %@ 方法 %@", nm,
-                               NSStringFromSelector(method_getName(sm[i]))]);
-            free(sm);
-        }
-    } @catch (NSException *e) {
-        HNPMAppendLog([NSString stringWithFormat:@"[岛控] 侦察异常: %@", e.reason]);
-    }
-}
-
-// 侦察: 通过 SBLockScreenManager 单例(免钩子)找 Aperture 控制器实例及元素存储
-static void HNPMReconLockManager(void) {
-    @try {
-        Class m = NSClassFromString(@"SBLockScreenManager");
-        if (!m) { HNPMAppendLog(@"[锁管理] SBLockScreenManager 不存在"); return; }
-        id inst = nil;
-        SEL sh = NSSelectorFromString(@"sharedInstance");
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Warc-performSelector-leaks"
-        if ([m respondsToSelector:sh]) inst = [(id)m performSelector:sh];
-#pragma clang diagnostic pop
-        HNPMAppendLog([NSString stringWithFormat:@"[锁管理] 单例=%@", inst]);
-        if (!inst) return;
-        id apertureCtrl = nil;
-        unsigned int ic = 0;
-        Ivar *ivs = class_copyIvarList([inst class], &ic);
-        for (unsigned int i = 0; i < ic; i++) {
-            const char *ty = ivar_getTypeEncoding(ivs[i]);
-            if (!ty || ty[0] != '@') continue;
-            id v = object_getIvar(inst, ivs[i]);
-            if (!v) continue;
-            NSString *cls = NSStringFromClass([v class]);
-            if ([cls containsString:@"Aperture"] || [cls containsString:@"LockElement"]) {
-                HNPMAppendLog([NSString stringWithFormat:@"[锁管理] 属性 %s = %@", ivar_getName(ivs[i]), cls]);
-                if ([cls containsString:@"Aperture"] && !apertureCtrl) apertureCtrl = v;
-            }
-        }
-        free(ivs);
-        if (!apertureCtrl) { HNPMAppendLog(@"[锁管理] 未找到 Aperture 对象引用"); return; }
-        HNPMAppendLog([NSString stringWithFormat:@"[锁管理] 岛控制器实例=%@", apertureCtrl]);
-        if ([apertureCtrl respondsToSelector:NSSelectorFromString(@"_currentFirstElement")]) {
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Warc-performSelector-leaks"
-            id el = [apertureCtrl performSelector:NSSelectorFromString(@"_currentFirstElement")];
-#pragma clang diagnostic pop
-            HNPMAppendLog([NSString stringWithFormat:@"[锁管理] 当前元素=%@",
-                           el ? NSStringFromClass([el class]) : @"(nil)"]);
-        }
-        unsigned int cc = 0;
-        Ivar *civs = class_copyIvarList([apertureCtrl class], &cc);
-        for (unsigned int i = 0; i < cc; i++) {
-            const char *ty = ivar_getTypeEncoding(civs[i]);
-            if (!ty || ty[0] != '@') continue;
-            id v = object_getIvar(apertureCtrl, civs[i]);
-            if (!v) continue;
-            NSString *cls = NSStringFromClass([v class]);
-            if ([cls containsString:@"Element"] || [cls containsString:@"Array"] || [cls containsString:@"Dictionary"] || [cls containsString:@"Set"]) {
-                HNPMAppendLog([NSString stringWithFormat:@"[锁管理] 控制器属性 %s = %@ (%@)",
-                               ivar_getName(civs[i]), cls, [v description]]);
-            }
-        }
-        free(civs);
-    } @catch (NSException *e) {
-        HNPMAppendLog([NSString stringWithFormat:@"[锁管理] 侦察异常: %@", e.reason]);
-    }
-}
-
-// 通用: 只读遍历对象属性, 记录含关键类名的引用
-static void HNPMWalkIvars(id obj, NSString *tag) {
-    @try {
-        unsigned int ic = 0;
-        Ivar *ivs = class_copyIvarList([obj class], &ic);
-        for (unsigned int i = 0; i < ic; i++) {
-            const char *ty = ivar_getTypeEncoding(ivs[i]);
-            if (!ty || ty[0] != '@') continue;
-            id v = object_getIvar(obj, ivs[i]);
-            if (!v) continue;
-            NSString *cls = NSStringFromClass([v class]);
-            if ([cls containsString:@"Aperture"] || [cls containsString:@"LockElement"]
-                || [cls containsString:@"Magician"] || [cls containsString:@"Controller"]
-                || [cls containsString:@"Provider"] || [cls containsString:@"Element"])
-                HNPMAppendLog([NSString stringWithFormat:@"[%@] 属性 %s = %@", tag, ivar_getName(ivs[i]), cls]);
-        }
-        free(ivs);
-    } @catch (NSException *e) {}
-}
-
-// 侦察: 从岛窗口/锁元素提供者侧免钩子定位 Aperture 控制器实例
-static void HNPMReconWindows(void) {
-    @try {
-        Class m = NSClassFromString(@"SBLockScreenManager");
-        id mgr = nil;
-        SEL sh = NSSelectorFromString(@"sharedInstance");
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Warc-performSelector-leaks"
-        if (m && [m respondsToSelector:sh]) mgr = [(id)m performSelector:sh];
-#pragma clang diagnostic pop
-        if (mgr) {
-            unsigned int ic = 0;
-            Ivar *ivs = class_copyIvarList([mgr class], &ic);
-            for (unsigned int i = 0; i < ic; i++) {
-                const char *ty = ivar_getTypeEncoding(ivs[i]);
-                if (!ty || ty[0] != '@') continue;
-                id v = object_getIvar(mgr, ivs[i]);
-                if (v && [NSStringFromClass([v class]) containsString:@"LockElement"]) {
-                    HNPMWalkIvars(v, @"锁元素");
-                }
-            }
-            free(ivs);
-        }
-        for (UIWindow *w in [UIApplication sharedApplication].windows) {
-            NSString *wn = NSStringFromClass([w class]);
-            if (![wn containsString:@"Aperture"]) continue;
-            HNPMAppendLog([NSString stringWithFormat:@"[岛窗口] %@", wn]);
-            HNPMWalkIvars(w, @"岛窗口");
-            HNPMWalkIvars([w rootViewController], @"岛窗口VC");
-            if ([w respondsToSelector:NSSelectorFromString(@"rootViewIfLoaded")]) {
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Warc-performSelector-leaks"
-                HNPMWalkIvars([w performSelector:NSSelectorFromString(@"rootViewIfLoaded")], @"岛窗口根视图");
-#pragma clang diagnostic pop
-            }
-        }
-        HNPMAppendLog(@"[岛窗口] 遍历完成");
-    } @catch (NSException *e) {
-        HNPMAppendLog([NSString stringWithFormat:@"[岛窗口] 侦察异常: %@", e.reason]);
-    }
+    HNPMAppendLog(@"v0.0.51: dylib 构造函数已执行(dyld 加载成功)");
 }
 
 // 通用: 完整遍历对象属性(含父类链, 每个对象属性都记)
@@ -1026,66 +859,25 @@ static void HNPMWalkIvarsFull(id obj, NSString *tag) {
     } @catch (NSException *e) {}
 }
 
-// 深挖: 元素宿主与内容VC的第二层属性
-static void HNPMReconDeep(void) {
-    @try {
-        Class m = NSClassFromString(@"SBLockScreenManager");
-        id mgr = nil;
-        SEL sh = NSSelectorFromString(@"sharedInstance");
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Warc-performSelector-leaks"
-        if (m && [m respondsToSelector:sh]) mgr = [(id)m performSelector:sh];
-#pragma clang diagnostic pop
-        if (mgr) {
-            unsigned int ic = 0;
-            Ivar *ivs = class_copyIvarList([mgr class], &ic);
-            for (unsigned int i = 0; i < ic; i++) {
-                const char *ty = ivar_getTypeEncoding(ivs[i]);
-                if (!ty || ty[0] != '@') continue;
-                id v = object_getIvar(mgr, ivs[i]);
-                if (!v || ![NSStringFromClass([v class]) containsString:@"LockElement"]) continue;
-                unsigned int jc = 0;
-                Ivar *jvs = class_copyIvarList([v class], &jc);
-                for (unsigned int j = 0; j < jc; j++) {
-                    const char *ty2 = ivar_getTypeEncoding(jvs[j]);
-                    if (!ty2 || ty2[0] != '@') continue;
-                    id w = object_getIvar(v, jvs[j]);
-                    if (!w) continue;
-                    NSString *wcls = NSStringFromClass([w class]);
-                    if ([wcls containsString:@"ViewController"] || [wcls containsString:@"Provider"]) {
-                        HNPMWalkIvarsFull(w, [NSString stringWithFormat:@"深挖(%s)", ivar_getName(jvs[j])]);
-                    }
-                }
-                free(jvs);
-            }
-            free(ivs);
-        }
-        for (UIWindow *w in [UIApplication sharedApplication].windows) {
-            if (![NSStringFromClass([w class]) containsString:@"Aperture"]) continue;
-            id rvc = [w rootViewController];
-            if (!rvc) continue;
-            unsigned int kc = 0;
-            Ivar *kvs = class_copyIvarList([rvc class], &kc);
-            for (unsigned int k = 0; k < kc; k++) {
-                const char *ty = ivar_getTypeEncoding(kvs[k]);
-                if (!ty || ty[0] != '@') continue;
-                id c = object_getIvar(rvc, kvs[k]);
-                if (c && [NSStringFromClass([c class]) containsString:@"ViewController"]) {
-                    HNPMWalkIvarsFull(c, [NSString stringWithFormat:@"窗口内容VC(%s)", ivar_getName(kvs[k])]);
-                }
-            }
-            free(kvs);
-        }
-        HNPMAppendLog(@"[深挖] 完成");
-    } @catch (NSException *e) {
-        HNPMAppendLog([NSString stringWithFormat:@"[深挖] 异常: %@", e.reason]);
-    }
-}
-
-// v0.0.50: 岛元素抑制策略钩子 — 隐藏期让系统把 NowPlaying 元素当作"应被抑制",
-// 沿用苹果自己的抑制机制 → 岛回默认布局(待机短胶囊+信号图标), 活动元素不受影响
+// v0.0.50/51: 岛元素抑制策略钩子 — 隐藏期让系统把 NowPlaying 元素当作"应被抑制",
+// 沿用苹果自己的抑制机制 → 岛回默认布局(待机短胶囊+信号图标), 活动元素不受影响。
+// v0.0.51 另钩 elementIdentifier 跟踪元素实例(元素被抑制后 _currentFirstElement 变 nil)
 %group HNPMIslandSuppression
 %hook SBSystemApertureSceneElement
+
+// v0.0.51: 元素跟踪 — 记录见过的 NowPlaying 元素(弱引用), 供解除抑制时定位
+- (NSString *)elementIdentifier {
+    NSString *v = %orig;
+    @try {
+        if (hnpmElementTable && [v isKindOfClass:[NSString class]]
+            && [(NSString *)v containsString:@"NowPlaying"]) {
+            @synchronized(hnpmElementTable) {
+                if (![hnpmElementTable containsObject:self]) [hnpmElementTable addObject:self];
+            }
+        }
+    } @catch (NSException *e) {}
+    return v;
+}
 
 - (BOOL)requiresSuppressionFromSystemAperture {
     if (hnpmHidden && HNPMIsNowPlayingElement(self)) return YES;
@@ -1117,7 +909,7 @@ static void HNPMReconDeep(void) {
 
 %ctor {
     @autoreleasepool {
-        HNPMAppendLog(@"v0.0.50: logos %ctor 进入");
+        HNPMAppendLog(@"v0.0.51: logos %ctor 进入");
 
         if ([[NSFileManager defaultManager] fileExistsAtPath:@"/var/mobile/Documents/HideNowPlaying.off"]) {
             HNPMAppendLog(@"检测到开关文件 HideNowPlaying.off, 不注册任何 hook");
@@ -1127,6 +919,7 @@ static void HNPMReconDeep(void) {
         hnpmCardCells = [NSHashTable weakObjectsHashTable];
         hnpmCardContents = [NSHashTable weakObjectsHashTable];
         hnpmIslandViews = [NSHashTable weakObjectsHashTable];
+        hnpmElementTable = [NSHashTable weakObjectsHashTable];
         hnpmPanTarget = [[HNPMPanTarget alloc] init];
 
         void *mr = dlopen("/System/Library/PrivateFrameworks/MediaRemote.framework/MediaRemote", RTLD_LAZY);
@@ -1141,15 +934,7 @@ static void HNPMReconDeep(void) {
         if (objc_getClass("CSActivityItemContentView"))      { %init(HNPMActivityCard); HNPMAppendLog(@"hook 已注册: 媒体卡片(高度>=150 过滤)"); }
         if (objc_getClass("_SAUIElementViewContentView"))    { %init(HNPMIslandElement); }
         if (objc_getClass("_SAUIProvidedViewContainerView")) { %init(HNPMIslandPortal); }
-        if (objc_getClass("SBSystemApertureSceneElement"))   { %init(HNPMIslandSuppression); HNPMAppendLog(@"hook 已注册: 岛元素抑制策略(NowPlaying)"); }
-        HNPMReconApertureManager();
-        HNPMReconApertureClasses();
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-            HNPMReconApertureController();
-            HNPMReconLockManager();
-            HNPMReconWindows();
-            HNPMReconDeep();
-        });
-        HNPMAppendLog(@"v0.0.50: %ctor 正常完成");
+        if (objc_getClass("SBSystemApertureSceneElement"))   { %init(HNPMIslandSuppression); HNPMAppendLog(@"hook 已注册: 岛元素抑制策略+元素跟踪(NowPlaying)"); }
+        HNPMAppendLog(@"v0.0.51: %ctor 正常完成");
     }
 }
