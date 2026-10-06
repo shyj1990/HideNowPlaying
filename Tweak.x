@@ -1,9 +1,9 @@
-// HideNowPlaying v0.0.42 — 岛内容隐藏(塌缩) + 播放信息重推送唤活
+// HideNowPlaying v0.0.43 — 岛内容隐藏(塌缩) + 播放信息重推送唤活
 //
 // v0.0.17 实测结论: 窗口级蒙版应用成功但仍裁不住媒体内容 → 蒙版路线放弃
 //   (容器级蒙版 v0.0.16 失败, 窗口级蒙版 v0.0.17 也失败)
 //
-// v0.0.42 方案(回到实测有效路径 + 修黑壳):
+// v0.0.43 方案(回到实测有效路径 + 修黑壳):
 //   隐藏: 藏岛的内容视图(_SAUIElementViewContentView + 宽>=30 的门户)
 //         → 岛塌缩为待机短胶囊(v0.0.12/13 用户满意的效果)
 //   恢复: ① 取消隐藏(登记表 + 全窗口类扫描兜底)
@@ -426,7 +426,38 @@ static void HNPMAttachPanIfNeeded(UIView *view) {
         [hnpmIslandViews addObject:self];
         HNPMLogThrottled([NSString stringWithFormat:@"[灵动岛] 元素内容登记 frame=%@",
                           NSStringFromCGRect(self.frame)]);
-        // v0.0.42: 不再隐藏内容(藏窗口方案, 内容保持存活)
+        // 一次性: 翻内容视图的属性链找元素模型
+        static BOOL walked = NO;
+        if (!walked) {
+            walked = YES;
+            HNPMWalkIvarsFull(self, @"岛内容视图");
+            Class c = [self class];
+            int depth = 0;
+            while (c && depth < 5) {
+                unsigned int ic = 0;
+                Ivar *ivs = class_copyIvarList(c, &ic);
+                for (unsigned int i = 0; i < ic; i++) {
+                    const char *ty = ivar_getTypeEncoding(ivs[i]);
+                    if (!ty || ty[0] != '@') continue;
+                    id v = object_getIvar(self, ivs[i]);
+                    if (!v) continue;
+                    NSString *cls = NSStringFromClass([v class]);
+                    if ([cls containsString:@"Element"] || [cls containsString:@"Content"]
+                        || [cls containsString:@"Model"] || [cls containsString:@"Item"]
+                        || [cls containsString:@"Representation"]) {
+                        NSString *desc = [v description];
+                        if ([desc length] > 400) desc = [desc substringToIndex:400];
+                        HNPMAppendLog([NSString stringWithFormat:@"[元素模型] 属性 %s(%@): %@",
+                                       ivar_getName(ivs[i]), cls, desc]);
+                        HNPMWalkIvarsFull(v, [NSString stringWithFormat:@"元素模型(%s)", ivar_getName(ivs[i])]);
+                    }
+                }
+                free(ivs);
+                c = [c superclass];
+                depth++;
+            }
+            HNPMAppendLog(@"[元素模型] 完成");
+        }
     } @catch (NSException *e) {}
 }
 %end
@@ -442,7 +473,7 @@ static void HNPMAttachPanIfNeeded(UIView *view) {
         [hnpmIslandViews addObject:self];
         HNPMLogThrottled([NSString stringWithFormat:@"[灵动岛] 门户登记 frame=%@",
                           NSStringFromCGRect(self.frame)]);
-        // v0.0.42: 不再隐藏内容(藏窗口方案, 内容保持存活)
+        // v0.0.43: 不再隐藏内容(藏窗口方案, 内容保持存活)
     } @catch (NSException *e) {}
 }
 %end
@@ -451,7 +482,7 @@ static void HNPMAttachPanIfNeeded(UIView *view) {
 #pragma mark - 入口
 
 __attribute__((constructor)) static void HNPMRawCtor(void) {
-    HNPMAppendLog(@"v0.0.42: dylib 构造函数已执行(dyld 加载成功)");
+    HNPMAppendLog(@"v0.0.43: dylib 构造函数已执行(dyld 加载成功)");
 }
 
 // 侦察: 灵动岛"元素管理器"是否存在及其方法签名(模型级方案的前提)
@@ -694,24 +725,30 @@ static void HNPMReconWindows(void) {
     }
 }
 
-// 通用: 完整遍历对象属性(每个对象属性都记), 用于深挖元素宿主
+// 通用: 完整遍历对象属性(含父类链, 每个对象属性都记)
 static void HNPMWalkIvarsFull(id obj, NSString *tag) {
     @try {
         if (!obj) return;
-        unsigned int ic = 0;
-        Ivar *ivs = class_copyIvarList([obj class], &ic);
-        for (unsigned int i = 0; i < ic; i++) {
-            const char *ty = ivar_getTypeEncoding(ivs[i]);
-            if (!ty || ty[0] != '@') continue;
-            id v = object_getIvar(obj, ivs[i]);
-            if (!v) continue;
-            NSString *cls = NSStringFromClass([v class]);
-            if ([cls hasPrefix:@"NS"] && ![cls containsString:@"Array"] && ![cls containsString:@"Dictionary"]
-                && ![cls containsString:@"Set"] && ![cls containsString:@"Mutable"]) continue;
-            HNPMAppendLog([NSString stringWithFormat:@"[%@] %s = %@",
-                           tag, ivar_getName(ivs[i]), cls]);
+        Class c = [obj class];
+        int depth = 0;
+        while (c && depth < 5) {
+            unsigned int ic = 0;
+            Ivar *ivs = class_copyIvarList(c, &ic);
+            for (unsigned int i = 0; i < ic; i++) {
+                const char *ty = ivar_getTypeEncoding(ivs[i]);
+                if (!ty || ty[0] != '@') continue;
+                id v = object_getIvar(obj, ivs[i]);
+                if (!v) continue;
+                NSString *cls = NSStringFromClass([v class]);
+                if ([cls hasPrefix:@"NS"] && ![cls containsString:@"Array"] && ![cls containsString:@"Dictionary"]
+                    && ![cls containsString:@"Set"] && ![cls containsString:@"Mutable"]) continue;
+                HNPMAppendLog([NSString stringWithFormat:@"[%@] %@ %s = %@",
+                               tag, NSStringFromClass(c), ivar_getName(ivs[i]), cls]);
+            }
+            free(ivs);
+            c = [c superclass];
+            depth++;
         }
-        free(ivs);
     } @catch (NSException *e) {}
 }
 
@@ -773,7 +810,7 @@ static void HNPMReconDeep(void) {
 
 %ctor {
     @autoreleasepool {
-        HNPMAppendLog(@"v0.0.42: logos %ctor 进入");
+        HNPMAppendLog(@"v0.0.43: logos %ctor 进入");
 
         if ([[NSFileManager defaultManager] fileExistsAtPath:@"/var/mobile/Documents/HideNowPlaying.off"]) {
             HNPMAppendLog(@"检测到开关文件 HideNowPlaying.off, 不注册任何 hook");
@@ -805,6 +842,6 @@ static void HNPMReconDeep(void) {
             HNPMReconWindows();
             HNPMReconDeep();
         });
-        HNPMAppendLog(@"v0.0.42: %ctor 正常完成");
+        HNPMAppendLog(@"v0.0.43: %ctor 正常完成");
     }
 }
