@@ -211,13 +211,17 @@ static void HNPMPassiveListenA(void) {
 }
 
 // B路: NSDistributedNotificationCenter(Foundation 全链接, 内部自己解析 CF 符号, 绕开 dlsym 死路)
+// (theos 头文件环境未声明此类 → 走 objc_getClass + msgSend 动态调用, 顺带多一层运行时诊断)
 static void HNPMPassiveListenB(void) {
     @try {
-        NSDistributedNotificationCenter *dnc = [NSDistributedNotificationCenter defaultCenter];
+        Class dncClass = objc_getClass("NSDistributedNotificationCenter");
+        if (!dncClass) { HNPMAppendLog(@"监听B(NS分布式): 运行时无此类, 未挂起"); return; }
+        id dnc = [(id)dncClass performSelector:@selector(defaultCenter)];
         if (!dnc) { HNPMAppendLog(@"监听B(NS分布式): defaultCenter 为空, 未挂起"); return; }
-        [dnc addObserverForName:@"com.apple.mediaremote.nowplaying.info-did-change"
-                         object:nil queue:nil
-                    usingBlock:^(NSNotification *note) { HNPMNotifyHit(@"B(NS分布式)"); }];
+        typedef id (*AddObsMsgSend)(id, SEL, id, id, id, id);
+        ((AddObsMsgSend)objc_msgSend)(dnc, NSSelectorFromString(@"addObserverForName:object:queue:usingBlock:"),
+            @"com.apple.mediaremote.nowplaying.info-did-change", (id)nil, (id)nil,
+            ^(NSNotification *note) { HNPMNotifyHit(@"B(NS分布式)"); });
         HNPMAppendLog(@"监听B(NS分布式)已挂: 媒体信息变化(纯收听)");
     } @catch (NSException *e) {
         HNPMAppendLog(@"监听B(NS分布式): 挂载异常, 未挂起");
