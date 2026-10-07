@@ -1,11 +1,12 @@
-// HideNowPlaying v0.0.59 — 省电优化第四步(稳态档 1.0s → 1.5s)
+// HideNowPlaying v0.0.60 — 被动监听双路实验(纯收听, 零注册)
 //
-// v0.0.58 结论: ①被动监听死路 — dlsym 在 SpringBoard 内拿不到 Darwin 通知中心
-//   (0.0.54"未注册"同源, 两次实锤, iOS17 此路径不通), 监听代码已整体移除;
-//   ②诊断行实锤: 注册符号在 MediaRemote 内存在 → 0.0.54 当年注册调用确实执行过。
-//   两凶手(注册调用 / GCD定时器)各自定罪完毕, 均永久关闭。
-// 本版: 轮询机制/代码与 v0.0.57 完全一致, 仅稳态档 1.0s → 1.5s(稳态唤醒再省 1/3)。
-//   恢复检测靠稳态轮询, 暂停→播放恢复延迟 ≤~2s 属预期; 1.5s 验证稳定后下版再试 2.0s。
+// v0.0.59 实测通过: 稳态 1.5s 无卡死、体感满意 → 本版以其为基线(轮询节奏完全不动)。
+// 本版重试"被动监听"(收到广播→即时查询, 为将来 2.0s 稳态铺路), 两路同时挂:
+//   A路: CF Darwin 通知中心三级解析链(链1 RTLD_DEFAULT 0.0.54/0.0.58 两次实锤为空, 保留对照;
+//        链2 dlopen CoreFoundation 镜像内 dlsym; 链3 CFBundle 按名取函数) — 每级结果分别落日志。
+//   B路: NSDistributedNotificationCenter(Foundation 自带全链接, 内部自己解析 CF 符号, 绕开 dlsym 死路)。
+// 广播名统一 com.apple.mediaremote.nowplaying.info-did-change; 隐藏期收到→限流1s内即时查询。
+// 判读: 任一路"[通知]...首次收到"=监听复活; 两路全程静默=该广播 iOS17 无注册不发布→监听路线永久关闭。
 //
 // 日志: /var/mobile/Documents/HideNowPlaying.log   紧急开关: /var/mobile/Documents/HideNowPlaying.off
 
@@ -124,6 +125,103 @@ static void HNPMQueryNowPlayingOnce(void) {
             });
         } @catch (NSException *e) {}
     });
+}
+
+// v0.0.60: 被动监听(双路纯收听, 零注册调用) — 隐藏期收到"媒体信息变化"广播 → 即时查询一次(限流1s防广播高频反噬省电)
+static int hnpmNotifCount = 0;
+static CFAbsoluteTime hnpmNotifLogAt = 0;
+static CFAbsoluteTime hnpmNotifLastQuery = 0;
+static BOOL hnpmNotifSeenA = NO;
+static BOOL hnpmNotifSeenB = NO;
+
+static void HNPMNotifyHit(NSString *path) {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        @try {
+            if ([path hasPrefix:@"A"] && !hnpmNotifSeenA) {
+                hnpmNotifSeenA = YES;
+                HNPMAppendLog(@"[通知] A路(CF Darwin中心)首次收到广播(验证通过)");
+            } else if ([path hasPrefix:@"B"] && !hnpmNotifSeenB) {
+                hnpmNotifSeenB = YES;
+                HNPMAppendLog(@"[通知] B路(NS分布式)首次收到广播(验证通过)");
+            }
+            hnpmNotifCount++;
+            CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
+            if (hnpmHidden) {
+                if (now - hnpmNotifLogAt >= 5.0) {
+                    HNPMAppendLog([NSString stringWithFormat:@"[通知] 隐藏期收到广播(5s内%d次)", hnpmNotifCount]);
+                    hnpmNotifCount = 0;
+                    hnpmNotifLogAt = now;
+                }
+                if (now - hnpmNotifLastQuery >= 1.0) {
+                    hnpmNotifLastQuery = now;
+                    HNPMQueryNowPlayingOnce();
+                }
+            }
+        } @catch (NSException *e) {}
+    });
+}
+
+static void HNPMNotifCBA(CFNotificationCenterRef center, void *observer,
+                         CFStringRef name, const void *object, CFDictionaryRef userInfo) {
+    HNPMNotifyHit(@"A(CF)");
+}
+
+// 符号解析 链1+链2: RTLD_DEFAULT → dlopen CoreFoundation 镜像内找
+static void *HNPMSym2(const char *name) {
+    void *p = dlsym(RTLD_DEFAULT, name);
+    if (p) return p;
+    void *cf = dlopen("/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation", RTLD_LAZY);
+    return cf ? dlsym(cf, name) : NULL;
+}
+
+// A路: CF Darwin 通知中心(三级解析链, 每级结果落日志)
+static void HNPMPassiveListenA(void) {
+    @try {
+        typedef CFNotificationCenterRef (*GetCenterFn)(void);
+        typedef void (*AddObsFn)(CFNotificationCenterRef, const void *, CFNotificationCallback,
+                                 CFStringRef, const void *, CFNotificationSuspensionBehavior);
+        GetCenterFn getCenter = (GetCenterFn)HNPMSym2("CFNotificationCenterGetDarwinNotificationCenter");
+        AddObsFn addObs = (AddObsFn)HNPMSym2("CFNotificationCenterAddObserver");
+        NSString *via = @"链1/2";
+        if (!getCenter || !addObs) {
+            // 链3: CFBundle 按名取函数(专治隐藏符号; 两个入口函数本身也 dlsym, 拿不到就算了)
+            void *(*bundleFn)(void *, CFStringRef) = (void *(*)(void *, CFStringRef))dlsym(RTLD_DEFAULT, "CFBundleGetFunctionPointerForName");
+            void *(*bundleForId)(CFStringRef) = (void *(*)(CFStringRef))dlsym(RTLD_DEFAULT, "CFBundleGetBundleWithIdentifier");
+            if (bundleFn && bundleForId) {
+                void *cfb = bundleForId(CFSTR("com.apple.CoreFoundation"));
+                if (cfb) {
+                    if (!getCenter) getCenter = (GetCenterFn)bundleFn(cfb, CFSTR("CFNotificationCenterGetDarwinNotificationCenter"));
+                    if (!addObs)    addObs    = (AddObsFn)bundleFn(cfb, CFSTR("CFNotificationCenterAddObserver"));
+                    via = @"链3(CFBundle)";
+                }
+            }
+        }
+        if (!getCenter || !addObs) {
+            HNPMAppendLog([NSString stringWithFormat:@"监听A(CF): 未挂起(中心%@ 观察器%@)",
+                           getCenter ? @"✓" : @"空", addObs ? @"✓" : @"空"]);
+            return;
+        }
+        addObs(getCenter(), NULL, &HNPMNotifCBA,
+               CFSTR("com.apple.mediaremote.nowplaying.info-did-change"), NULL,
+               CFNotificationSuspensionBehaviorCoalesce);
+        HNPMAppendLog([NSString stringWithFormat:@"监听A(CF Darwin中心)已挂(%@): 媒体信息变化(纯收听)", via]);
+    } @catch (NSException *e) {
+        HNPMAppendLog(@"监听A(CF): 挂载异常, 未挂起");
+    }
+}
+
+// B路: NSDistributedNotificationCenter(Foundation 全链接, 内部自己解析 CF 符号, 绕开 dlsym 死路)
+static void HNPMPassiveListenB(void) {
+    @try {
+        NSDistributedNotificationCenter *dnc = [NSDistributedNotificationCenter defaultCenter];
+        if (!dnc) { HNPMAppendLog(@"监听B(NS分布式): defaultCenter 为空, 未挂起"); return; }
+        [dnc addObserverForName:@"com.apple.mediaremote.nowplaying.info-did-change"
+                         object:nil queue:nil
+                    usingBlock:^(NSNotification *note) { HNPMNotifyHit(@"B(NS分布式)"); }];
+        HNPMAppendLog(@"监听B(NS分布式)已挂: 媒体信息变化(纯收听)");
+    } @catch (NSException *e) {
+        HNPMAppendLog(@"监听B(NS分布式): 挂载异常, 未挂起");
+    }
 }
 
 #pragma mark - 媒体卡片判定
@@ -812,7 +910,7 @@ static void HNPMAttachPanIfNeeded(UIView *view) {
 #pragma mark - 入口
 
 __attribute__((constructor)) static void HNPMRawCtor(void) {
-    HNPMAppendLog(@"v0.0.59: dylib 构造函数已执行(dyld 加载成功)");
+    HNPMAppendLog(@"v0.0.60: dylib 构造函数已执行(dyld 加载成功)");
 }
 
 // v0.0.50/51: 岛元素抑制策略钩子 — 隐藏期让系统把 NowPlaying 元素当作"应被抑制",
@@ -865,7 +963,7 @@ __attribute__((constructor)) static void HNPMRawCtor(void) {
 
 %ctor {
     @autoreleasepool {
-        HNPMAppendLog(@"v0.0.59: logos %ctor 进入");
+        HNPMAppendLog(@"v0.0.60: logos %ctor 进入");
 
         if ([[NSFileManager defaultManager] fileExistsAtPath:@"/var/mobile/Documents/HideNowPlaying.off"]) {
             HNPMAppendLog(@"检测到开关文件 HideNowPlaying.off, 不注册任何 hook");
@@ -888,11 +986,14 @@ __attribute__((constructor)) static void HNPMRawCtor(void) {
         } else {
             HNPMAppendLog(@"MediaRemote 加载失败");
         }
+        // v0.0.60: 双路纯收听监听器(零注册) — 隐藏期收到广播即提速查询
+        HNPMPassiveListenA();
+        HNPMPassiveListenB();
 
         if (objc_getClass("CSActivityItemContentView"))      { %init(HNPMActivityCard); HNPMAppendLog(@"hook 已注册: 媒体卡片(高度>=150 过滤)"); }
         if (objc_getClass("_SAUIElementViewContentView"))    { %init(HNPMIslandElement); }
         if (objc_getClass("_SAUIProvidedViewContainerView")) { %init(HNPMIslandPortal); }
         if (objc_getClass("SBSystemApertureSceneElement"))   { %init(HNPMIslandSuppression); HNPMAppendLog(@"hook 已注册: 岛元素抑制策略+元素跟踪(NowPlaying)"); }
-        HNPMAppendLog(@"v0.0.59: %ctor 正常完成");
+        HNPMAppendLog(@"v0.0.60: %ctor 正常完成");
     }
 }
