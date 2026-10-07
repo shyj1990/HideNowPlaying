@@ -1,11 +1,12 @@
-// HideNowPlaying v0.0.61 — 被动监听收尾: 全量嗅探判死活
+// HideNowPlaying v0.0.62 — A路复活: iOS 真名 CFNotificationCenterGetDarwinNotifyCenter
 //
-// v0.0.60 实锤: ①A路(CF Darwin中心)三级解析全空 — 精确定位"中心空 观察器✓":
-//   iOS17 的 CF 根本不导出 CFNotificationCenterGetDarwinNotificationCenter(AddObserver 倒有), A路永久关闭移除;
-//   ②B路(NSDistributedNotificationCenter)运行时存在、挂载成功, 但定向监听(info-did-change)全程静默。
-// 本版(基线仍是 v0.0.59 稳态1.5s, 轮询不动): B路加"全量嗅探"(name=nil 收所有分布式通知),
-//   记录首次见到的名字([嗅探], 上限30行防刷屏) — 区分"NS分布式在iOS17不送货"还是"广播名不对":
-//   嗅探到媒体相关名字 → 下版换名字定向监听(监听复活); 全程零[嗅探] → 监听路线永久关闭。
+// 头文件破案(2026-10-07): theos/sdks 三代 iOS SDK(9.3/15.6/16.5)头文件+.tbd 均实锤 —
+//   Darwin 中心 getter 的 iOS 真名 = CFNotificationCenterGetDarwinNotifyCenter(无s!)，
+//   macOS 才叫 CFNotificationCenterGetDarwinNotificationCenter(带s)。0.0.54/0.0.58/0.0.60
+//   所有"中心空/dlsym不到"全因查了带s的 macOS 名; AddObserver 两平台同名所以一直查得到。
+// 本版(基线仍是 v0.0.59 稳态1.5s, 轮询不动, B路嗅探保留): A路 dlsym 正名优先+旧名兜底复活,
+//   挂两个候选广播名(info-did-change + nowplayinginfochanged), 回调记录首次收到的真实 name —
+//   管道通不通+名字对不对, 一次测试全判明。纯收听零注册, 无 0.0.54 系统级风险。
 //
 // 日志: /var/mobile/Documents/HideNowPlaying.log   紧急开关: /var/mobile/Documents/HideNowPlaying.off
 
@@ -204,6 +205,43 @@ static void HNPMPassiveListenB(void) {
         HNPMAppendLog(@"监听B已挂×2: 定向(info-did-change) + 全量嗅探(纯收听)");
     } @catch (NSException *e) {
         HNPMAppendLog(@"监听B(NS分布式): 挂载异常, 未挂起");
+    }
+}
+
+// A路: CF Darwin 中心(纯收听) — v0.0.60"死路"真相=函数名拼错: iOS 真名无s, 之前查的是 macOS 名(带s)。
+// dlsym 正名优先+旧名兜底(拿不到只降级不崩, 不走链接期符号避开 dyld 硬崩); 挂两个候选广播名。
+static void HNPMDarwinCallback(CFNotificationCenterRef center, void *observer,
+                               CFStringRef name, const void *object, CFDictionaryRef userInfo) {
+    static BOOL loggedName = NO;
+    if (!loggedName) {
+        loggedName = YES;
+        NSString *n = name ? (__bridge NSString *)name : @"(空)";
+        HNPMAppendLog([NSString stringWithFormat:@"[通知] A路回调首次触发 name=%@", n]);
+    }
+    HNPMNotifyHit(@"A(定向)");
+}
+
+static void HNPMPassiveListenA(void) {
+    @try {
+        typedef void *(*GetCenterFunc)(void);
+        GetCenterFunc getCenter = (GetCenterFunc)dlsym(RTLD_DEFAULT, "CFNotificationCenterGetDarwinNotifyCenter");
+        const char *via = "NotifyCenter(iOS真名,无s)";
+        if (!getCenter) {
+            getCenter = (GetCenterFunc)dlsym(RTLD_DEFAULT, "CFNotificationCenterGetDarwinNotificationCenter");
+            via = "NotificationCenter(macOS旧名,带s)";
+        }
+        if (!getCenter) { HNPMAppendLog(@"监听A: 两名均dlsym不到, 未挂起"); return; }
+        CFNotificationCenterRef dc = (CFNotificationCenterRef)getCenter();
+        if (!dc) { HNPMAppendLog([NSString stringWithFormat:@"监听A: 中心空(%s), 未挂起", via]); return; }
+        CFNotificationCenterAddObserver(dc, NULL, HNPMDarwinCallback,
+            CFSTR("com.apple.mediaremote.nowplaying.info-did-change"),
+            NULL, CFNotificationSuspensionBehaviorCoalesce);
+        CFNotificationCenterAddObserver(dc, NULL, HNPMDarwinCallback,
+            CFSTR("com.apple.mediaremote.nowplayinginfochanged"),
+            NULL, CFNotificationSuspensionBehaviorCoalesce);
+        HNPMAppendLog([NSString stringWithFormat:@"监听A已挂(%s)×2候选名", via]);
+    } @catch (NSException *e) {
+        HNPMAppendLog(@"监听A: 挂载异常, 未挂起");
     }
 }
 
@@ -946,7 +984,7 @@ __attribute__((constructor)) static void HNPMRawCtor(void) {
 
 %ctor {
     @autoreleasepool {
-        HNPMAppendLog(@"v0.0.61: logos %ctor 进入");
+        HNPMAppendLog(@"v0.0.62: logos %ctor 进入");
 
         if ([[NSFileManager defaultManager] fileExistsAtPath:@"/var/mobile/Documents/HideNowPlaying.off"]) {
             HNPMAppendLog(@"检测到开关文件 HideNowPlaying.off, 不注册任何 hook");
@@ -969,13 +1007,14 @@ __attribute__((constructor)) static void HNPMRawCtor(void) {
         } else {
             HNPMAppendLog(@"MediaRemote 加载失败");
         }
-        // v0.0.61: NS分布式定向监听+全量嗅探(零注册) — 隐藏期收到广播即提速查询
+        // v0.0.62: A路(CF Darwin中心, iOS真名)复活 + B路NS分布式定向+全量嗅探(均零注册, 纯收听)
+        HNPMPassiveListenA();
         HNPMPassiveListenB();
 
         if (objc_getClass("CSActivityItemContentView"))      { %init(HNPMActivityCard); HNPMAppendLog(@"hook 已注册: 媒体卡片(高度>=150 过滤)"); }
         if (objc_getClass("_SAUIElementViewContentView"))    { %init(HNPMIslandElement); }
         if (objc_getClass("_SAUIProvidedViewContainerView")) { %init(HNPMIslandPortal); }
         if (objc_getClass("SBSystemApertureSceneElement"))   { %init(HNPMIslandSuppression); HNPMAppendLog(@"hook 已注册: 岛元素抑制策略+元素跟踪(NowPlaying)"); }
-        HNPMAppendLog(@"v0.0.61: %ctor 正常完成");
+        HNPMAppendLog(@"v0.0.62: %ctor 正常完成");
     }
 }
