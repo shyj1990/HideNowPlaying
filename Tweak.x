@@ -1,12 +1,14 @@
-// HideNowPlaying v0.0.62 — A路复活: iOS 真名 CFNotificationCenterGetDarwinNotifyCenter
+// HideNowPlaying v0.0.63 — 头文件破案第二步: 注册通知是媒体监听唯一正确通道
 //
-// 头文件破案(2026-10-07): theos/sdks 三代 iOS SDK(9.3/15.6/16.5)头文件+.tbd 均实锤 —
-//   Darwin 中心 getter 的 iOS 真名 = CFNotificationCenterGetDarwinNotifyCenter(无s!)，
-//   macOS 才叫 CFNotificationCenterGetDarwinNotificationCenter(带s)。0.0.54/0.0.58/0.0.60
-//   所有"中心空/dlsym不到"全因查了带s的 macOS 名; AddObserver 两平台同名所以一直查得到。
-// 本版(基线仍是 v0.0.59 稳态1.5s, 轮询不动, B路嗅探保留): A路 dlsym 正名优先+旧名兜底复活,
-//   挂两个候选广播名(info-did-change + nowplayinginfochanged), 回调记录首次收到的真实 name —
-//   管道通不通+名字对不对, 一次测试全判明。纯收听零注册, 无 0.0.54 系统级风险。
+// v0.0.62 头文件核对结论(theos/headers 官方私有头+社区探针 spelunking/uptrack 三方实锤):
+//   媒体通知 = 注册后由 mediaremoted 守护进程 XPC 推送 → 进程内 NotificationCenter;
+//   Darwin 广播(CF)与 NSDistributedNotificationCenter 从来不是媒体通道(v0.0.62 两路全零输出的真相)。
+//   正确姿势: MRMediaRemoteRegisterForNowPlayingNotifications(queue) + NSNotificationCenter 观察名常量
+//   (dlsym "kMRMediaRemoteNowPlayingInfoDidChangeNotification" 取 CFStringRef, 不猜字符串)。
+// 0.0.54 冤案复审: 注册调用②从未单独测过 — 0.0.56 证明 GCD 定时器①单独致同款卡死, ②疑似连坐。
+// 本版(控制变量, 轮询1.5s 基线不动): 隐藏→短暂注册挂链, 恢复→立即注销摘链;
+//   进程内观察者常驻(未注册时 MediaRemote 不推送=零开销), 收到通知→限流1s即时查询。
+// 风险提示: 若真机复现 0.0.54 式卡死(CC 失效/App 被杀), 立即回退 v0.0.62(仍在照片同步文件夹)。
 //
 // 日志: /var/mobile/Documents/HideNowPlaying.log   紧急开关: /var/mobile/Documents/HideNowPlaying.off
 
@@ -85,12 +87,42 @@ static void HNPMBumpFastPhase(void) { hnpmFastUntil = CFAbsoluteTimeGetCurrent()
 
 #pragma mark - MediaRemote
 
-// v0.0.55: 已移除 v0.0.54 新增的 MRMediaRemoteRegisterForNowPlayingNotifications + Darwin
-// 通知注册 — 真机实测: 每次隐藏后系统媒体控制链路被搅乱(CC 播放控制失效/音乐App被看门狗杀/
-// 其他App卡死), v0.0.51~53 无此调用六轮零问题。播放/暂停检测退回 0.5s 轮询。
+// v0.0.55: 曾移除 0.0.54 的媒体通知注册 — 当时定罪注册调用搅乱媒体链路。
+// v0.0.63 冤案复审: 0.0.56 证明 GCD 定时器单独即可致同款卡死, 注册调用从未单独测过;
+// 且头文件实锤注册是媒体通知唯一正确通道(见文件头)。本版以"隐藏期短暂注册+恢复即注销"重启。
 
 typedef void (*HNPMGetInfoFunc)(dispatch_queue_t, void (^)(CFDictionaryRef));
 static HNPMGetInfoFunc hnpmGetInfo = NULL;
+
+// v0.0.63: 媒体通知链路符号(头文件实锤的唯一正确通道, 见文件头注释)
+typedef void (*HNPMRegFunc)(dispatch_queue_t);
+typedef void (*HNPMUnregFunc)(void);
+static HNPMRegFunc hnpmMRRegister = NULL;
+static HNPMUnregFunc hnpmMRUnregister = NULL;
+static NSString *hnpmInfoDidChangeName = nil;
+static NSString *hnpmIsPlayingDidChangeName = nil;
+static BOOL hnpmMRRegistered = NO;
+static id hnpmMRObserver = nil;
+
+// 隐藏→注册挂链 / 恢复→注销摘链(0.0.54 常驻注册的风险改造: 只在隐藏期短暂存在)
+static void HNPMRegisterMediaListen(BOOL on) {
+    @try {
+        if (on) {
+            if (hnpmMRRegistered) return;
+            if (!hnpmMRRegister || !hnpmMRObserver) return;  // 符号缺失或观察者未挂上, 注册无意义
+            hnpmMRRegister(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0));
+            hnpmMRRegistered = YES;
+            HNPMAppendLog(@"[监听MR] 已注册(隐藏期短暂挂链)");
+        } else {
+            if (!hnpmMRRegistered) return;
+            if (hnpmMRUnregister) hnpmMRUnregister();
+            hnpmMRRegistered = NO;
+            HNPMAppendLog(@"[监听MR] 已注销(恢复摘链)");
+        }
+    } @catch (NSException *e) {
+        HNPMAppendLog(@"[监听MR] 异常吞掉, 不影响主流程");
+    }
+}
 
 // 查一次正在播放信息并喂给"暂停→继续播放"状态机(隐藏期轮询每跳调用)
 static void HNPMQueryNowPlayingOnce(void) {
@@ -133,6 +165,7 @@ static CFAbsoluteTime hnpmNotifLogAt = 0;
 static CFAbsoluteTime hnpmNotifLastQuery = 0;
 static BOOL hnpmNotifSeenA = NO;
 static BOOL hnpmNotifSeenB = NO;
+static BOOL hnpmNotifSeenMR = NO;
 
 static void HNPMNotifyHit(NSString *path) {
     dispatch_async(dispatch_get_main_queue(), ^{
@@ -143,6 +176,9 @@ static void HNPMNotifyHit(NSString *path) {
             } else if ([path hasPrefix:@"B"] && !hnpmNotifSeenB) {
                 hnpmNotifSeenB = YES;
                 HNPMAppendLog(@"[通知] B路(NS分布式)首次收到广播(验证通过)");
+            } else if ([path hasPrefix:@"MR"] && !hnpmNotifSeenMR) {
+                hnpmNotifSeenMR = YES;
+                HNPMAppendLog(@"[通知] MR路(进程内)首次收到广播(验证通过)");
             }
             hnpmNotifCount++;
             CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
@@ -668,6 +704,7 @@ static void HNPMSetHidden(BOOL hide, NSString *reason) {
     hnpmBaseline = NO;
     hnpmPauseStreak = 0;
     if (hide) {
+        HNPMRegisterMediaListen(YES);  // v0.0.63: 隐藏期短暂挂媒体通知链(通知→限流即时查询)
         HNPMBumpFastPhase();  // 刚隐藏的 10s 内用快节奏盯紧过渡期
         // 卡片已由 handlePan 单独隐藏(只动"正在播放"那张)
         HNPMSetIslandContentHidden(YES, @"隐藏");
@@ -680,6 +717,7 @@ static void HNPMSetHidden(BOOL hide, NSString *reason) {
             } @catch (NSException *e) {}
         });
     } else {
+        HNPMRegisterMediaListen(NO);  // v0.0.63: 恢复立即注销摘链
         // v0.0.51: 先解除模型级抑制并触发重评估 → 系统重新呈现媒体元素(内容管线复活);
         // 视图点亮立即一次 + 延迟重试, 避免把系统尚未重建的陈旧视图提前点亮成黑壳
         HNPMSetElementSuppression(NO, @"·解");
@@ -984,7 +1022,7 @@ __attribute__((constructor)) static void HNPMRawCtor(void) {
 
 %ctor {
     @autoreleasepool {
-        HNPMAppendLog(@"v0.0.62: logos %ctor 进入");
+        HNPMAppendLog(@"v0.0.63: logos %ctor 进入");
 
         if ([[NSFileManager defaultManager] fileExistsAtPath:@"/var/mobile/Documents/HideNowPlaying.off"]) {
             HNPMAppendLog(@"检测到开关文件 HideNowPlaying.off, 不注册任何 hook");
@@ -1000,14 +1038,38 @@ __attribute__((constructor)) static void HNPMRawCtor(void) {
         void *mr = dlopen("/System/Library/PrivateFrameworks/MediaRemote.framework/MediaRemote", RTLD_LAZY);
         if (mr) {
             hnpmGetInfo = (HNPMGetInfoFunc)dlsym(mr, "MRMediaRemoteGetNowPlayingInfo");
-            // 诊断留档: 注册符号存在但绝不调用(v0.0.54 头号嫌疑, 永久禁止; 0.0.58 实锤存在)
-            void *regSym = dlsym(mr, "MRMediaRemoteRegisterForNowPlayingNotifications");
+            // v0.0.63: 注册/注销符号 + 通知名常量(头文件实锤; dlsym 全局变量返回地址, 解引用取 CFStringRef)
+            hnpmMRRegister   = (HNPMRegFunc)dlsym(mr, "MRMediaRemoteRegisterForNowPlayingNotifications");
+            hnpmMRUnregister = (HNPMUnregFunc)dlsym(mr, "MRMediaRemoteUnregisterForNowPlayingNotifications");
+            void *n1 = dlsym(mr, "kMRMediaRemoteNowPlayingInfoDidChangeNotification");
+            void *n2 = dlsym(mr, "kMRMediaRemoteNowPlayingApplicationIsPlayingDidChangeNotification");
+            hnpmInfoDidChangeName        = n1 ? (__bridge NSString *)*(CFStringRef *)n1 : nil;
+            hnpmIsPlayingDidChangeName   = n2 ? (__bridge NSString *)*(CFStringRef *)n2 : nil;
             HNPMAppendLog(hnpmGetInfo ? @"MediaRemote 已加载, 播放检测可用" : @"MediaRemote 已加载, 播放检测不可用");
-            HNPMAppendLog(regSym ? @"诊断: 注册符号存在(未调用)" : @"诊断: 注册符号不存在");
+            HNPMAppendLog([NSString stringWithFormat:@"[监听MR] 符号: 注册%d 注销%d 通知名1:%@ 通知名2:%@",
+                           hnpmMRRegister != NULL, hnpmMRUnregister != NULL,
+                           hnpmInfoDidChangeName ?: @"(空)", hnpmIsPlayingDidChangeName ?: @"(空)"]);
+            // 常驻进程内观察者(未注册时 MediaRemote 不推送=零开销); 注册/摘链由隐藏/恢复控制
+            NSOperationQueue *mainQ = [NSOperationQueue mainQueue];
+            if (hnpmInfoDidChangeName) {
+                NSString *name1 = [hnpmInfoDidChangeName copy];
+                hnpmMRObserver = [[NSNotificationCenter defaultCenter]
+                    addObserverForName:name1 object:nil queue:mainQ
+                    usingBlock:^(NSNotification *note) { HNPMNotifyHit(@"MR(InfoDidChange)"); }];
+            }
+            if (hnpmIsPlayingDidChangeName) {
+                NSString *name2 = [hnpmIsPlayingDidChangeName copy];
+                id obs2 = [[NSNotificationCenter defaultCenter]
+                    addObserverForName:name2 object:nil queue:mainQ
+                    usingBlock:^(NSNotification *note) { HNPMNotifyHit(@"MR(IsPlaying)"); }];
+                if (!hnpmMRObserver) hnpmMRObserver = obs2;  // 观察者token任存一个作"已挂"标记
+            }
+            HNPMAppendLog(hnpmMRObserver ? @"[监听MR] 进程内观察者已挂(注册期才收通知)" : @"[监听MR] 观察者未挂(通知名缺失)");
         } else {
             HNPMAppendLog(@"MediaRemote 加载失败");
         }
-        // v0.0.62: A路(CF Darwin中心, iOS真名)复活 + B路NS分布式定向+全量嗅探(均零注册, 纯收听)
+        // v0.0.62 A/B路(Darwin/NS分布式)保留作对照 — 0.0.62 实锤两路零输出(非媒体通道);
+        // v0.0.63 主监听 = MR注册(隐藏期短暂挂链, 见 [监听MR])
         HNPMPassiveListenA();
         HNPMPassiveListenB();
 
@@ -1015,6 +1077,6 @@ __attribute__((constructor)) static void HNPMRawCtor(void) {
         if (objc_getClass("_SAUIElementViewContentView"))    { %init(HNPMIslandElement); }
         if (objc_getClass("_SAUIProvidedViewContainerView")) { %init(HNPMIslandPortal); }
         if (objc_getClass("SBSystemApertureSceneElement"))   { %init(HNPMIslandSuppression); HNPMAppendLog(@"hook 已注册: 岛元素抑制策略+元素跟踪(NowPlaying)"); }
-        HNPMAppendLog(@"v0.0.62: %ctor 正常完成");
+        HNPMAppendLog(@"v0.0.63: %ctor 正常完成");
     }
 }
