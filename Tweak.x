@@ -83,6 +83,9 @@ static void HNPMBumpFastPhase(void) { hnpmFastUntil = CFAbsoluteTimeGetCurrent()
 
 #pragma mark - MediaRemote
 
+// v0.0.54: 个别 theos SDK 环境的 CFNotificationCenter.h 未导出此声明, 手动补
+extern CFNotificationCenterRef CFNotificationCenterGetDarwinNotificationCenter(void);
+
 typedef void (*HNPMGetInfoFunc)(dispatch_queue_t, void (^)(CFDictionaryRef));
 static HNPMGetInfoFunc hnpmGetInfo = NULL;
 
