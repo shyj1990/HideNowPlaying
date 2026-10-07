@@ -83,8 +83,16 @@ static void HNPMBumpFastPhase(void) { hnpmFastUntil = CFAbsoluteTimeGetCurrent()
 
 #pragma mark - MediaRemote
 
-// v0.0.54: 个别 theos SDK 环境的 CFNotificationCenter.h 未导出此声明, 手动补
-extern CFNotificationCenterRef CFNotificationCenterGetDarwinNotificationCenter(void);
+// v0.0.54: theos 链接环境未带 CoreFoundation(直接引用会 Undefined symbols) →
+// 用 dlsym 拿 Darwin 通知中心(CoreFoundation 在 SpringBoard 常驻, RTLD_DEFAULT 必中)
+static CFNotificationCenterRef HNPMDarwinCenter(void) {
+    static CFNotificationCenterRef (*getCenter)(void) = NULL;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        getCenter = (CFNotificationCenterRef (*)(void))dlsym(RTLD_DEFAULT, "CFNotificationCenterGetDarwinNotificationCenter");
+    });
+    return getCenter ? getCenter() : NULL;
+}
 
 typedef void (*HNPMGetInfoFunc)(dispatch_queue_t, void (^)(CFDictionaryRef));
 static HNPMGetInfoFunc hnpmGetInfo = NULL;
@@ -898,12 +906,13 @@ __attribute__((constructor)) static void HNPMRawCtor(void) {
             // v0.0.54: 注册"正在播放信息变化"通知 — 播放/暂停/切歌即时唤醒检测, 免高频轮询
             void (*reg)(dispatch_queue_t) = (void (*)(dispatch_queue_t))dlsym(mr, "MRMediaRemoteRegisterForNowPlayingNotifications");
             if (reg) reg(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0));
-            CFNotificationCenterAddObserver(CFNotificationCenterGetDarwinNotificationCenter(), NULL,
+            CFNotificationCenterRef dc = HNPMDarwinCenter();
+            if (dc) CFNotificationCenterAddObserver(dc, NULL,
                                             &HNPMNowPlayingChangedCB,
                                             CFSTR("com.apple.mediaremote.nowplaying.info-did-change"),
                                             NULL, CFNotificationSuspensionBehaviorCoalesce);
             HNPMAppendLog([NSString stringWithFormat:@"MediaRemote 已加载, 播放检测%@, 变化通知%@",
-                           hnpmGetInfo ? @"可用" : @"不可用", reg ? @"已注册" : @"未注册"]);
+                           hnpmGetInfo ? @"可用" : @"不可用", (reg && dc) ? @"已注册" : @"未注册"]);
         } else {
             HNPMAppendLog(@"MediaRemote 加载失败");
         }
