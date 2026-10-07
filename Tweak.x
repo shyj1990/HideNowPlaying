@@ -1,9 +1,12 @@
-// HideNowPlaying v0.0.56 — 省电优化第一步(单独变量)
+// HideNowPlaying v0.0.57 — 省电优化第二步(拆分变量: 节奏装回 NSTimer 载体)
 //
-// 策略: 以 v0.0.55(实测稳定)为基线, v0.0.54 的省电改动一次只加回一个、每版单独真机测试。
-// 本版只加回 ①自适应 GCD 轮询: 快节奏(0.5s)只用于隐藏后10s内/刚发生命中/岛内新建媒体视图时,
-//   稳态慢节奏(2s)+1.2s余量让系统合并唤醒(隐藏挂机/熄屏不再 2次/秒 空转)。
-//   纯本地调度改动, 不碰任何系统服务(媒体通知注册仍是禁止项 — v0.0.54 卡死头号嫌疑)。
+// v0.0.56 结论: 自适应 GCD 轮询单独复现卡死 → 已定罪的是"换定时器机制+放慢节奏"这个组合,
+// 两者尚未拆开验证。本版把"放慢节奏"装回被证明安全的 NSTimer 机制里:
+//   定时器仍是 0.5s NSTimer(NSRunLoopCommonModes, 与 v0.0.55 相同), 稳态(非快相)用 setFireDate
+//   把下一跳推迟到 1.0s — 唤醒次数减半(真省电), 定时器机制零改动。
+//   稳态档取 1.0s 而非已定罪的 2s, 走中间档降风险; 验证稳定后再考虑更长档位。
+// 快相触发同 v0.0.56: 刚隐藏 10s 内 / 轮询命中 / 岛内新建媒体视图被隐藏时。
+// 媒体通知注册仍是禁止项(v0.0.54 头号嫌疑); ②的被动监听留待本版验证通过后单独测。
 // 保留 v0.0.55 已有: 元素归属关联缓存 + [判定]日志节流。核心隐藏/恢复逻辑与 v0.0.53/55 完全一致。
 //
 // 日志: /var/mobile/Documents/HideNowPlaying.log   紧急开关: /var/mobile/Documents/HideNowPlaying.off
@@ -76,8 +79,9 @@ static BOOL HNPMIsBottomMostMediaCell(UIView *cell) {
 }
 static NSHashTable *hnpmIslandViews = nil;   // 弱引用: 灵动岛内容视图
 static void *kHNPMPanKey = &kHNPMPanKey;
-static CFAbsoluteTime hnpmFastUntil = 0;     // 此时刻之前轮询用快节奏(0.5s); 稳态慢节奏(2s)省电
-static dispatch_source_t hnpmPollSource = nil; // 自适应轮询定时器(GCD)
+static CFAbsoluteTime hnpmFastUntil = 0;     // 此时刻之前轮询用快节奏(0.5s); 稳态慢节奏(1s)省电
+static NSTimer *hnpmPollTimer = nil;         // 自适应轮询定时器(纯 NSTimer — v0.0.56 实锤 GCD 定时器独立致卡死, 永久弃用)
+static BOOL hnpmSteadyLogged = NO;           // 本次隐藏期"转入稳态"只记一行
 static void HNPMBumpFastPhase(void) { hnpmFastUntil = CFAbsoluteTimeGetCurrent() + 10.0; }
 
 #pragma mark - MediaRemote
@@ -588,41 +592,36 @@ static void HNPMSetHidden(BOOL hide, NSString *reason) {
                    reason, hide ? @"已隐藏(音乐继续)" : @"已恢复显示"]);
 }
 
-// 自适应轮询(GCD 定时器): 隐藏期间检测"暂停→继续播放" + 维持岛内媒体内容隐藏
-// v0.0.56: 快节奏(0.5s/余量0.15s)只用于隐藏后10s内或刚发生命中时; 稳态慢节奏(2s/余量1.2s)
-//   让系统合并唤醒, 熄屏挂机不再 2次/秒 空转(纯本地调度, 不碰系统服务)。
+// 自适应轮询(纯 NSTimer): 隐藏期间检测"暂停→继续播放" + 维持岛内媒体内容隐藏
+// v0.0.57: 定时器机制与 v0.0.55 相同(0.5s NSTimer + NSRunLoopCommonModes); 稳态(非快相)用
+//   setFireDate 把下一跳推迟到 1.0s 实现省电(唤醒减半), 快相保持 0.5s 不推迟。
+//   不用 GCD dispatch_source — v0.0.56 实锤其独立致系统卡死(机理未明, 永久弃用)。
 static void HNPMStartRestorePolling(void) {
     dispatch_async(dispatch_get_main_queue(), ^{
         @try {
-            if (hnpmPollSource) return;
-            dispatch_source_t src = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, dispatch_get_main_queue());
-            dispatch_source_set_timer(src, DISPATCH_TIME_NOW,
-                                      (uint64_t)(0.5 * NSEC_PER_SEC), (uint64_t)(0.15 * NSEC_PER_SEC));
-            dispatch_source_set_event_handler(src, ^{
+            if (hnpmPollTimer) return;
+            hnpmSteadyLogged = NO;
+            hnpmPollTimer = [NSTimer timerWithTimeInterval:0.5 repeats:YES block:^(NSTimer *t) {
                 @try {
                     if (!hnpmHidden) {
                         // 隐藏结束 → 停表(下次隐藏会重建)
-                        dispatch_source_t s = hnpmPollSource;
-                        hnpmPollSource = nil;
-                        if (s) dispatch_source_cancel(s);
+                        if (hnpmPollTimer == t) { [hnpmPollTimer invalidate]; hnpmPollTimer = nil; }
                         return;
                     }
-                    // 自适应节奏: 快(过渡期/刚有动静) / 慢(稳态, 大余量省电)
-                    dispatch_source_t s = hnpmPollSource;
-                    if (s) {
-                        if (CFAbsoluteTimeGetCurrent() < hnpmFastUntil)
-                            dispatch_source_set_timer(s, DISPATCH_TIME_NOW,
-                                                      (uint64_t)(0.5 * NSEC_PER_SEC), (uint64_t)(0.15 * NSEC_PER_SEC));
-                        else
-                            dispatch_source_set_timer(s, DISPATCH_TIME_NOW,
-                                                      (uint64_t)(2.0 * NSEC_PER_SEC), (uint64_t)(1.2 * NSEC_PER_SEC));
+                    if (CFAbsoluteTimeGetCurrent() >= hnpmFastUntil) {
+                        // 稳态: 推迟下一跳到 1.0s(setFireDate 重排下次触发, 机制仍是 NSTimer)
+                        if (!hnpmSteadyLogged) {
+                            HNPMAppendLog(@"[轮询] 转入稳态 1.0s");
+                            hnpmSteadyLogged = YES;
+                        }
+                        [t setFireDate:[NSDate dateWithTimeIntervalSinceNow:1.0]];
                     }
+                    // 快相: 不推迟, 保持 0.5s 原节奏
                     HNPMSetIslandContentHidden(YES, @"轮询");
                     HNPMQueryNowPlayingOnce();
                 } @catch (NSException *e) {}
-            });
-            hnpmPollSource = src;
-            dispatch_resume(src);
+            }];
+            [[NSRunLoop mainRunLoop] addTimer:hnpmPollTimer forMode:NSRunLoopCommonModes];
         } @catch (NSException *e) {}
     });
 }
@@ -815,7 +814,7 @@ static void HNPMAttachPanIfNeeded(UIView *view) {
 #pragma mark - 入口
 
 __attribute__((constructor)) static void HNPMRawCtor(void) {
-    HNPMAppendLog(@"v0.0.56: dylib 构造函数已执行(dyld 加载成功)");
+    HNPMAppendLog(@"v0.0.57: dylib 构造函数已执行(dyld 加载成功)");
 }
 
 // v0.0.50/51: 岛元素抑制策略钩子 — 隐藏期让系统把 NowPlaying 元素当作"应被抑制",
@@ -868,7 +867,7 @@ __attribute__((constructor)) static void HNPMRawCtor(void) {
 
 %ctor {
     @autoreleasepool {
-        HNPMAppendLog(@"v0.0.56: logos %ctor 进入");
+        HNPMAppendLog(@"v0.0.57: logos %ctor 进入");
 
         if ([[NSFileManager defaultManager] fileExistsAtPath:@"/var/mobile/Documents/HideNowPlaying.off"]) {
             HNPMAppendLog(@"检测到开关文件 HideNowPlaying.off, 不注册任何 hook");
@@ -894,6 +893,6 @@ __attribute__((constructor)) static void HNPMRawCtor(void) {
         if (objc_getClass("_SAUIElementViewContentView"))    { %init(HNPMIslandElement); }
         if (objc_getClass("_SAUIProvidedViewContainerView")) { %init(HNPMIslandPortal); }
         if (objc_getClass("SBSystemApertureSceneElement"))   { %init(HNPMIslandSuppression); HNPMAppendLog(@"hook 已注册: 岛元素抑制策略+元素跟踪(NowPlaying)"); }
-        HNPMAppendLog(@"v0.0.56: %ctor 正常完成");
+        HNPMAppendLog(@"v0.0.57: %ctor 正常完成");
     }
 }
