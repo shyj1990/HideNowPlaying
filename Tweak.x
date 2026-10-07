@@ -1,12 +1,11 @@
-// HideNowPlaying v0.0.60 — 被动监听双路实验(纯收听, 零注册)
+// HideNowPlaying v0.0.61 — 被动监听收尾: 全量嗅探判死活
 //
-// v0.0.59 实测通过: 稳态 1.5s 无卡死、体感满意 → 本版以其为基线(轮询节奏完全不动)。
-// 本版重试"被动监听"(收到广播→即时查询, 为将来 2.0s 稳态铺路), 两路同时挂:
-//   A路: CF Darwin 通知中心三级解析链(链1 RTLD_DEFAULT 0.0.54/0.0.58 两次实锤为空, 保留对照;
-//        链2 dlopen CoreFoundation 镜像内 dlsym; 链3 CFBundle 按名取函数) — 每级结果分别落日志。
-//   B路: NSDistributedNotificationCenter(Foundation 自带全链接, 内部自己解析 CF 符号, 绕开 dlsym 死路)。
-// 广播名统一 com.apple.mediaremote.nowplaying.info-did-change; 隐藏期收到→限流1s内即时查询。
-// 判读: 任一路"[通知]...首次收到"=监听复活; 两路全程静默=该广播 iOS17 无注册不发布→监听路线永久关闭。
+// v0.0.60 实锤: ①A路(CF Darwin中心)三级解析全空 — 精确定位"中心空 观察器✓":
+//   iOS17 的 CF 根本不导出 CFNotificationCenterGetDarwinNotificationCenter(AddObserver 倒有), A路永久关闭移除;
+//   ②B路(NSDistributedNotificationCenter)运行时存在、挂载成功, 但定向监听(info-did-change)全程静默。
+// 本版(基线仍是 v0.0.59 稳态1.5s, 轮询不动): B路加"全量嗅探"(name=nil 收所有分布式通知),
+//   记录首次见到的名字([嗅探], 上限30行防刷屏) — 区分"NS分布式在iOS17不送货"还是"广播名不对":
+//   嗅探到媒体相关名字 → 下版换名字定向监听(监听复活); 全程零[嗅探] → 监听路线永久关闭。
 //
 // 日志: /var/mobile/Documents/HideNowPlaying.log   紧急开关: /var/mobile/Documents/HideNowPlaying.off
 
@@ -161,57 +160,34 @@ static void HNPMNotifyHit(NSString *path) {
     });
 }
 
-static void HNPMNotifCBA(CFNotificationCenterRef center, void *observer,
-                         CFStringRef name, const void *object, CFDictionaryRef userInfo) {
-    HNPMNotifyHit(@"A(CF)");
-}
+// 嗅探器: name=nil 收所有分布式通知 — 回答两个问题: ①NS分布式在iOS17到底送不送货
+// ②媒体广播有哪些名字(定向监听静默可能是名字不对)。[嗅探]行上限30/会话防刷屏。
+static NSMutableSet *hnpmSniffSeen = nil;
+static int hnpmSniffLines = 0;
 
-// 符号解析 链1+链2: RTLD_DEFAULT → dlopen CoreFoundation 镜像内找
-static void *HNPMSym2(const char *name) {
-    void *p = dlsym(RTLD_DEFAULT, name);
-    if (p) return p;
-    void *cf = dlopen("/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation", RTLD_LAZY);
-    return cf ? dlsym(cf, name) : NULL;
-}
-
-// A路: CF Darwin 通知中心(三级解析链, 每级结果落日志)
-static void HNPMPassiveListenA(void) {
-    @try {
-        typedef CFNotificationCenterRef (*GetCenterFn)(void);
-        typedef void (*AddObsFn)(CFNotificationCenterRef, const void *, CFNotificationCallback,
-                                 CFStringRef, const void *, CFNotificationSuspensionBehavior);
-        GetCenterFn getCenter = (GetCenterFn)HNPMSym2("CFNotificationCenterGetDarwinNotificationCenter");
-        AddObsFn addObs = (AddObsFn)HNPMSym2("CFNotificationCenterAddObserver");
-        NSString *via = @"链1/2";
-        if (!getCenter || !addObs) {
-            // 链3: CFBundle 按名取函数(专治隐藏符号; 两个入口函数本身也 dlsym, 拿不到就算了)
-            void *(*bundleFn)(void *, CFStringRef) = (void *(*)(void *, CFStringRef))dlsym(RTLD_DEFAULT, "CFBundleGetFunctionPointerForName");
-            void *(*bundleForId)(CFStringRef) = (void *(*)(CFStringRef))dlsym(RTLD_DEFAULT, "CFBundleGetBundleWithIdentifier");
-            if (bundleFn && bundleForId) {
-                void *cfb = bundleForId(CFSTR("com.apple.CoreFoundation"));
-                if (cfb) {
-                    if (!getCenter) getCenter = (GetCenterFn)bundleFn(cfb, CFSTR("CFNotificationCenterGetDarwinNotificationCenter"));
-                    if (!addObs)    addObs    = (AddObsFn)bundleFn(cfb, CFSTR("CFNotificationCenterAddObserver"));
-                    via = @"链3(CFBundle)";
-                }
+static void HNPMNotifySniff(NSNotification *note) {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        @try {
+            if (hnpmSniffLines >= 30 || !note.name) return;
+            NSString *name = note.name;
+            BOOL media = ([name rangeOfString:@"ediaRemote"].location != NSNotFound
+                          || [name rangeOfString:@"owPlaying"].location != NSNotFound);
+            if (!hnpmSniffSeen) hnpmSniffSeen = [NSMutableSet set];
+            if (![hnpmSniffSeen containsObject:name]) {
+                [hnpmSniffSeen addObject:name];
+                hnpmSniffLines++;
+                HNPMAppendLog([NSString stringWithFormat:@"[嗅探] %@", name]);
+            } else if (media) {
+                hnpmSniffLines++;
+                HNPMAppendLog([NSString stringWithFormat:@"[嗅探] %@(再次)", name]);
             }
-        }
-        if (!getCenter || !addObs) {
-            HNPMAppendLog([NSString stringWithFormat:@"监听A(CF): 未挂起(中心%@ 观察器%@)",
-                           getCenter ? @"✓" : @"空", addObs ? @"✓" : @"空"]);
-            return;
-        }
-        addObs(getCenter(), NULL, &HNPMNotifCBA,
-               CFSTR("com.apple.mediaremote.nowplaying.info-did-change"), NULL,
-               CFNotificationSuspensionBehaviorCoalesce);
-        HNPMAppendLog([NSString stringWithFormat:@"监听A(CF Darwin中心)已挂(%@): 媒体信息变化(纯收听)", via]);
-    } @catch (NSException *e) {
-        HNPMAppendLog(@"监听A(CF): 挂载异常, 未挂起");
-    }
+            if (media) HNPMNotifyHit(@"B(嗅探)");
+        } @catch (NSException *e) {}
+    });
 }
 
 // B路: NSDistributedNotificationCenter(Foundation 全链接, 内部自己解析 CF 符号, 绕开 dlsym 死路)
-// (theos 头文件环境未声明此类 → 走 objc_getClass + msgSend 动态调用, 顺带多一层运行时诊断)
+// v0.0.60 实锤: 运行时存在、挂载成功, 但定向监听全程静默 → v0.0.61 加全量嗅探分辨"不送货"还是"名字不对"
 static void HNPMPassiveListenB(void) {
     @try {
         Class dncClass = objc_getClass("NSDistributedNotificationCenter");
@@ -219,10 +195,13 @@ static void HNPMPassiveListenB(void) {
         id dnc = [(id)dncClass performSelector:@selector(defaultCenter)];
         if (!dnc) { HNPMAppendLog(@"监听B(NS分布式): defaultCenter 为空, 未挂起"); return; }
         typedef id (*AddObsMsgSend)(id, SEL, id, id, id, id);
-        ((AddObsMsgSend)objc_msgSend)(dnc, NSSelectorFromString(@"addObserverForName:object:queue:usingBlock:"),
+        SEL addSel = NSSelectorFromString(@"addObserverForName:object:queue:usingBlock:");
+        ((AddObsMsgSend)objc_msgSend)(dnc, addSel,
             @"com.apple.mediaremote.nowplaying.info-did-change", (id)nil, (id)nil,
-            ^(NSNotification *note) { HNPMNotifyHit(@"B(NS分布式)"); });
-        HNPMAppendLog(@"监听B(NS分布式)已挂: 媒体信息变化(纯收听)");
+            ^(NSNotification *note) { HNPMNotifyHit(@"B(定向)"); });
+        ((AddObsMsgSend)objc_msgSend)(dnc, addSel, (id)nil, (id)nil, (id)nil,
+            ^(NSNotification *note) { HNPMNotifySniff(note); });
+        HNPMAppendLog(@"监听B已挂×2: 定向(info-did-change) + 全量嗅探(纯收听)");
     } @catch (NSException *e) {
         HNPMAppendLog(@"监听B(NS分布式): 挂载异常, 未挂起");
     }
@@ -914,7 +893,7 @@ static void HNPMAttachPanIfNeeded(UIView *view) {
 #pragma mark - 入口
 
 __attribute__((constructor)) static void HNPMRawCtor(void) {
-    HNPMAppendLog(@"v0.0.60: dylib 构造函数已执行(dyld 加载成功)");
+    HNPMAppendLog(@"v0.0.61: dylib 构造函数已执行(dyld 加载成功)");
 }
 
 // v0.0.50/51: 岛元素抑制策略钩子 — 隐藏期让系统把 NowPlaying 元素当作"应被抑制",
@@ -967,7 +946,7 @@ __attribute__((constructor)) static void HNPMRawCtor(void) {
 
 %ctor {
     @autoreleasepool {
-        HNPMAppendLog(@"v0.0.60: logos %ctor 进入");
+        HNPMAppendLog(@"v0.0.61: logos %ctor 进入");
 
         if ([[NSFileManager defaultManager] fileExistsAtPath:@"/var/mobile/Documents/HideNowPlaying.off"]) {
             HNPMAppendLog(@"检测到开关文件 HideNowPlaying.off, 不注册任何 hook");
@@ -990,14 +969,13 @@ __attribute__((constructor)) static void HNPMRawCtor(void) {
         } else {
             HNPMAppendLog(@"MediaRemote 加载失败");
         }
-        // v0.0.60: 双路纯收听监听器(零注册) — 隐藏期收到广播即提速查询
-        HNPMPassiveListenA();
+        // v0.0.61: NS分布式定向监听+全量嗅探(零注册) — 隐藏期收到广播即提速查询
         HNPMPassiveListenB();
 
         if (objc_getClass("CSActivityItemContentView"))      { %init(HNPMActivityCard); HNPMAppendLog(@"hook 已注册: 媒体卡片(高度>=150 过滤)"); }
         if (objc_getClass("_SAUIElementViewContentView"))    { %init(HNPMIslandElement); }
         if (objc_getClass("_SAUIProvidedViewContainerView")) { %init(HNPMIslandPortal); }
         if (objc_getClass("SBSystemApertureSceneElement"))   { %init(HNPMIslandSuppression); HNPMAppendLog(@"hook 已注册: 岛元素抑制策略+元素跟踪(NowPlaying)"); }
-        HNPMAppendLog(@"v0.0.60: %ctor 正常完成");
+        HNPMAppendLog(@"v0.0.61: %ctor 正常完成");
     }
 }
