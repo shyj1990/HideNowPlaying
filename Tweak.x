@@ -1,14 +1,12 @@
-// HideNowPlaying v0.0.63 — 头文件破案第二步: 注册通知是媒体监听唯一正确通道
+// HideNowPlaying v0.0.64 — 稳态 1.5s→2.0s(省电收官)
 //
-// v0.0.62 头文件核对结论(theos/headers 官方私有头+社区探针 spelunking/uptrack 三方实锤):
-//   媒体通知 = 注册后由 mediaremoted 守护进程 XPC 推送 → 进程内 NotificationCenter;
-//   Darwin 广播(CF)与 NSDistributedNotificationCenter 从来不是媒体通道(v0.0.62 两路全零输出的真相)。
-//   正确姿势: MRMediaRemoteRegisterForNowPlayingNotifications(queue) + NSNotificationCenter 观察名常量
-//   (dlsym "kMRMediaRemoteNowPlayingInfoDidChangeNotification" 取 CFStringRef, 不猜字符串)。
-// 0.0.54 冤案复审: 注册调用②从未单独测过 — 0.0.56 证明 GCD 定时器①单独致同款卡死, ②疑似连坐。
-// 本版(控制变量, 轮询1.5s 基线不动): 隐藏→短暂注册挂链, 恢复→立即注销摘链;
-//   进程内观察者常驻(未注册时 MediaRemote 不推送=零开销), 收到通知→限流1s即时查询。
-// 风险提示: 若真机复现 0.0.54 式卡死(CC 失效/App 被杀), 立即回退 v0.0.62(仍在照片同步文件夹)。
+// v0.0.63 实测全绿(2026-10-07): MR短暂注册+进程内监听复活, 隐藏→注册/恢复→注销完美成对,
+//   隐藏期广播 5s 内 6~7 次(1s限流查询接住), 零卡死; 用户确认 CC 控制流畅、App 不卡。
+//   彩蛋: 首次广播出现在注册之前 — SB 系统组件本就维持注册, 观察者搭系统顺风车。
+//   0.0.54 冤案正式平反: 注册调用无罪(短暂注册已验证安全), GCD 定时器是唯一实锤凶手。
+// 本版唯一变量: 稳态 1.5→2.0s — 播放状态变化已由通知驱动即时查询, 轮询降为兜底,
+//   长隐藏期轮询次数再省 1/4; NSTimer+setFireDate 机制不动(0.0.57 终审安全路径)。
+// 恢复速度预期: 暂停→播放若无通知兜底最慢 2s+ 状态机确认, 有通知则即时(通知驱动)。
 //
 // 日志: /var/mobile/Documents/HideNowPlaying.log   紧急开关: /var/mobile/Documents/HideNowPlaying.off
 
@@ -764,12 +762,13 @@ static void HNPMStartRestorePolling(void) {
                         return;
                     }
                     if (CFAbsoluteTimeGetCurrent() >= hnpmFastUntil) {
-                        // 稳态: 推迟下一跳到 1.5s(v0.0.59: 1.0→1.5, 稳态唤醒再省 1/3; 机制仍是 NSTimer)
+                        // 稳态: 推迟下一跳到 2.0s(v0.0.59: 1.0→1.5; v0.0.64: 1.5→2.0 — MR通知监听已复活,
+                        // 播放状态变化由通知驱动即时查询, 轮询只是兜底, 放宽到2.0s; 机制仍是 NSTimer)
                         if (!hnpmSteadyLogged) {
-                            HNPMAppendLog(@"[轮询] 转入稳态 1.5s");
+                            HNPMAppendLog(@"[轮询] 转入稳态 2.0s");
                             hnpmSteadyLogged = YES;
                         }
-                        [t setFireDate:[NSDate dateWithTimeIntervalSinceNow:1.5]];
+                        [t setFireDate:[NSDate dateWithTimeIntervalSinceNow:2.0]];
                     }
                     // 快相: 不推迟, 保持 0.5s 原节奏
                     HNPMSetIslandContentHidden(YES, @"轮询");
@@ -1022,7 +1021,7 @@ __attribute__((constructor)) static void HNPMRawCtor(void) {
 
 %ctor {
     @autoreleasepool {
-        HNPMAppendLog(@"v0.0.63: logos %ctor 进入");
+        HNPMAppendLog(@"v0.0.64: logos %ctor 进入");
 
         if ([[NSFileManager defaultManager] fileExistsAtPath:@"/var/mobile/Documents/HideNowPlaying.off"]) {
             HNPMAppendLog(@"检测到开关文件 HideNowPlaying.off, 不注册任何 hook");
@@ -1077,6 +1076,6 @@ __attribute__((constructor)) static void HNPMRawCtor(void) {
         if (objc_getClass("_SAUIElementViewContentView"))    { %init(HNPMIslandElement); }
         if (objc_getClass("_SAUIProvidedViewContainerView")) { %init(HNPMIslandPortal); }
         if (objc_getClass("SBSystemApertureSceneElement"))   { %init(HNPMIslandSuppression); HNPMAppendLog(@"hook 已注册: 岛元素抑制策略+元素跟踪(NowPlaying)"); }
-        HNPMAppendLog(@"v0.0.63: %ctor 正常完成");
+        HNPMAppendLog(@"v0.0.64: %ctor 正常完成");
     }
 }
