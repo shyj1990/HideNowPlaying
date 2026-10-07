@@ -1,13 +1,12 @@
-// HideNowPlaying v0.0.57 — 省电优化第二步(拆分变量: 节奏装回 NSTimer 载体)
+// HideNowPlaying v0.0.58 — 省电优化第三步(②的被动监听单独测试)
 //
-// v0.0.56 结论: 自适应 GCD 轮询单独复现卡死 → 已定罪的是"换定时器机制+放慢节奏"这个组合,
-// 两者尚未拆开验证。本版把"放慢节奏"装回被证明安全的 NSTimer 机制里:
-//   定时器仍是 0.5s NSTimer(NSRunLoopCommonModes, 与 v0.0.55 相同), 稳态(非快相)用 setFireDate
-//   把下一跳推迟到 1.0s — 唤醒次数减半(真省电), 定时器机制零改动。
-//   稳态档取 1.0s 而非已定罪的 2s, 走中间档降风险; 验证稳定后再考虑更长档位。
-// 快相触发同 v0.0.56: 刚隐藏 10s 内 / 轮询命中 / 岛内新建媒体视图被隐藏时。
-// 媒体通知注册仍是禁止项(v0.0.54 头号嫌疑); ②的被动监听留待本版验证通过后单独测。
-// 保留 v0.0.55 已有: 元素归属关联缓存 + [判定]日志节流。核心隐藏/恢复逻辑与 v0.0.53/55 完全一致。
+// v0.0.57 已验证: 慢节奏装回 NSTimer 载体安全, 稳态 1.0s 省电生效(真凶=GCD定时器机制)。
+// 本版单独加回 ② 的安全一半: 只挂 Darwin 通知"收听器"(CFNotificationCenterAddObserver),
+//   绝不调用 MRMediaRemoteRegisterForNowPlayingNotifications(v0.0.54 头号嫌疑, 永久禁止)。
+//   隐藏期收到"媒体信息变化"广播 → 即时查询一次 → 暂停→播放恢复更快; 轮询节奏完全不动。
+// 日志锚点: "被动监听已挂" / "[通知] ..." — 若测试全程零 [通知] 行 = 广播没到(iOS17不发此广播),
+//   下版换通知名; 若广播频率高(进度条每秒推)也如实记录, 据此决定是否只用它不提速。
+// 0.0.54 教训沿用: CFNotificationCenterGetDarwinNotificationCenter / AddObserver 都走 dlsym(链接缺符号)。
 //
 // 日志: /var/mobile/Documents/HideNowPlaying.log   紧急开关: /var/mobile/Documents/HideNowPlaying.off
 
@@ -126,6 +125,61 @@ static void HNPMQueryNowPlayingOnce(void) {
             });
         } @catch (NSException *e) {}
     });
+}
+
+// v0.0.58: 被动监听 — 只收听系统的"媒体信息已变化" Darwin 广播(绝无注册调用), 隐藏期收到即查询一次。
+// (0.0.54 事故版是"注册调用+监听"捆绑; 注册调用已定罪头号嫌疑永久禁止, 本次单测"纯收听"这半。)
+// 两个 CF 函数都 dlsym: 0.0.54 实锤 CFNotificationCenterGetDarwinNotificationCenter 直接引用链接不过。
+static CFNotificationCenterRef HNPMDarwinCenter(void) {
+    static CFNotificationCenterRef (*getCenter)(void) = NULL;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        getCenter = (CFNotificationCenterRef (*)(void))dlsym(RTLD_DEFAULT, "CFNotificationCenterGetDarwinNotificationCenter");
+    });
+    return getCenter ? getCenter() : NULL;
+}
+
+static int hnpmNotifCount = 0;              // 5s 窗口内的广播计数(验证监听器活着+广播频率)
+static CFAbsoluteTime hnpmNotifLogAt = 0;
+static BOOL hnpmNotifEverSeen = NO;         // 全程只要收到过一次就记一行(验证广播真的能到)
+
+static void HNPMNowPlayingChangedCB(CFNotificationCenterRef center, void *observer,
+                                    CFStringRef name, const void *object, CFDictionaryRef userInfo) {
+    @try {
+        hnpmNotifCount++;
+        if (!hnpmNotifEverSeen) {
+            hnpmNotifEverSeen = YES;
+            HNPMAppendLog(@"[通知] 监听器首次收到媒体信息变化广播(验证通过)");
+        }
+        CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
+        if (now - hnpmNotifLogAt >= 5.0) {
+            if (hnpmHidden)
+                HNPMAppendLog([NSString stringWithFormat:@"[通知] 隐藏期收到广播(5s内%d次) → 即时查询", hnpmNotifCount]);
+            hnpmNotifCount = 0;
+            hnpmNotifLogAt = now;
+        }
+        if (hnpmHidden) HNPMQueryNowPlayingOnce();
+    } @catch (NSException *e) {}
+}
+
+static void HNPMPassiveListenInstall(void) {
+    static void (*addObs)(CFNotificationCenterRef, void *, CFNotificationCallback, CFStringRef,
+                          const void *, CFNotificationSuspensionBehavior) = NULL;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        addObs = (void (*)(CFNotificationCenterRef, void *, CFNotificationCallback, CFStringRef,
+                           const void *, CFNotificationSuspensionBehavior))
+                 dlsym(RTLD_DEFAULT, "CFNotificationCenterAddObserver");
+    });
+    CFNotificationCenterRef dc = HNPMDarwinCenter();
+    if (!addObs || !dc) {
+        HNPMAppendLog(@"被动监听: 未挂起(darwin中心或AddObserver经dlsym不可得)");
+        return;
+    }
+    addObs(dc, NULL, &HNPMNowPlayingChangedCB,
+           CFSTR("com.apple.mediaremote.nowplaying.info-did-change"), NULL,
+           CFNotificationSuspensionBehaviorCoalesce);
+    HNPMAppendLog(@"被动监听已挂: 媒体信息变化(纯收听, 未调用任何注册API)");
 }
 
 #pragma mark - 媒体卡片判定
@@ -814,7 +868,7 @@ static void HNPMAttachPanIfNeeded(UIView *view) {
 #pragma mark - 入口
 
 __attribute__((constructor)) static void HNPMRawCtor(void) {
-    HNPMAppendLog(@"v0.0.57: dylib 构造函数已执行(dyld 加载成功)");
+    HNPMAppendLog(@"v0.0.58: dylib 构造函数已执行(dyld 加载成功)");
 }
 
 // v0.0.50/51: 岛元素抑制策略钩子 — 隐藏期让系统把 NowPlaying 元素当作"应被抑制",
@@ -867,7 +921,7 @@ __attribute__((constructor)) static void HNPMRawCtor(void) {
 
 %ctor {
     @autoreleasepool {
-        HNPMAppendLog(@"v0.0.57: logos %ctor 进入");
+        HNPMAppendLog(@"v0.0.58: logos %ctor 进入");
 
         if ([[NSFileManager defaultManager] fileExistsAtPath:@"/var/mobile/Documents/HideNowPlaying.off"]) {
             HNPMAppendLog(@"检测到开关文件 HideNowPlaying.off, 不注册任何 hook");
@@ -883,8 +937,11 @@ __attribute__((constructor)) static void HNPMRawCtor(void) {
         void *mr = dlopen("/System/Library/PrivateFrameworks/MediaRemote.framework/MediaRemote", RTLD_LAZY);
         if (mr) {
             hnpmGetInfo = (HNPMGetInfoFunc)dlsym(mr, "MRMediaRemoteGetNowPlayingInfo");
-            // v0.0.55: 不再注册任何媒体通知(见文件头) — 只读查询, 与 v0.0.51~53 一致
+            // v0.0.58: 注册符号只查存在性作诊断, 绝不调用(v0.0.54 头号嫌疑, 永久禁止)
+            void *regSym = dlsym(mr, "MRMediaRemoteRegisterForNowPlayingNotifications");
             HNPMAppendLog(hnpmGetInfo ? @"MediaRemote 已加载, 播放检测可用" : @"MediaRemote 已加载, 播放检测不可用");
+            HNPMAppendLog(regSym ? @"诊断: 注册符号存在(未调用)" : @"诊断: 注册符号不存在(本来就不会调)");
+            HNPMPassiveListenInstall();
         } else {
             HNPMAppendLog(@"MediaRemote 加载失败");
         }
@@ -893,6 +950,6 @@ __attribute__((constructor)) static void HNPMRawCtor(void) {
         if (objc_getClass("_SAUIElementViewContentView"))    { %init(HNPMIslandElement); }
         if (objc_getClass("_SAUIProvidedViewContainerView")) { %init(HNPMIslandPortal); }
         if (objc_getClass("SBSystemApertureSceneElement"))   { %init(HNPMIslandSuppression); HNPMAppendLog(@"hook 已注册: 岛元素抑制策略+元素跟踪(NowPlaying)"); }
-        HNPMAppendLog(@"v0.0.57: %ctor 正常完成");
+        HNPMAppendLog(@"v0.0.58: %ctor 正常完成");
     }
 }
