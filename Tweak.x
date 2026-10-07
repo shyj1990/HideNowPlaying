@@ -1,12 +1,11 @@
-// HideNowPlaying v0.0.53 — 修复: 隐藏期来通知时状态栏内容全空
+// HideNowPlaying v0.0.54 — 省电优化
 //
-// 根因: 状态栏(时间/信号/电池)与岛元素住同一批 Aperture 窗口的共享容器。隐藏期系统因
-//   通知等重排岛布局, 媒体内容视图可能被重挂进共享容器; 兜底逻辑按"类名+宽≥80"藏内容
-//   视图时, 通知/实时活动的内容视图同样命中, 且祖先链(共享容器)整串被藏 → 状态栏全空。
-// v0.0.53: 内容视图先按元素归属分类(HNPMElementIdForView 沿视图链反查 elementIdentifier):
-//   NowPlaying → 媒体, 照常藏; 其他元素/待机小图标 → 自身+祖先记入"共享"集合绝不碰;
-//   找不到归属 → 按媒体兜底(保核心功能)。共享容器不进隐藏集 → 通知/实时活动/状态栏安全。
-// 功能基础同 v0.0.52(正式精简版): 无诊断倾倒, 日志只留关键事件, 256KB 上限。
+// v0.0.54: ①轮询改自适应 GCD 定时器 — 快节奏(0.5s)只用于隐藏后10s内/刚发生命中时,
+//   稳态慢节奏(2s)+1.2s余量让系统合并唤醒(隐藏挂机不再 2次/秒 空转, 熄屏同理);
+//   ②播放/暂停检测加 Darwin 通知快路径(MRMediaRemoteRegisterForNowPlayingNotifications,
+//   info 变化即时查询, 免等轮询; 定时器退化为兜底) ③元素归属反查加关联对象缓存,
+//   稳态不再每次重走 ivar ④[判定]日志只在手势开始/判定翻转时记 1 行(省 CPU+日志)。
+// 核心隐藏/恢复逻辑同 v0.0.53(元素归属分类+共享容器保护), 功能无变化。
 //
 // 日志: /var/mobile/Documents/HideNowPlaying.log   紧急开关: /var/mobile/Documents/HideNowPlaying.off
 
@@ -77,11 +76,60 @@ static BOOL HNPMIsBottomMostMediaCell(UIView *cell) {
 }
 static NSHashTable *hnpmIslandViews = nil;   // 弱引用: 灵动岛内容视图
 static void *kHNPMPanKey = &kHNPMPanKey;
+static CFAbsoluteTime hnpmFastUntil = 0;     // 此时刻之前轮询用快节奏(0.5s); 稳态慢节奏(2s)省电
+static dispatch_source_t hnpmPollSource = nil; // 自适应轮询定时器(GCD)
+static void HNPMBumpFastPhase(void) { hnpmFastUntil = CFAbsoluteTimeGetCurrent() + 10.0; }
 
 #pragma mark - MediaRemote
 
 typedef void (*HNPMGetInfoFunc)(dispatch_queue_t, void (^)(CFDictionaryRef));
 static HNPMGetInfoFunc hnpmGetInfo = NULL;
+
+// v0.0.54: 查一次正在播放信息并喂给"暂停→继续播放"状态机(轮询与 Darwin 通知共用)
+static void HNPMQueryNowPlayingOnce(void) {
+    if (!hnpmGetInfo) return;
+    hnpmGetInfo(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^(CFDictionaryRef info) {
+        @try {
+            BOOL hasInfo = (info != NULL && CFDictionaryGetCount(info) > 0);
+            double rate = 0;
+            if (hasInfo) {
+                CFNumberRef rateRef = CFDictionaryGetValue(info, CFSTR("kMRMediaRemoteNowPlayingInfoPlaybackRate"));
+                if (rateRef) CFNumberGetValue(rateRef, kCFNumberDoubleType, &rate);
+            }
+            BOOL playing = (hasInfo && rate > 0.05);
+            dispatch_async(dispatch_get_main_queue(), ^{
+                @try {
+                    if (!hnpmHidden) return;
+                    if (!hnpmBaseline) {
+                        hnpmLastPlaying = playing;
+                        hnpmPauseStreak = playing ? 0 : 1;
+                        hnpmBaseline = YES;
+                    } else if (!playing) {
+                        hnpmLastPlaying = NO;
+                        hnpmPauseStreak++;
+                    } else {
+                        if (!hnpmLastPlaying && hnpmPauseStreak >= 2) {
+                            HNPMSetHidden(NO, @"检测到暂停后继续播放");
+                        }
+                        hnpmLastPlaying = YES;
+                        hnpmPauseStreak = 0;
+                    }
+                } @catch (NSException *e) {}
+            });
+        } @catch (NSException *e) {}
+    });
+}
+
+// v0.0.54: MediaRemote "播放信息已变化" Darwin 通知回调 — 播放/暂停/切歌即时唤醒检测
+// (点播放按钮的瞬间就触发, 免等下一个轮询; 轮询保留作兜底)
+static void HNPMNowPlayingChangedCB(CFNotificationCenterRef center, void *observer,
+                                    CFStringRef name, const void *object, CFDictionaryRef userInfo) {
+    @try {
+        if (!hnpmHidden) return;
+        HNPMBumpFastPhase();
+        HNPMQueryNowPlayingOnce();
+    } @catch (NSException *e) {}
+}
 #pragma mark - 媒体卡片判定
 
 static BOOL HNPMIsMediaSized(CGSize size) {
@@ -111,10 +159,16 @@ static BOOL HNPMCellHasLiveMedia(UIView *cell) {
 // 信号/WiFi/电池(尾部元素)与媒体同窗, 整窗隐藏会陪葬 → 内容级隐藏让系统自动回到待机布局
 // (隐藏期 = 原生待机观感: 短胶囊 + 信号图标 + 其他活动图标; 恢复后 = 原生播放观感)
 
+// v0.0.54: 归属结果缓存(关联对象) — 稳态轮询反复分类同一批视图, 不必每次重走 ivar
+// (只缓存非空结果: 视图刚创建还没挂到元素上的瞬时不缓存, 避免把"查不到"固化成误判)
+static void *kHNPMElementIdKey = &kHNPMElementIdKey;
+
 // v0.0.53: 沿视图链反查元素归属 — 找挂在链上视图/其ivar里的元素模型对象, 返回 elementIdentifier
 // (只向上找6层、每层查3级父类的ivar, 避免被高层共享容器里无关的元素引用污染)
 static NSString *HNPMElementIdForView(UIView *v) {
     @try {
+        id cached = objc_getAssociatedObject(v, kHNPMElementIdKey);
+        if ([cached isKindOfClass:[NSString class]]) return cached;
         SEL gi = NSSelectorFromString(@"elementIdentifier");
         int depth = 0;
         for (UIView *p = v; p && depth < 6; p = p.superview, depth++) {
@@ -123,7 +177,10 @@ static NSString *HNPMElementIdForView(UIView *v) {
 #pragma clang diagnostic ignored "-Warc-performSelector-leaks"
                 id r = [p performSelector:gi];
 #pragma clang diagnostic pop
-                if ([r isKindOfClass:[NSString class]]) return r;
+                if ([r isKindOfClass:[NSString class]]) {
+                    objc_setAssociatedObject(v, kHNPMElementIdKey, r, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+                    return r;
+                }
             }
             Class c = [p class];
             int cd = 0;
@@ -142,7 +199,11 @@ static NSString *HNPMElementIdForView(UIView *v) {
 #pragma clang diagnostic ignored "-Warc-performSelector-leaks"
                         id r = [val performSelector:gi];
 #pragma clang diagnostic pop
-                        if ([r isKindOfClass:[NSString class]]) { free(ivs); return r; }
+                        if ([r isKindOfClass:[NSString class]]) {
+                            free(ivs);
+                            objc_setAssociatedObject(v, kHNPMElementIdKey, r, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+                            return r;
+                        }
                     }
                 }
                 free(ivs);
@@ -403,6 +464,8 @@ static void HNPMSetIslandContentHidden(BOOL hide, NSString *tag) {
                 HNPMAppendLog([NSString stringWithFormat:@"[岛内] %@ 命中 %d 个→%@%@ 外壳%d 其他%d 缺归属%d",
                                tag, n, hide ? @"隐藏" : @"显示", kick, shells, others, unknown]);
             }
+            // v0.0.54: 隐藏期出现新命中(系统重挂了媒体视图) → 提速 10s 盯紧, 平时慢节奏省电
+            if (hide && n > 0) HNPMBumpFastPhase();
         } @catch (NSException *e) {}
     });
 }
@@ -490,6 +553,7 @@ static void HNPMSetHidden(BOOL hide, NSString *reason) {
     hnpmBaseline = NO;
     hnpmPauseStreak = 0;
     if (hide) {
+        HNPMBumpFastPhase();  // v0.0.54: 刚隐藏的 10s 内用快节奏盯紧过渡期
         // 卡片已由 handlePan 单独隐藏(只动"正在播放"那张)
         HNPMSetIslandContentHidden(YES, @"隐藏");
         // v0.0.51: 模型级抑制(置属性+触发重评估, 应即时生效; +2s 重申兜底)
@@ -530,58 +594,42 @@ static void HNPMSetHidden(BOOL hide, NSString *reason) {
                    reason, hide ? @"已隐藏(音乐继续)" : @"已恢复显示"]);
 }
 
-// 0.5 秒轮询: 隐藏期间检测"暂停→继续播放"; 维持岛内媒体内容隐藏(系统重开就再藏)
+// 自适应轮询(GCD 定时器): 隐藏期间检测"暂停→继续播放" + 维持岛内媒体内容隐藏
+// v0.0.54 省电: 快节奏(0.5s/余量0.15s)只用于隐藏后10s内或刚发生命中/媒体事件时;
+//   稳态慢节奏(2s/余量1.2s)让系统合并唤醒, 熄屏挂机不再 2次/秒 空转。
+//   播放/暂停变化另有 Darwin 通知即时路径(HNPMNowPlayingChangedCB), 此定时器为兜底。
 static void HNPMStartRestorePolling(void) {
     dispatch_async(dispatch_get_main_queue(), ^{
         @try {
-            static NSTimer *restoreTimer = nil;
-            if (restoreTimer) return;
-            restoreTimer = [NSTimer timerWithTimeInterval:0.5 repeats:YES block:^(NSTimer *timer) {
+            if (hnpmPollSource) return;
+            dispatch_source_t src = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, dispatch_get_main_queue());
+            dispatch_source_set_timer(src, DISPATCH_TIME_NOW,
+                                      (uint64_t)(0.5 * NSEC_PER_SEC), (uint64_t)(0.15 * NSEC_PER_SEC));
+            dispatch_source_set_event_handler(src, ^{
                 @try {
                     if (!hnpmHidden) {
-                        [timer invalidate];
-                        restoreTimer = nil;
+                        // 隐藏结束 → 停表(下次隐藏会重建)
+                        dispatch_source_t s = hnpmPollSource;
+                        hnpmPollSource = nil;
+                        if (s) dispatch_source_cancel(s);
                         return;
                     }
-                    dispatch_async(dispatch_get_main_queue(), ^{
-                        @try {
-                            HNPMSetIslandContentHidden(YES, @"轮询");
-                        } @catch (NSException *e) {}
-                    });
-                    if (!hnpmGetInfo) return;
-                    hnpmGetInfo(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^(CFDictionaryRef info) {
-                        @try {
-                            BOOL hasInfo = (info != NULL && CFDictionaryGetCount(info) > 0);
-                            double rate = 0;
-                            if (hasInfo) {
-                                CFNumberRef rateRef = CFDictionaryGetValue(info, CFSTR("kMRMediaRemoteNowPlayingInfoPlaybackRate"));
-                                if (rateRef) CFNumberGetValue(rateRef, kCFNumberDoubleType, &rate);
-                            }
-                            BOOL playing = (hasInfo && rate > 0.05);
-                            dispatch_async(dispatch_get_main_queue(), ^{
-                                @try {
-                                    if (!hnpmHidden) return;
-                                    if (!hnpmBaseline) {
-                                        hnpmLastPlaying = playing;
-                                        hnpmPauseStreak = playing ? 0 : 1;
-                                        hnpmBaseline = YES;
-                                    } else if (!playing) {
-                                        hnpmLastPlaying = NO;
-                                        hnpmPauseStreak++;
-                                    } else {
-                                        if (!hnpmLastPlaying && hnpmPauseStreak >= 2) {
-                                            HNPMSetHidden(NO, @"检测到暂停后继续播放");
-                                        }
-                                        hnpmLastPlaying = YES;
-                                        hnpmPauseStreak = 0;
-                                    }
-                                } @catch (NSException *e) {}
-                            });
-                        } @catch (NSException *e) {}
-                    });
+                    // 自适应节奏: 快(过渡期/刚有动静) / 慢(稳态, 大余量省电)
+                    dispatch_source_t s = hnpmPollSource;
+                    if (s) {
+                        if (CFAbsoluteTimeGetCurrent() < hnpmFastUntil)
+                            dispatch_source_set_timer(s, DISPATCH_TIME_NOW,
+                                                      (uint64_t)(0.5 * NSEC_PER_SEC), (uint64_t)(0.15 * NSEC_PER_SEC));
+                        else
+                            dispatch_source_set_timer(s, DISPATCH_TIME_NOW,
+                                                      (uint64_t)(2.0 * NSEC_PER_SEC), (uint64_t)(1.2 * NSEC_PER_SEC));
+                    }
+                    HNPMSetIslandContentHidden(YES, @"轮询");
+                    HNPMQueryNowPlayingOnce();
                 } @catch (NSException *e) {}
-            }];
-            [[NSRunLoop mainRunLoop] addTimer:restoreTimer forMode:NSRunLoopCommonModes];
+            });
+            hnpmPollSource = src;
+            dispatch_resume(src);
         } @catch (NSException *e) {}
     });
 }
@@ -602,20 +650,25 @@ static void HNPMStartRestorePolling(void) {
         while (p && ![p isKindOfClass:cellClass]) p = p.superview;
         if (!p) return;
         BOOL accept = HNPMIsBottomMostMediaCell(p);
-        @try {
-            CGRect wr = [p convertRect:p.bounds toView:nil];
-            CGFloat myY = wr.origin.y + wr.size.height;
-            CGFloat bestY = -CGFLOAT_MAX;
-            for (UIView *c in hnpmCardCells) {
-                if (!c.window || c == p) continue;
-                CGRect cr = [c convertRect:c.bounds toView:nil];
-                CGFloat cy = cr.origin.y + cr.size.height;
-                if (cy > bestY) bestY = cy;
-            }
-            HNPMAppendLog([NSString stringWithFormat:@"[判定] 触摸单元格 win=%@ myY=%.0f bestY=%.0f cells=%lu → %@",
-                           NSStringFromCGRect(wr), myY, bestY, (unsigned long)hnpmCardCells.count,
-                           accept ? @"接受(当作正在播放卡)" : @"拒绝(当作其他实时活动)"]);
-        } @catch (NSException *e) {}
+        // v0.0.54: 只在手势开始/判定翻转时记日志(原每个触摸事件都记, 一滑刷十几行)
+        static BOOL hnpmLastPanAccept = NO;
+        if (gr.state == UIGestureRecognizerStateBegan || accept != hnpmLastPanAccept) {
+            hnpmLastPanAccept = accept;
+            @try {
+                CGRect wr = [p convertRect:p.bounds toView:nil];
+                CGFloat myY = wr.origin.y + wr.size.height;
+                CGFloat bestY = -CGFLOAT_MAX;
+                for (UIView *c in hnpmCardCells) {
+                    if (!c.window || c == p) continue;
+                    CGRect cr = [c convertRect:c.bounds toView:nil];
+                    CGFloat cy = cr.origin.y + cr.size.height;
+                    if (cy > bestY) bestY = cy;
+                }
+                HNPMAppendLog([NSString stringWithFormat:@"[判定] 触摸单元格 myY=%.0f bestY=%.0f cells=%lu → %@",
+                               myY, bestY, (unsigned long)hnpmCardCells.count,
+                               accept ? @"接受(当作正在播放卡)" : @"拒绝(当作其他实时活动)"]);
+            } @catch (NSException *e) {}
+        }
         if (!accept) return;
         CGPoint t = [gr translationInView:gr.view];
         CGPoint v = [gr velocityInView:gr.view];
@@ -735,7 +788,7 @@ static void HNPMAttachPanIfNeeded(UIView *view) {
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.3 * NSEC_PER_SEC)),
                            dispatch_get_main_queue(), ^{
                 @try {
-                    if (hnpmHidden && self.window && HNPMIsIslandMediaView(self)) self.hidden = YES;
+                    if (hnpmHidden && self.window && HNPMIsIslandMediaView(self)) { self.hidden = YES; HNPMBumpFastPhase(); }
                 } @catch (NSException *e) {}
             });
         }
@@ -757,7 +810,7 @@ static void HNPMAttachPanIfNeeded(UIView *view) {
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.3 * NSEC_PER_SEC)),
                            dispatch_get_main_queue(), ^{
                 @try {
-                    if (hnpmHidden && self.window && HNPMIsIslandMediaView(self)) self.hidden = YES;
+                    if (hnpmHidden && self.window && HNPMIsIslandMediaView(self)) { self.hidden = YES; HNPMBumpFastPhase(); }
                 } @catch (NSException *e) {}
             });
         }
@@ -769,7 +822,7 @@ static void HNPMAttachPanIfNeeded(UIView *view) {
 #pragma mark - 入口
 
 __attribute__((constructor)) static void HNPMRawCtor(void) {
-    HNPMAppendLog(@"v0.0.53: dylib 构造函数已执行(dyld 加载成功)");
+    HNPMAppendLog(@"v0.0.54: dylib 构造函数已执行(dyld 加载成功)");
 }
 
 // v0.0.50/51: 岛元素抑制策略钩子 — 隐藏期让系统把 NowPlaying 元素当作"应被抑制",
@@ -822,7 +875,7 @@ __attribute__((constructor)) static void HNPMRawCtor(void) {
 
 %ctor {
     @autoreleasepool {
-        HNPMAppendLog(@"v0.0.53: logos %ctor 进入");
+        HNPMAppendLog(@"v0.0.54: logos %ctor 进入");
 
         if ([[NSFileManager defaultManager] fileExistsAtPath:@"/var/mobile/Documents/HideNowPlaying.off"]) {
             HNPMAppendLog(@"检测到开关文件 HideNowPlaying.off, 不注册任何 hook");
@@ -838,8 +891,15 @@ __attribute__((constructor)) static void HNPMRawCtor(void) {
         void *mr = dlopen("/System/Library/PrivateFrameworks/MediaRemote.framework/MediaRemote", RTLD_LAZY);
         if (mr) {
             hnpmGetInfo = (HNPMGetInfoFunc)dlsym(mr, "MRMediaRemoteGetNowPlayingInfo");
-            HNPMAppendLog([NSString stringWithFormat:@"MediaRemote 已加载, 播放检测%@",
-                           hnpmGetInfo ? @"可用" : @"不可用"]);
+            // v0.0.54: 注册"正在播放信息变化"通知 — 播放/暂停/切歌即时唤醒检测, 免高频轮询
+            void (*reg)(dispatch_queue_t) = (void (*)(dispatch_queue_t))dlsym(mr, "MRMediaRemoteRegisterForNowPlayingNotifications");
+            if (reg) reg(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0));
+            CFNotificationCenterAddObserver(CFNotificationCenterGetDarwinNotificationCenter(), NULL,
+                                            &HNPMNowPlayingChangedCB,
+                                            CFSTR("com.apple.mediaremote.nowplaying.info-did-change"),
+                                            NULL, CFNotificationSuspensionBehaviorCoalesce);
+            HNPMAppendLog([NSString stringWithFormat:@"MediaRemote 已加载, 播放检测%@, 变化通知%@",
+                           hnpmGetInfo ? @"可用" : @"不可用", reg ? @"已注册" : @"未注册"]);
         } else {
             HNPMAppendLog(@"MediaRemote 加载失败");
         }
@@ -848,6 +908,6 @@ __attribute__((constructor)) static void HNPMRawCtor(void) {
         if (objc_getClass("_SAUIElementViewContentView"))    { %init(HNPMIslandElement); }
         if (objc_getClass("_SAUIProvidedViewContainerView")) { %init(HNPMIslandPortal); }
         if (objc_getClass("SBSystemApertureSceneElement"))   { %init(HNPMIslandSuppression); HNPMAppendLog(@"hook 已注册: 岛元素抑制策略+元素跟踪(NowPlaying)"); }
-        HNPMAppendLog(@"v0.0.53: %ctor 正常完成");
+        HNPMAppendLog(@"v0.0.54: %ctor 正常完成");
     }
 }
