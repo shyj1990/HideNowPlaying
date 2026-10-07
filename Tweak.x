@@ -1,11 +1,13 @@
-// HideNowPlaying v0.0.54 — 省电优化
+// HideNowPlaying v0.0.55 — 回退修复版
 //
-// v0.0.54: ①轮询改自适应 GCD 定时器 — 快节奏(0.5s)只用于隐藏后10s内/刚发生命中时,
-//   稳态慢节奏(2s)+1.2s余量让系统合并唤醒(隐藏挂机不再 2次/秒 空转, 熄屏同理);
-//   ②播放/暂停检测加 Darwin 通知快路径(MRMediaRemoteRegisterForNowPlayingNotifications,
-//   info 变化即时查询, 免等轮询; 定时器退化为兜底) ③元素归属反查加关联对象缓存,
-//   稳态不再每次重走 ivar ④[判定]日志只在手势开始/判定翻转时记 1 行(省 CPU+日志)。
-// 核心隐藏/恢复逻辑同 v0.0.53(元素归属分类+共享容器保护), 功能无变化。
+// v0.0.54 省电版真机严重问题: 隐藏后控制中心播放控制失效(无法暂停/播放/切歌), 音乐App被系统
+// 看门狗杀死(启动10秒零CPU), 其他App卡住需注销 — 每次隐藏必现; v0.0.51~53 六轮测试零问题。
+// v0.0.55 全部退回 v0.0.53 已验证逻辑:
+//   ①移除 MRMediaRemoteRegisterForNowPlayingNotifications + Darwin 通知注册
+//     (v0.0.54 唯一新增的系统级调用, 头号嫌疑 — 会把 SpringBoard 挂进系统媒体通知链路,
+//     与元素抑制交互后搅乱媒体控制通道; 日志"变化通知未注册"但符号存在时调用其实已发生)
+//   ②自适应 GCD 轮询(0.5s/2s 变节奏)退回 0.5s NSTimer
+// 仅保留两个纯本地无风险优化: 元素归属关联对象缓存 + [判定]日志节流。
 //
 // 日志: /var/mobile/Documents/HideNowPlaying.log   紧急开关: /var/mobile/Documents/HideNowPlaying.off
 
@@ -77,27 +79,18 @@ static BOOL HNPMIsBottomMostMediaCell(UIView *cell) {
 }
 static NSHashTable *hnpmIslandViews = nil;   // 弱引用: 灵动岛内容视图
 static void *kHNPMPanKey = &kHNPMPanKey;
-static CFAbsoluteTime hnpmFastUntil = 0;     // 此时刻之前轮询用快节奏(0.5s); 稳态慢节奏(2s)省电
-static dispatch_source_t hnpmPollSource = nil; // 自适应轮询定时器(GCD)
-static void HNPMBumpFastPhase(void) { hnpmFastUntil = CFAbsoluteTimeGetCurrent() + 10.0; }
+static NSTimer *hnpmPollTimer = nil;         // 隐藏期轮询定时器(0.5s, v0.0.51~53 已验证)
 
 #pragma mark - MediaRemote
 
-// v0.0.54: theos 链接环境未带 CoreFoundation(直接引用会 Undefined symbols) →
-// 用 dlsym 拿 Darwin 通知中心(CoreFoundation 在 SpringBoard 常驻, RTLD_DEFAULT 必中)
-static CFNotificationCenterRef HNPMDarwinCenter(void) {
-    static CFNotificationCenterRef (*getCenter)(void) = NULL;
-    static dispatch_once_t once;
-    dispatch_once(&once, ^{
-        getCenter = (CFNotificationCenterRef (*)(void))dlsym(RTLD_DEFAULT, "CFNotificationCenterGetDarwinNotificationCenter");
-    });
-    return getCenter ? getCenter() : NULL;
-}
+// v0.0.55: 已移除 v0.0.54 新增的 MRMediaRemoteRegisterForNowPlayingNotifications + Darwin
+// 通知注册 — 真机实测: 每次隐藏后系统媒体控制链路被搅乱(CC 播放控制失效/音乐App被看门狗杀/
+// 其他App卡死), v0.0.51~53 无此调用六轮零问题。播放/暂停检测退回 0.5s 轮询。
 
 typedef void (*HNPMGetInfoFunc)(dispatch_queue_t, void (^)(CFDictionaryRef));
 static HNPMGetInfoFunc hnpmGetInfo = NULL;
 
-// v0.0.54: 查一次正在播放信息并喂给"暂停→继续播放"状态机(轮询与 Darwin 通知共用)
+// 查一次正在播放信息并喂给"暂停→继续播放"状态机(隐藏期轮询每跳调用)
 static void HNPMQueryNowPlayingOnce(void) {
     if (!hnpmGetInfo) return;
     hnpmGetInfo(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^(CFDictionaryRef info) {
@@ -132,16 +125,6 @@ static void HNPMQueryNowPlayingOnce(void) {
     });
 }
 
-// v0.0.54: MediaRemote "播放信息已变化" Darwin 通知回调 — 播放/暂停/切歌即时唤醒检测
-// (点播放按钮的瞬间就触发, 免等下一个轮询; 轮询保留作兜底)
-static void HNPMNowPlayingChangedCB(CFNotificationCenterRef center, void *observer,
-                                    CFStringRef name, const void *object, CFDictionaryRef userInfo) {
-    @try {
-        if (!hnpmHidden) return;
-        HNPMBumpFastPhase();
-        HNPMQueryNowPlayingOnce();
-    } @catch (NSException *e) {}
-}
 #pragma mark - 媒体卡片判定
 
 static BOOL HNPMIsMediaSized(CGSize size) {
@@ -476,8 +459,6 @@ static void HNPMSetIslandContentHidden(BOOL hide, NSString *tag) {
                 HNPMAppendLog([NSString stringWithFormat:@"[岛内] %@ 命中 %d 个→%@%@ 外壳%d 其他%d 缺归属%d",
                                tag, n, hide ? @"隐藏" : @"显示", kick, shells, others, unknown]);
             }
-            // v0.0.54: 隐藏期出现新命中(系统重挂了媒体视图) → 提速 10s 盯紧, 平时慢节奏省电
-            if (hide && n > 0) HNPMBumpFastPhase();
         } @catch (NSException *e) {}
     });
 }
@@ -565,7 +546,6 @@ static void HNPMSetHidden(BOOL hide, NSString *reason) {
     hnpmBaseline = NO;
     hnpmPauseStreak = 0;
     if (hide) {
-        HNPMBumpFastPhase();  // v0.0.54: 刚隐藏的 10s 内用快节奏盯紧过渡期
         // 卡片已由 handlePan 单独隐藏(只动"正在播放"那张)
         HNPMSetIslandContentHidden(YES, @"隐藏");
         // v0.0.51: 模型级抑制(置属性+触发重评估, 应即时生效; +2s 重申兜底)
@@ -606,42 +586,24 @@ static void HNPMSetHidden(BOOL hide, NSString *reason) {
                    reason, hide ? @"已隐藏(音乐继续)" : @"已恢复显示"]);
 }
 
-// 自适应轮询(GCD 定时器): 隐藏期间检测"暂停→继续播放" + 维持岛内媒体内容隐藏
-// v0.0.54 省电: 快节奏(0.5s/余量0.15s)只用于隐藏后10s内或刚发生命中/媒体事件时;
-//   稳态慢节奏(2s/余量1.2s)让系统合并唤醒, 熄屏挂机不再 2次/秒 空转。
-//   播放/暂停变化另有 Darwin 通知即时路径(HNPMNowPlayingChangedCB), 此定时器为兜底。
+// 轮询定时器(NSTimer, v0.0.51~53 同款 0.5s): 隐藏期间检测"暂停→继续播放" + 维持岛内媒体内容隐藏
 static void HNPMStartRestorePolling(void) {
     dispatch_async(dispatch_get_main_queue(), ^{
         @try {
-            if (hnpmPollSource) return;
-            dispatch_source_t src = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, dispatch_get_main_queue());
-            dispatch_source_set_timer(src, DISPATCH_TIME_NOW,
-                                      (uint64_t)(0.5 * NSEC_PER_SEC), (uint64_t)(0.15 * NSEC_PER_SEC));
-            dispatch_source_set_event_handler(src, ^{
+            if (hnpmPollTimer) [hnpmPollTimer invalidate];
+            hnpmPollTimer = [NSTimer timerWithTimeInterval:0.5 repeats:YES block:^(NSTimer *t) {
                 @try {
                     if (!hnpmHidden) {
                         // 隐藏结束 → 停表(下次隐藏会重建)
-                        dispatch_source_t s = hnpmPollSource;
-                        hnpmPollSource = nil;
-                        if (s) dispatch_source_cancel(s);
+                        [t invalidate];
+                        if (hnpmPollTimer == t) hnpmPollTimer = nil;
                         return;
-                    }
-                    // 自适应节奏: 快(过渡期/刚有动静) / 慢(稳态, 大余量省电)
-                    dispatch_source_t s = hnpmPollSource;
-                    if (s) {
-                        if (CFAbsoluteTimeGetCurrent() < hnpmFastUntil)
-                            dispatch_source_set_timer(s, DISPATCH_TIME_NOW,
-                                                      (uint64_t)(0.5 * NSEC_PER_SEC), (uint64_t)(0.15 * NSEC_PER_SEC));
-                        else
-                            dispatch_source_set_timer(s, DISPATCH_TIME_NOW,
-                                                      (uint64_t)(2.0 * NSEC_PER_SEC), (uint64_t)(1.2 * NSEC_PER_SEC));
                     }
                     HNPMSetIslandContentHidden(YES, @"轮询");
                     HNPMQueryNowPlayingOnce();
                 } @catch (NSException *e) {}
-            });
-            hnpmPollSource = src;
-            dispatch_resume(src);
+            }];
+            [[NSRunLoop mainRunLoop] addTimer:hnpmPollTimer forMode:NSRunLoopCommonModes];
         } @catch (NSException *e) {}
     });
 }
@@ -800,7 +762,7 @@ static void HNPMAttachPanIfNeeded(UIView *view) {
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.3 * NSEC_PER_SEC)),
                            dispatch_get_main_queue(), ^{
                 @try {
-                    if (hnpmHidden && self.window && HNPMIsIslandMediaView(self)) { self.hidden = YES; HNPMBumpFastPhase(); }
+                    if (hnpmHidden && self.window && HNPMIsIslandMediaView(self)) { self.hidden = YES; }
                 } @catch (NSException *e) {}
             });
         }
@@ -822,7 +784,7 @@ static void HNPMAttachPanIfNeeded(UIView *view) {
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.3 * NSEC_PER_SEC)),
                            dispatch_get_main_queue(), ^{
                 @try {
-                    if (hnpmHidden && self.window && HNPMIsIslandMediaView(self)) { self.hidden = YES; HNPMBumpFastPhase(); }
+                    if (hnpmHidden && self.window && HNPMIsIslandMediaView(self)) { self.hidden = YES; }
                 } @catch (NSException *e) {}
             });
         }
@@ -834,7 +796,7 @@ static void HNPMAttachPanIfNeeded(UIView *view) {
 #pragma mark - 入口
 
 __attribute__((constructor)) static void HNPMRawCtor(void) {
-    HNPMAppendLog(@"v0.0.54: dylib 构造函数已执行(dyld 加载成功)");
+    HNPMAppendLog(@"v0.0.55: dylib 构造函数已执行(dyld 加载成功)");
 }
 
 // v0.0.50/51: 岛元素抑制策略钩子 — 隐藏期让系统把 NowPlaying 元素当作"应被抑制",
@@ -887,7 +849,7 @@ __attribute__((constructor)) static void HNPMRawCtor(void) {
 
 %ctor {
     @autoreleasepool {
-        HNPMAppendLog(@"v0.0.54: logos %ctor 进入");
+        HNPMAppendLog(@"v0.0.55: logos %ctor 进入");
 
         if ([[NSFileManager defaultManager] fileExistsAtPath:@"/var/mobile/Documents/HideNowPlaying.off"]) {
             HNPMAppendLog(@"检测到开关文件 HideNowPlaying.off, 不注册任何 hook");
@@ -903,16 +865,8 @@ __attribute__((constructor)) static void HNPMRawCtor(void) {
         void *mr = dlopen("/System/Library/PrivateFrameworks/MediaRemote.framework/MediaRemote", RTLD_LAZY);
         if (mr) {
             hnpmGetInfo = (HNPMGetInfoFunc)dlsym(mr, "MRMediaRemoteGetNowPlayingInfo");
-            // v0.0.54: 注册"正在播放信息变化"通知 — 播放/暂停/切歌即时唤醒检测, 免高频轮询
-            void (*reg)(dispatch_queue_t) = (void (*)(dispatch_queue_t))dlsym(mr, "MRMediaRemoteRegisterForNowPlayingNotifications");
-            if (reg) reg(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0));
-            CFNotificationCenterRef dc = HNPMDarwinCenter();
-            if (dc) CFNotificationCenterAddObserver(dc, NULL,
-                                            &HNPMNowPlayingChangedCB,
-                                            CFSTR("com.apple.mediaremote.nowplaying.info-did-change"),
-                                            NULL, CFNotificationSuspensionBehaviorCoalesce);
-            HNPMAppendLog([NSString stringWithFormat:@"MediaRemote 已加载, 播放检测%@, 变化通知%@",
-                           hnpmGetInfo ? @"可用" : @"不可用", (reg && dc) ? @"已注册" : @"未注册"]);
+            // v0.0.55: 不再注册任何媒体通知(见文件头) — 只读查询, 与 v0.0.51~53 一致
+            HNPMAppendLog(hnpmGetInfo ? @"MediaRemote 已加载, 播放检测可用" : @"MediaRemote 已加载, 播放检测不可用");
         } else {
             HNPMAppendLog(@"MediaRemote 加载失败");
         }
@@ -921,6 +875,6 @@ __attribute__((constructor)) static void HNPMRawCtor(void) {
         if (objc_getClass("_SAUIElementViewContentView"))    { %init(HNPMIslandElement); }
         if (objc_getClass("_SAUIProvidedViewContainerView")) { %init(HNPMIslandPortal); }
         if (objc_getClass("SBSystemApertureSceneElement"))   { %init(HNPMIslandSuppression); HNPMAppendLog(@"hook 已注册: 岛元素抑制策略+元素跟踪(NowPlaying)"); }
-        HNPMAppendLog(@"v0.0.54: %ctor 正常完成");
+        HNPMAppendLog(@"v0.0.55: %ctor 正常完成");
     }
 }
