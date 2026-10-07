@@ -1,13 +1,10 @@
-// HideNowPlaying v0.0.55 — 回退修复版
+// HideNowPlaying v0.0.56 — 省电优化第一步(单独变量)
 //
-// v0.0.54 省电版真机严重问题: 隐藏后控制中心播放控制失效(无法暂停/播放/切歌), 音乐App被系统
-// 看门狗杀死(启动10秒零CPU), 其他App卡住需注销 — 每次隐藏必现; v0.0.51~53 六轮测试零问题。
-// v0.0.55 全部退回 v0.0.53 已验证逻辑:
-//   ①移除 MRMediaRemoteRegisterForNowPlayingNotifications + Darwin 通知注册
-//     (v0.0.54 唯一新增的系统级调用, 头号嫌疑 — 会把 SpringBoard 挂进系统媒体通知链路,
-//     与元素抑制交互后搅乱媒体控制通道; 日志"变化通知未注册"但符号存在时调用其实已发生)
-//   ②自适应 GCD 轮询(0.5s/2s 变节奏)退回 0.5s NSTimer
-// 仅保留两个纯本地无风险优化: 元素归属关联对象缓存 + [判定]日志节流。
+// 策略: 以 v0.0.55(实测稳定)为基线, v0.0.54 的省电改动一次只加回一个、每版单独真机测试。
+// 本版只加回 ①自适应 GCD 轮询: 快节奏(0.5s)只用于隐藏后10s内/刚发生命中/岛内新建媒体视图时,
+//   稳态慢节奏(2s)+1.2s余量让系统合并唤醒(隐藏挂机/熄屏不再 2次/秒 空转)。
+//   纯本地调度改动, 不碰任何系统服务(媒体通知注册仍是禁止项 — v0.0.54 卡死头号嫌疑)。
+// 保留 v0.0.55 已有: 元素归属关联缓存 + [判定]日志节流。核心隐藏/恢复逻辑与 v0.0.53/55 完全一致。
 //
 // 日志: /var/mobile/Documents/HideNowPlaying.log   紧急开关: /var/mobile/Documents/HideNowPlaying.off
 
@@ -79,7 +76,9 @@ static BOOL HNPMIsBottomMostMediaCell(UIView *cell) {
 }
 static NSHashTable *hnpmIslandViews = nil;   // 弱引用: 灵动岛内容视图
 static void *kHNPMPanKey = &kHNPMPanKey;
-static NSTimer *hnpmPollTimer = nil;         // 隐藏期轮询定时器(0.5s, v0.0.51~53 已验证)
+static CFAbsoluteTime hnpmFastUntil = 0;     // 此时刻之前轮询用快节奏(0.5s); 稳态慢节奏(2s)省电
+static dispatch_source_t hnpmPollSource = nil; // 自适应轮询定时器(GCD)
+static void HNPMBumpFastPhase(void) { hnpmFastUntil = CFAbsoluteTimeGetCurrent() + 10.0; }
 
 #pragma mark - MediaRemote
 
@@ -459,6 +458,8 @@ static void HNPMSetIslandContentHidden(BOOL hide, NSString *tag) {
                 HNPMAppendLog([NSString stringWithFormat:@"[岛内] %@ 命中 %d 个→%@%@ 外壳%d 其他%d 缺归属%d",
                                tag, n, hide ? @"隐藏" : @"显示", kick, shells, others, unknown]);
             }
+            // v0.0.56: 隐藏期出现新命中(系统重挂了媒体视图) → 提速 10s 盯紧, 平时慢节奏省电
+            if (hide && n > 0) HNPMBumpFastPhase();
         } @catch (NSException *e) {}
     });
 }
@@ -546,6 +547,7 @@ static void HNPMSetHidden(BOOL hide, NSString *reason) {
     hnpmBaseline = NO;
     hnpmPauseStreak = 0;
     if (hide) {
+        HNPMBumpFastPhase();  // 刚隐藏的 10s 内用快节奏盯紧过渡期
         // 卡片已由 handlePan 单独隐藏(只动"正在播放"那张)
         HNPMSetIslandContentHidden(YES, @"隐藏");
         // v0.0.51: 模型级抑制(置属性+触发重评估, 应即时生效; +2s 重申兜底)
@@ -586,24 +588,41 @@ static void HNPMSetHidden(BOOL hide, NSString *reason) {
                    reason, hide ? @"已隐藏(音乐继续)" : @"已恢复显示"]);
 }
 
-// 轮询定时器(NSTimer, v0.0.51~53 同款 0.5s): 隐藏期间检测"暂停→继续播放" + 维持岛内媒体内容隐藏
+// 自适应轮询(GCD 定时器): 隐藏期间检测"暂停→继续播放" + 维持岛内媒体内容隐藏
+// v0.0.56: 快节奏(0.5s/余量0.15s)只用于隐藏后10s内或刚发生命中时; 稳态慢节奏(2s/余量1.2s)
+//   让系统合并唤醒, 熄屏挂机不再 2次/秒 空转(纯本地调度, 不碰系统服务)。
 static void HNPMStartRestorePolling(void) {
     dispatch_async(dispatch_get_main_queue(), ^{
         @try {
-            if (hnpmPollTimer) [hnpmPollTimer invalidate];
-            hnpmPollTimer = [NSTimer timerWithTimeInterval:0.5 repeats:YES block:^(NSTimer *t) {
+            if (hnpmPollSource) return;
+            dispatch_source_t src = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, dispatch_get_main_queue());
+            dispatch_source_set_timer(src, DISPATCH_TIME_NOW,
+                                      (uint64_t)(0.5 * NSEC_PER_SEC), (uint64_t)(0.15 * NSEC_PER_SEC));
+            dispatch_source_set_event_handler(src, ^{
                 @try {
                     if (!hnpmHidden) {
                         // 隐藏结束 → 停表(下次隐藏会重建)
-                        [t invalidate];
-                        if (hnpmPollTimer == t) hnpmPollTimer = nil;
+                        dispatch_source_t s = hnpmPollSource;
+                        hnpmPollSource = nil;
+                        if (s) dispatch_source_cancel(s);
                         return;
+                    }
+                    // 自适应节奏: 快(过渡期/刚有动静) / 慢(稳态, 大余量省电)
+                    dispatch_source_t s = hnpmPollSource;
+                    if (s) {
+                        if (CFAbsoluteTimeGetCurrent() < hnpmFastUntil)
+                            dispatch_source_set_timer(s, DISPATCH_TIME_NOW,
+                                                      (uint64_t)(0.5 * NSEC_PER_SEC), (uint64_t)(0.15 * NSEC_PER_SEC));
+                        else
+                            dispatch_source_set_timer(s, DISPATCH_TIME_NOW,
+                                                      (uint64_t)(2.0 * NSEC_PER_SEC), (uint64_t)(1.2 * NSEC_PER_SEC));
                     }
                     HNPMSetIslandContentHidden(YES, @"轮询");
                     HNPMQueryNowPlayingOnce();
                 } @catch (NSException *e) {}
-            }];
-            [[NSRunLoop mainRunLoop] addTimer:hnpmPollTimer forMode:NSRunLoopCommonModes];
+            });
+            hnpmPollSource = src;
+            dispatch_resume(src);
         } @catch (NSException *e) {}
     });
 }
@@ -762,7 +781,7 @@ static void HNPMAttachPanIfNeeded(UIView *view) {
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.3 * NSEC_PER_SEC)),
                            dispatch_get_main_queue(), ^{
                 @try {
-                    if (hnpmHidden && self.window && HNPMIsIslandMediaView(self)) { self.hidden = YES; }
+                    if (hnpmHidden && self.window && HNPMIsIslandMediaView(self)) { self.hidden = YES; HNPMBumpFastPhase(); }
                 } @catch (NSException *e) {}
             });
         }
@@ -784,7 +803,7 @@ static void HNPMAttachPanIfNeeded(UIView *view) {
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.3 * NSEC_PER_SEC)),
                            dispatch_get_main_queue(), ^{
                 @try {
-                    if (hnpmHidden && self.window && HNPMIsIslandMediaView(self)) { self.hidden = YES; }
+                    if (hnpmHidden && self.window && HNPMIsIslandMediaView(self)) { self.hidden = YES; HNPMBumpFastPhase(); }
                 } @catch (NSException *e) {}
             });
         }
@@ -796,7 +815,7 @@ static void HNPMAttachPanIfNeeded(UIView *view) {
 #pragma mark - 入口
 
 __attribute__((constructor)) static void HNPMRawCtor(void) {
-    HNPMAppendLog(@"v0.0.55: dylib 构造函数已执行(dyld 加载成功)");
+    HNPMAppendLog(@"v0.0.56: dylib 构造函数已执行(dyld 加载成功)");
 }
 
 // v0.0.50/51: 岛元素抑制策略钩子 — 隐藏期让系统把 NowPlaying 元素当作"应被抑制",
@@ -849,7 +868,7 @@ __attribute__((constructor)) static void HNPMRawCtor(void) {
 
 %ctor {
     @autoreleasepool {
-        HNPMAppendLog(@"v0.0.55: logos %ctor 进入");
+        HNPMAppendLog(@"v0.0.56: logos %ctor 进入");
 
         if ([[NSFileManager defaultManager] fileExistsAtPath:@"/var/mobile/Documents/HideNowPlaying.off"]) {
             HNPMAppendLog(@"检测到开关文件 HideNowPlaying.off, 不注册任何 hook");
@@ -875,6 +894,6 @@ __attribute__((constructor)) static void HNPMRawCtor(void) {
         if (objc_getClass("_SAUIElementViewContentView"))    { %init(HNPMIslandElement); }
         if (objc_getClass("_SAUIProvidedViewContainerView")) { %init(HNPMIslandPortal); }
         if (objc_getClass("SBSystemApertureSceneElement"))   { %init(HNPMIslandSuppression); HNPMAppendLog(@"hook 已注册: 岛元素抑制策略+元素跟踪(NowPlaying)"); }
-        HNPMAppendLog(@"v0.0.55: %ctor 正常完成");
+        HNPMAppendLog(@"v0.0.56: %ctor 正常完成");
     }
 }
