@@ -1,10 +1,20 @@
-// HideNowPlaying v0.0.64 — 稳态 1.5s→2.0s(省电收官)
+// HideNowPlaying v0.0.65 — 与 NativeIsland 共存: 检测到其加载时自动降级为"仅模型级抑制"
+//
+// v0.0.65 共存策略(分层退让):
+//   碰岛的三条路径按冲突风险分层 — ①视图级直改(岛内容视图 hidden/重挂载/窗口抖动,
+//   与 NativeIsland 类岛增强插件撞车高发区) ②模型级抑制(借用苹果自己的
+//   shouldSuppressElement* 通道, 岛增强插件基本不会碰) ③通知列表媒体卡片(与岛无关, 永远保留)。
+//   检测到 NativeIsland.dylib 已加载 → 停用①, 保留②③(岛隐藏功能仍在, 走最安全通道);
+//   未检出 → 全功能(与 0.0.64 行为一致)。
+//   手动覆盖: /var/mobile/Documents/HideNowPlaying.noisland     = 强制全停岛侧
+//            /var/mobile/Documents/HideNowPlaying.forceisland  = 强制全功能(无视检测)
+//   (原有 /var/mobile/Documents/HideNowPlaying.off 紧急全停开关不变)
 //
 // v0.0.63 实测全绿(2026-10-07): MR短暂注册+进程内监听复活, 隐藏→注册/恢复→注销完美成对,
 //   隐藏期广播 5s 内 6~7 次(1s限流查询接住), 零卡死; 用户确认 CC 控制流畅、App 不卡。
 //   彩蛋: 首次广播出现在注册之前 — SB 系统组件本就维持注册, 观察者搭系统顺风车。
 //   0.0.54 冤案正式平反: 注册调用无罪(短暂注册已验证安全), GCD 定时器是唯一实锤凶手。
-// 本版唯一变量: 稳态 1.5→2.0s — 播放状态变化已由通知驱动即时查询, 轮询降为兜底,
+// v0.0.64: 稳态 1.5→2.0s — 播放状态变化已由通知驱动即时查询, 轮询降为兜底,
 //   长隐藏期轮询次数再省 1/4; NSTimer+setFireDate 机制不动(0.0.57 终审安全路径)。
 // 恢复速度预期: 暂停→播放若无通知兜底最慢 2s+ 状态机确认, 有通知则即时(通知驱动)。
 //
@@ -16,8 +26,10 @@
 #import <objc/runtime.h>
 #import <objc/message.h>
 #import <dlfcn.h>
+#import <mach-o/dyld.h>
 #import <math.h>
 #import <stdlib.h>
+#import <string.h>
 
 #pragma mark - 前置声明
 
@@ -279,6 +291,76 @@ static void HNPMPassiveListenA(void) {
     }
 }
 
+#pragma mark - 岛侧共存 (v0.0.65)
+
+// NativeIsland 检测: 扫描 dyld 已加载镜像(注入发生在 main 之前, %ctor 时必然可见)。
+// 懒查一次并缓存 — 运行期镜像表不会变化。
+static volatile int hnpmNativeIslandState = -1;   // -1未查 0无 1有
+
+static BOOL HNPMNativeIslandPresent(void) {
+    int cached = hnpmNativeIslandState;
+    if (cached >= 0) return cached == 1;
+    BOOL found = NO;
+    @try {
+        uint32_t n = _dyld_image_count();
+        for (uint32_t i = 0; i < n; i++) {
+            const char *p = _dyld_get_image_name(i);
+            if (!p) continue;
+            NSString *path = [[NSString alloc] initWithUTF8String:p];
+            if ([path rangeOfString:@"NativeIsland" options:NSCaseInsensitiveSearch].location != NSNotFound) {
+                found = YES;
+                break;
+            }
+        }
+        // 兜底: 若 roothide patcher 重命名了 dylib(镜像路径扫不到), 改查其 Swift 类前缀。
+        // NativeIsland 1.0.3 实测为 Swift+Orion 插件, 类名硬编码为 _TtC12NativeIsland*(改不掉)。
+        if (!found) {
+            unsigned int cnt = 0;
+            Class *classes = objc_copyClassList(&cnt);
+            if (classes) {
+                for (unsigned int i = 0; i < cnt; i++) {
+                    const char *nm = class_getName(classes[i]);
+                    if (nm && strncmp(nm, "_TtC12NativeIsland", 18) == 0) { found = YES; break; }
+                }
+                free(classes);
+            }
+        }
+    } @catch (NSException *e) {}
+    hnpmNativeIslandState = found ? 1 : 0;
+    return found;
+}
+
+// 岛侧模式(懒查一次缓存):
+//   0 = 全停岛侧(noisland 开关文件 / 未来扩展)
+//   1 = 仅模型级抑制(检测到 NativeIsland — 视图级直改停用, 避开撞车高发区)
+//   2 = 全功能(未检出 NativeIsland, 或 forceisland 强制)
+static int hnpmIslandMode = -1;
+
+static int HNPMIslandMode(void) {
+    if (hnpmIslandMode >= 0) return hnpmIslandMode;
+    @try {
+        NSFileManager *fm = [NSFileManager defaultManager];
+        if ([fm fileExistsAtPath:@"/var/mobile/Documents/HideNowPlaying.noisland"]) {
+            hnpmIslandMode = 0;
+        } else if ([fm fileExistsAtPath:@"/var/mobile/Documents/HideNowPlaying.forceisland"]) {
+            hnpmIslandMode = 2;
+        } else {
+            hnpmIslandMode = HNPMNativeIslandPresent() ? 1 : 2;
+        }
+    } @catch (NSException *e) {
+        hnpmIslandMode = 2;
+    }
+    return hnpmIslandMode;
+}
+
+static NSString *HNPMIslandModeName(int mode) {
+    switch (mode) {
+        case 0:  return @"全停(noisland)";
+        case 1:  return @"仅模型级抑制(检出NativeIsland)";
+        default: return @"全功能";
+    }
+}
+
 #pragma mark - 媒体卡片判定
 
 static BOOL HNPMIsMediaSized(CGSize size) {
@@ -453,6 +535,8 @@ static BOOL HNPMIsNowPlayingElement(id el) {
 }
 
 static void HNPMSetElementSuppression(BOOL suppress, NSString *tag) {
+    // v0.0.65 共存: 模型级抑制在"全停"模式(noisland)下不执行; 检出 NativeIsland 时保留(最安全通道)
+    if (HNPMIslandMode() < 1) return;
     dispatch_async(dispatch_get_main_queue(), ^{
         @try {
             NSMutableArray *targets = [NSMutableArray array];
@@ -516,6 +600,17 @@ static BOOL HNPMInMediaSizeBand(CGSize size) {
 //   (修复: 隐藏期来通知, 媒体视图被重挂进共享容器 → 连带藏掉状态栏/待机链 → 状态栏全空)
 // 恢复时同一套判定反向点亮; 只对内容视图做原位重新挂载(抗黑壳)
 static void HNPMSetIslandContentHidden(BOOL hide, NSString *tag) {
+    // v0.0.65 共存: 视图级直改(hidden/重挂载/窗口抖动)在"全停"或"检出NativeIsland"模式下停用。
+    // 轮询每 0.5~2s 调一次本函数 → 停用原因只记一行, 防日志刷屏。
+    if (HNPMIslandMode() < 2) {
+        static BOOL loggedSkip = NO;
+        if (!loggedSkip) {
+            loggedSkip = YES;
+            HNPMAppendLog([NSString stringWithFormat:@"[岛内] 视图级直改已停用(岛侧模式: %@)",
+                           HNPMIslandModeName(HNPMIslandMode())]);
+        }
+        return;
+    }
     dispatch_async(dispatch_get_main_queue(), ^{
         @try {
             NSMutableArray *t1 = [NSMutableArray array];       // 媒体内容视图(两类)
@@ -968,7 +1063,7 @@ static void HNPMAttachPanIfNeeded(UIView *view) {
 #pragma mark - 入口
 
 __attribute__((constructor)) static void HNPMRawCtor(void) {
-    HNPMAppendLog(@"v0.0.61: dylib 构造函数已执行(dyld 加载成功)");
+    HNPMAppendLog(@"v0.0.65: dylib 构造函数已执行(dyld 加载成功)");
 }
 
 // v0.0.50/51: 岛元素抑制策略钩子 — 隐藏期让系统把 NowPlaying 元素当作"应被抑制",
@@ -1021,7 +1116,7 @@ __attribute__((constructor)) static void HNPMRawCtor(void) {
 
 %ctor {
     @autoreleasepool {
-        HNPMAppendLog(@"v0.0.64: logos %ctor 进入");
+        HNPMAppendLog(@"v0.0.65: logos %ctor 进入");
 
         if ([[NSFileManager defaultManager] fileExistsAtPath:@"/var/mobile/Documents/HideNowPlaying.off"]) {
             HNPMAppendLog(@"检测到开关文件 HideNowPlaying.off, 不注册任何 hook");
@@ -1033,6 +1128,12 @@ __attribute__((constructor)) static void HNPMRawCtor(void) {
         hnpmIslandViews = [NSHashTable weakObjectsHashTable];
         hnpmElementTable = [NSHashTable weakObjectsHashTable];
         hnpmPanTarget = [[HNPMPanTarget alloc] init];
+
+        // v0.0.65: 先定岛侧模式(检测 NativeIsland / 开关文件), 按模式注册岛相关 hook
+        int islandMode = HNPMIslandMode();
+        HNPMAppendLog([NSString stringWithFormat:@"[共存] 岛侧模式: %@ (NativeIsland %@)",
+                       HNPMIslandModeName(islandMode),
+                       HNPMNativeIslandPresent() ? @"已检出" : @"未检出"]);
 
         void *mr = dlopen("/System/Library/PrivateFrameworks/MediaRemote.framework/MediaRemote", RTLD_LAZY);
         if (mr) {
@@ -1073,9 +1174,19 @@ __attribute__((constructor)) static void HNPMRawCtor(void) {
         HNPMPassiveListenB();
 
         if (objc_getClass("CSActivityItemContentView"))      { %init(HNPMActivityCard); HNPMAppendLog(@"hook 已注册: 媒体卡片(高度>=150 过滤)"); }
-        if (objc_getClass("_SAUIElementViewContentView"))    { %init(HNPMIslandElement); }
-        if (objc_getClass("_SAUIProvidedViewContainerView")) { %init(HNPMIslandPortal); }
-        if (objc_getClass("SBSystemApertureSceneElement"))   { %init(HNPMIslandSuppression); HNPMAppendLog(@"hook 已注册: 岛元素抑制策略+元素跟踪(NowPlaying)"); }
-        HNPMAppendLog(@"v0.0.64: %ctor 正常完成");
+        // v0.0.65: 岛内容视图/门户组的"视图级直改" hook 只在全功能模式(模式2)注册
+        if (islandMode >= 2) {
+            if (objc_getClass("_SAUIElementViewContentView"))    { %init(HNPMIslandElement); }
+            if (objc_getClass("_SAUIProvidedViewContainerView")) { %init(HNPMIslandPortal); }
+        } else {
+            HNPMAppendLog(@"[共存] 岛内容视图级 hook 未注册(视图级直改已让位)");
+        }
+        // v0.0.65: 模型级抑制 hook(苹果自己的通道, 冲突面最小)在模式1/2保留, 仅"全停"模式不注册
+        if (islandMode >= 1) {
+            if (objc_getClass("SBSystemApertureSceneElement"))   { %init(HNPMIslandSuppression); HNPMAppendLog(@"hook 已注册: 岛元素抑制策略+元素跟踪(NowPlaying)"); }
+        } else {
+            HNPMAppendLog(@"[共存] 岛模型级抑制 hook 未注册(noisland 全停)");
+        }
+        HNPMAppendLog(@"v0.0.65: %ctor 正常完成");
     }
 }
