@@ -1905,7 +1905,7 @@ static void HNPMAttachPanIfNeeded(UIView *view) {
 #pragma mark - 入口
 
 __attribute__((constructor)) static void HNPMRawCtor(void) {
-    HNPMAppendLog(@"v0.0.76: dylib 构造函数已执行(dyld 加载成功)");
+    HNPMAppendLog(@"v0.0.77: dylib 构造函数已执行(dyld 加载成功)");
 }
 
 // v0.0.50/51: 岛元素抑制策略钩子 — 隐藏期让系统把 NowPlaying 元素当作"应被抑制",
@@ -1968,7 +1968,7 @@ __attribute__((constructor)) static void HNPMRawCtor(void) {
 
 %ctor {
     @autoreleasepool {
-        HNPMAppendLog(@"v0.0.76: logos %ctor 进入");
+        HNPMAppendLog(@"v0.0.77: logos %ctor 进入");
 
         if ([[NSFileManager defaultManager] fileExistsAtPath:@"/var/mobile/Documents/HideNowPlaying.off"]) {
             HNPMAppendLog(@"检测到开关文件 HideNowPlaying.off, 不注册任何 hook");
@@ -2045,6 +2045,6 @@ __attribute__((constructor)) static void HNPMRawCtor(void) {
                                         HNPMPrefsChangedCB, CFSTR("com.aha.hidenowplaying/prefschanged"),
                                         NULL, CFNotificationSuspensionBehaviorDeliverImmediately);
         HNPMAppendLog(@"v0.0.76: 设置面板通知观察者已挂");
-        HNPMAppendLog(@"v0.0.76: %ctor 正常完成");
+        HNPMAppendLog(@"v0.0.77: %ctor 正常完成");
     }
 }
