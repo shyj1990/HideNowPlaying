@@ -1522,7 +1522,12 @@ static void HNPMAttachPanIfNeeded(UIView *view) {
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.3 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
             @try {
                 if (!self.window) return;
-                if (!HNPMIsMediaSized(self.frame.size)) return;
+                // v0.0.70: 门槛前侦察 — 计时器卡等未过150pt门槛的内容视图此前完全静默, 无法诊断
+                if (!HNPMIsMediaSized(self.frame.size)) {
+                    HNPMAppendLog([NSString stringWithFormat:@"[挂载] 未登记(尺寸不足150) cls=%@ frame=%@",
+                                   NSStringFromClass([self class]), NSStringFromCGRect(self.frame)]);
+                    return;
+                }
                 Class cellClass = NSClassFromString(@"NCNotificationListCell");
                 UIView *p = self;
                 while (p && ![p isKindOfClass:cellClass]) p = p.superview;
@@ -1629,7 +1634,7 @@ static void HNPMAttachPanIfNeeded(UIView *view) {
 #pragma mark - 入口
 
 __attribute__((constructor)) static void HNPMRawCtor(void) {
-    HNPMAppendLog(@"v0.0.69: dylib 构造函数已执行(dyld 加载成功)");
+    HNPMAppendLog(@"v0.0.70: dylib 构造函数已执行(dyld 加载成功)");
 }
 
 // v0.0.50/51: 岛元素抑制策略钩子 — 隐藏期让系统把 NowPlaying 元素当作"应被抑制",
@@ -1692,7 +1697,7 @@ __attribute__((constructor)) static void HNPMRawCtor(void) {
 
 %ctor {
     @autoreleasepool {
-        HNPMAppendLog(@"v0.0.69: logos %ctor 进入");
+        HNPMAppendLog(@"v0.0.70: logos %ctor 进入");
 
         if ([[NSFileManager defaultManager] fileExistsAtPath:@"/var/mobile/Documents/HideNowPlaying.off"]) {
             HNPMAppendLog(@"检测到开关文件 HideNowPlaying.off, 不注册任何 hook");
@@ -1764,6 +1769,6 @@ __attribute__((constructor)) static void HNPMRawCtor(void) {
                            HNPMIslandModeName(m),
                            (m == 2) ? @"未检出" : @"已检出/强制"]);
         });
-        HNPMAppendLog(@"v0.0.69: %ctor 正常完成");
+        HNPMAppendLog(@"v0.0.70: %ctor 正常完成");
     }
 }
