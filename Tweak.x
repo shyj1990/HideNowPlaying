@@ -84,6 +84,7 @@
 #pragma mark - 前置声明
 
 static void HNPMSetHidden(BOOL hide, NSString *reason, BOOL linkIsland);
+static BOOL HNPMPrefCardHidden(void);   // v0.0.76: 前置声明(设置面板开关, 定义在后)
 static void HNPMStartRestorePolling(void);
 
 #pragma mark - 日志
@@ -1607,7 +1608,7 @@ static void HNPMPrefApplyCardHidden(void) {
 
 // v0.0.76: 设置面板改动回调(Root.plist 的 PostNotification → darwin notify)
 //          清透明度缓存 + 立即应用隐藏开关(免等登记/轮询)。
-static void HNPMPrefsChangedCB(CFNotificationCenterRef center, void *observer, CFNameRef name, void *object, CFDictionaryRef userInfo) {
+static void HNPMPrefsChangedCB(CFNotificationCenterRef center, void *observer, CFNotificationName name, void *object, CFDictionaryRef userInfo) {
     CFPreferencesAppSynchronize(CFSTR("com.aha.hidenowplaying"));
     HNPMBgAlphaInvalidate();
     dispatch_async(dispatch_get_main_queue(), ^{
