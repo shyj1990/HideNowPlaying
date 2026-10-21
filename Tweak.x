@@ -1,4 +1,23 @@
-// HideNowPlaying v0.0.67 — 修复+增强: 其他App实时活动与音乐卡共存时的完整行为模型
+// HideNowPlaying v0.0.68 — 真机修正: 本地特征分类在远程渲染下失灵, 身份裁决改走 MR 会话
+//
+// v0.0.68 真机实锤(2026-10-21 日志): 所有卡(含音乐卡)全部登记为类别2、eid=(nil) —
+//   CSActivityItemContentView 的内容是远程渲染的, 本地视图树没有 UILabel/UIButton/滑条,
+//   特征评分只剩"高≥160"一项(两卡都167pt → 1分) → 全判类别2。
+//   后果: ①手势只给类别1挂恢复链 → 音乐卡被判2 → 暂停恢复永远检测不到、ShowCards 身份闸门拒收;
+//         ②岛联动同样丢失。
+//   修正:
+//   · 左滑裁决改走 MR 异步(HNPMSwipeSettle): 有活跃媒体会话 → 按音乐卡处理(hnpmHiddenCard=被滑卡,
+//     挂监听+轮询); 无会话 → 纯实时活动卡。视图级隐藏不等裁决, 立即执行。
+//   · 岛联动仅在"单卡"场景全开(多卡时无法排除滑的是实时活动; 且真机岛侦察只扫到锁图标,
+//     媒体元素不走标准 Aperture 通道, 联动收益存疑)。
+//   · ShowCards 摘掉身份闸门(按恢复锚恢复); 登记期"隐藏期重建保持隐藏"改认恢复锚。
+//   · 登记日志加 按钮/滑条/时间标签/评分/锚 诊断项。
+//   已知取舍: 音乐播放中左滑实时活动卡, 会被误入恢复通道(暂停恢复会把它带回来) — MR 无法区分
+//   "滑的是哪张卡"; 待后续从单元格 ivar 里找到实时活动身份(bundle id)做精确匹配。
+//
+// v0.0.67 — 身份判定取代位置判定(三层): 模型标识沿链反查 → 内容特征评分 → 存疑退回位置启发式;
+//   音乐卡与实时活动卡各自独立左滑隐藏; 下方卡被藏后上方可见卡自动下移补位(底边对齐,
+//   0.6/2/5s 突发重申); 暂停恢复只救恢复锚; 实时活动卡被藏时触发岛侧侦察采样。
 //
 // v0.0.67 根因修复: 卡片判定原用"只认登记表里最底下那张"的位置启发式, 但外卖卡(带地图)高度
 //   可达150~160pt, 同样通过登记(高≥150) → 登记表混入外卖卡 → ①音乐卡非最底→左滑被拒;
@@ -53,7 +72,7 @@
 
 #pragma mark - 前置声明
 
-static void HNPMSetHidden(BOOL hide, NSString *reason);
+static void HNPMSetHidden(BOOL hide, NSString *reason, BOOL linkIsland);
 static void HNPMStartRestorePolling(void);
 
 #pragma mark - 日志
@@ -83,6 +102,7 @@ static void HNPMAppendLog(NSString *text) {
 #pragma mark - 全局状态
 
 static BOOL hnpmHidden = NO;
+static BOOL hnpmIslandLinked = NO;   // v0.0.68: 本次隐藏期是否允许碰岛(单卡/类别1 才开; 轮询与岛hook统一把门)
 static BOOL hnpmBaseline = NO;
 static BOOL hnpmLastPlaying = NO;
 static int  hnpmPauseStreak = 0;
@@ -178,7 +198,7 @@ static void HNPMQueryNowPlayingOnce(void) {
                         hnpmPauseStreak++;
                     } else {
                         if (!hnpmLastPlaying && hnpmPauseStreak >= 2) {
-                            HNPMSetHidden(NO, @"检测到暂停后继续播放");
+                            HNPMSetHidden(NO, @"检测到暂停后继续播放", YES);
                         }
                         hnpmLastPlaying = YES;
                         hnpmPauseStreak = 0;
@@ -1015,19 +1035,19 @@ static void HNPMShowCards(void) {
             for (UIView *content in hnpmCardContents) {
                 if (content.window && content.isHidden) content.hidden = NO;
             }
-            // 找要恢复的卡片: 优先被左滑那张; 系统重建过就找最底部的隐藏"正在播放"卡
-            // (v0.0.67: 只在正在播放卡里挑, 防止把错登记的其他活动卡恢复出来)
+            // 找要恢复的卡片: 优先被左滑那张(v0.0.68: 不再看身份 — 本地特征分类在远程渲染下
+            // 失灵, 音乐卡也会被判类别2, 身份闸门会把恢复拦死); 系统重建过就找最底部的隐藏媒体卡
             UIView *cell = hnpmHiddenCard;
             if (!cell || !cell.window) {
                 CGFloat bestY = -CGFLOAT_MAX;
                 for (UIView *c in hnpmCardCells) {
-                    if (!c.window || !c.hidden || !HNPMIsNowPlayingCell(c)) continue;
+                    if (!c.window || !c.hidden || !HNPMCellHasLiveMedia(c)) continue;
                     CGRect cr = [c convertRect:c.bounds toView:nil];
                     CGFloat cy = cr.origin.y + cr.size.height;
                     if (cy > bestY) { bestY = cy; cell = c; }
                 }
             }
-            if (!cell || !cell.window || !HNPMIsNowPlayingCell(cell)) return;
+            if (!cell || !cell.window || !HNPMCellHasLiveMedia(cell)) return;
             // 已在显示中 → 不再重复动画(防恢复重试导致的闪烁)
             if (!cell.hidden) return;
             HNPMCardHiddenSet(cell, NO);   // 暂停恢复通道: 清掉左滑隐藏标志(否则下次登记会被重新藏)
@@ -1063,24 +1083,27 @@ static void HNPMRestoreWithRetries(void) {
     }
 }
 
-static void HNPMSetHidden(BOOL hide, NSString *reason) {
+static void HNPMSetHidden(BOOL hide, NSString *reason, BOOL linkIsland) {
     if (hide == hnpmHidden) return;
     hnpmHidden = hide;
+    hnpmIslandLinked = (hide && linkIsland);
     hnpmBaseline = NO;
     hnpmPauseStreak = 0;
     if (hide) {
         HNPMRegisterMediaListen(YES);  // v0.0.63: 隐藏期短暂挂媒体通知链(通知→限流即时查询)
         HNPMBumpFastPhase();  // 刚隐藏的 10s 内用快节奏盯紧过渡期
-        // 卡片已由 handlePan 单独隐藏(只动"正在播放"那张)
-        HNPMSetIslandContentHidden(YES, @"隐藏");
-        // v0.0.51: 模型级抑制(置属性+触发重评估, 应即时生效; +2s 重申兜底)
-        HNPMSetElementSuppression(YES, @"·隐");
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)),
-                       dispatch_get_main_queue(), ^{
-            @try {
-                if (hnpmHidden) HNPMSetElementSuppression(YES, @"·隐2");
-            } @catch (NSException *e) {}
-        });
+        // v0.0.68: 岛联动可关 — 实时活动卡/多卡歧义场景不碰岛(卡片已由 handlePan 单独隐藏)
+        if (linkIsland) {
+            HNPMSetIslandContentHidden(YES, @"隐藏");
+            // v0.0.51: 模型级抑制(置属性+触发重评估, 应即时生效; +2s 重申兜底)
+            HNPMSetElementSuppression(YES, @"·隐");
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)),
+                           dispatch_get_main_queue(), ^{
+                @try {
+                    if (hnpmHidden && linkIsland) HNPMSetElementSuppression(YES, @"·隐2");
+                } @catch (NSException *e) {}
+            });
+        }
     } else {
         HNPMRegisterMediaListen(NO);  // v0.0.63: 恢复立即注销摘链
         // v0.0.51: 先解除模型级抑制并触发重评估 → 系统重新呈现媒体元素(内容管线复活);
@@ -1138,11 +1161,52 @@ static void HNPMStartRestorePolling(void) {
                         [t setFireDate:[NSDate dateWithTimeIntervalSinceNow:2.0]];
                     }
                     // 快相: 不推迟, 保持 0.5s 原节奏
-                    HNPMSetIslandContentHidden(YES, @"轮询");
+                    if (hnpmIslandLinked) HNPMSetIslandContentHidden(YES, @"轮询");   // v0.0.68: 岛联动关时轮询不碰岛
                     HNPMQueryNowPlayingOnce();
                 } @catch (NSException *e) {}
             }];
             [[NSRunLoop mainRunLoop] addTimer:hnpmPollTimer forMode:NSRunLoopCommonModes];
+        } @catch (NSException *e) {}
+    });
+}
+
+// v0.0.68: 左滑后的身份裁决 — 本地特征分类在真机失灵(CSActivityItemContentView 内容是
+// 远程渲染的, 本地视图树里没有 UILabel/UIButton, 特征评分只剩高度一项, 音乐卡也被判类别2),
+// 只能借 MediaRemote 会话状态: 有活跃会话(播放或暂停) → 按音乐卡走恢复通道; 无会话 → 纯实时活动。
+// 视图级隐藏不等裁决, 立即执行(动画不卡顿); 岛联动仅在"单卡"场景全开(多卡时无法排除滑的是实时活动)。
+static void HNPMSwipeSettle(UIView *cell, int kind) {
+    if (!hnpmGetInfo) {
+        HNPMAppendLog(@"[裁决] MR符号缺失 → 仅视图级隐藏(无岛联动/无暂停恢复)");
+        return;
+    }
+    hnpmGetInfo(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^(CFDictionaryRef info) {
+        @try {
+            BOOL hasInfo = (info != NULL && CFDictionaryGetCount(info) > 0);
+            double rate = 0;
+            if (hasInfo) {
+                CFNumberRef r = CFDictionaryGetValue(info, CFSTR("kMRMediaRemoteNowPlayingInfoPlaybackRate"));
+                if (r) CFNumberGetValue(r, kCFNumberDoubleType, &rate);
+            }
+            dispatch_async(dispatch_get_main_queue(), ^{
+                @try {
+                    if (!cell.window) {
+                        HNPMAppendLog(@"[裁决] 返回时卡片已不在场 → 忽略");
+                        return;
+                    }
+                    if (!hasInfo) {
+                        HNPMAppendLog(@"[裁决] MR无媒体会话 → 纯实时活动卡(不进恢复通道/不联动岛)");
+                        return;
+                    }
+                    BOOL single = (hnpmCardCells.count <= 1);
+                    HNPMAppendLog([NSString stringWithFormat:@"[裁决] MR会话活跃(rate=%.2f, 在场卡片%lu张, 单卡=%d) → 按音乐卡处理(岛联动=%d)",
+                                   rate, (unsigned long)hnpmCardCells.count, single ? 1 : 0, (single || kind == 1) ? 1 : 0]);
+                    hnpmHiddenCard = cell;   // 恢复锚: 被滑的那张(身份分类失灵, 不再区分)
+                    if (!hnpmHidden) {
+                        HNPMSetHidden(YES, @"锁屏播放卡片左滑", single || kind == 1);
+                        HNPMStartRestorePolling();
+                    }
+                } @catch (NSException *e) {}
+            });
         } @catch (NSException *e) {}
     });
 }
@@ -1181,10 +1245,7 @@ static void HNPMStartRestorePolling(void) {
                 HNPMApplyCardLayout(YES);   // 下方藏卡 → 上方可见卡下移补位
                 HNPMLayoutRetryBurst();
                 if (kind == 2) HNPMIslandReconLog(@"实时活动卡藏");   // 岛侧样本采集(为下一版精确联动做准备)
-                if (kind == 1 && !hnpmHidden) {
-                    HNPMSetHidden(YES, @"锁屏播放卡片左滑");
-                    HNPMStartRestorePolling();
-                }
+                HNPMSwipeSettle(p, kind);   // v0.0.68: MR异步裁决音乐/实时活动通道
             }
         } else if (gr.state == UIGestureRecognizerStateEnded) {
             if (t.x < -55 && fabs(t.x) > fabs(t.y) * 1.2 && v.x < -300) {
@@ -1192,10 +1253,7 @@ static void HNPMStartRestorePolling(void) {
                 HNPMApplyCardLayout(YES);
                 HNPMLayoutRetryBurst();
                 if (kind == 2) HNPMIslandReconLog(@"实时活动卡藏");
-                if (kind == 1 && !hnpmHidden) {
-                    HNPMSetHidden(YES, @"锁屏播放卡片左滑(轻扫)");
-                    HNPMStartRestorePolling();
-                }
+                HNPMSwipeSettle(p, kind);
             }
         }
     } @catch (NSException *e) {}
@@ -1263,20 +1321,25 @@ static void HNPMAttachPanIfNeeded(UIView *view) {
                 // v0.0.67: 登记期即定性(模型标识→内容特征→位置兜底), 结果缓存在单元格上
                 NSString *eid = nil;
                 int kind = HNPMClassifyListCell(cell, &eid);
+                // v0.0.68: 特征评分上日志 — 真机实锤远程渲染导致本地特征全零, 评分只剩高度项
+                HNPMCellTraits t = HNPMScanCellTraits(cell);
+                int tscore = HNPMTraitsScore(t, cell.bounds.size.height);
                 if (kind < 0) kind = HNPMIsBottomMostMediaCell(cell) ? 1 : 2;   // 存疑退回位置
                 HNPMCellClassSet(cell, kind);
+                BOOL isAnchor = (cell == hnpmHiddenCard);   // 被滑过的恢复锚(身份分类失灵也要认)
                 // 侦察: 单元格/内容的 frame + 窗口坐标 + 上两级容器类名 + 身份证据
                 CGRect winR = [cell convertRect:cell.bounds toView:nil];
                 CGRect winC = [self convertRect:self.bounds toView:nil];
                 NSString *p1 = [[cell superview] class] ? NSStringFromClass([[cell superview] class]) : @"无";
                 NSString *p2 = [[cell superview] superview] ? NSStringFromClass([[cell superview] superview].class) : @"无";
-                HNPMAppendLog([NSString stringWithFormat:@"[卡片] 登记 类别%d eid=%@ 单元格 frame=%@ win=%@ 内容 frame=%@ win=%@ 容器=%@/%@",
+                HNPMAppendLog([NSString stringWithFormat:@"[卡片] 登记 类别%d eid=%@ 按钮%d 滑条%d 时间标签%d 评分%d 锚%d 单元格 frame=%@ win=%@ 内容 frame=%@ win=%@ 容器=%@/%@",
                                kind, eid ?: @"(nil)",
+                               t.buttons, t.sliders, t.timeLabels, tscore, isAnchor ? 1 : 0,
                                NSStringFromCGRect(cell.frame), NSStringFromCGRect(winR),
                                NSStringFromCGRect(self.frame), NSStringFromCGRect(winC), p1, p2]);
-                if (HNPMCardHiddenGet(cell) || (hnpmHidden && kind == 1)) {
-                    // 用户左滑藏过(或音乐隐藏期被系统重建) → 保持隐藏; 实时活动卡同规则
-                    if (hnpmHidden && kind == 1) HNPMCardHiddenSet(cell, YES);
+                if (HNPMCardHiddenGet(cell) || (hnpmHidden && (kind == 1 || isAnchor))) {
+                    // 用户左滑藏过 / 音乐隐藏期被系统重建(类别1 或 恢复锚) → 保持隐藏
+                    if (hnpmHidden && (kind == 1 || isAnchor)) HNPMCardHiddenSet(cell, YES);
                     self.hidden = YES;
                     cell.hidden = YES;
                     cell.transform = CGAffineTransformIdentity;
@@ -1314,7 +1377,7 @@ static void HNPMAttachPanIfNeeded(UIView *view) {
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.3 * NSEC_PER_SEC)),
                            dispatch_get_main_queue(), ^{
                 @try {
-                    if (hnpmHidden && HNPMIslandMode() >= 2 && self.window && HNPMIsIslandMediaView(self)) { self.hidden = YES; HNPMBumpFastPhase(); }
+                    if (hnpmIslandLinked && HNPMIslandMode() >= 2 && self.window && HNPMIsIslandMediaView(self)) { self.hidden = YES; HNPMBumpFastPhase(); }
                 } @catch (NSException *e) {}
             });
         }
@@ -1337,7 +1400,7 @@ static void HNPMAttachPanIfNeeded(UIView *view) {
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.3 * NSEC_PER_SEC)),
                            dispatch_get_main_queue(), ^{
                 @try {
-                    if (hnpmHidden && HNPMIslandMode() >= 2 && self.window && HNPMIsIslandMediaView(self)) { self.hidden = YES; HNPMBumpFastPhase(); }
+                    if (hnpmIslandLinked && HNPMIslandMode() >= 2 && self.window && HNPMIsIslandMediaView(self)) { self.hidden = YES; HNPMBumpFastPhase(); }
                 } @catch (NSException *e) {}
             });
         }
@@ -1349,7 +1412,7 @@ static void HNPMAttachPanIfNeeded(UIView *view) {
 #pragma mark - 入口
 
 __attribute__((constructor)) static void HNPMRawCtor(void) {
-    HNPMAppendLog(@"v0.0.67: dylib 构造函数已执行(dyld 加载成功)");
+    HNPMAppendLog(@"v0.0.68: dylib 构造函数已执行(dyld 加载成功)");
 }
 
 // v0.0.50/51: 岛元素抑制策略钩子 — 隐藏期让系统把 NowPlaying 元素当作"应被抑制",
@@ -1402,7 +1465,7 @@ __attribute__((constructor)) static void HNPMRawCtor(void) {
 
 %ctor {
     @autoreleasepool {
-        HNPMAppendLog(@"v0.0.67: logos %ctor 进入");
+        HNPMAppendLog(@"v0.0.68: logos %ctor 进入");
 
         if ([[NSFileManager defaultManager] fileExistsAtPath:@"/var/mobile/Documents/HideNowPlaying.off"]) {
             HNPMAppendLog(@"检测到开关文件 HideNowPlaying.off, 不注册任何 hook");
@@ -1473,6 +1536,6 @@ __attribute__((constructor)) static void HNPMRawCtor(void) {
                            HNPMIslandModeName(m),
                            (m == 2) ? @"未检出" : @"已检出/强制"]);
         });
-        HNPMAppendLog(@"v0.0.67: %ctor 正常完成");
+        HNPMAppendLog(@"v0.0.68: %ctor 正常完成");
     }
 }
