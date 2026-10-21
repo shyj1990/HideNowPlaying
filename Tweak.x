@@ -213,7 +213,12 @@ static void HNPMQueryNowPlayingOnce(void) {
                         hnpmPauseStreak++;
                     } else {
                         if (!hnpmLastPlaying && hnpmPauseStreak >= 2) {
-                            HNPMSetHidden(NO, @"检测到暂停后继续播放", YES);
+                            // v0.0.76: 设置"隐藏音乐卡片"=开 → 暂停恢复不再还原(保持默认隐藏)
+                            if (HNPMPrefCardHidden()) {
+                                HNPMAppendLog(@"[设置] 隐藏音乐卡片=开 → 忽略暂停恢复(保持隐藏)");
+                            } else {
+                                HNPMSetHidden(NO, @"检测到暂停后继续播放", YES);
+                            }
                         }
                         hnpmLastPlaying = YES;
                         hnpmPauseStreak = 0;
@@ -724,22 +729,35 @@ static void HNPMLayoutRetryBurst(void) {
 }
 
 // ---- v0.0.71: 卡片背景透明度 ----
-// 配置: /var/mobile/Documents/HideNowPlaying.alpha 写 0.05~1.0 的数字(如 0.4);
-//       无文件默认 0.55; 写 1.0 = 关闭功能。5s 缓存防频繁读盘。
+// v0.0.76: 配置优先级 = 设置面板(CFPreferences bgAlpha) > 文件(/var/mobile/Documents/HideNowPlaying.alpha)
+//          > 默认 0.55; 1.0 = 关闭功能; 5s 缓存防频繁读盘, 面板改动经 darwin 通知即时清缓存。
+static CGFloat hnpmBgAlphaCached = -1.0;
+static CFAbsoluteTime hnpmBgAlphaCachedAt = 0;
+static void HNPMBgAlphaInvalidate(void) { hnpmBgAlphaCached = -1.0; }
+
+// v0.0.76: 设置面板"隐藏音乐卡片"开关(CFPreferences)
+static BOOL HNPMPrefCardHidden(void) {
+    Boolean ok = NO;
+    BOOL v = CFPreferencesGetAppBooleanValue(CFSTR("cardHidden"), CFSTR("com.aha.hidenowplaying"), &ok);
+    return ok ? (BOOL)v : NO;
+}
+
 static CGFloat HNPMBgAlpha(void) {
-    static CGFloat cached = -1.0;
-    static CFAbsoluteTime cachedAt = 0;
-    if (cached >= 0 && CFAbsoluteTimeGetCurrent() - cachedAt < 5.0) return cached;
+    if (hnpmBgAlphaCached >= 0 && CFAbsoluteTimeGetCurrent() - hnpmBgAlphaCachedAt < 5.0) return hnpmBgAlphaCached;
     CGFloat v = 0.55;
-    NSString *s = [NSString stringWithContentsOfFile:@"/var/mobile/Documents/HideNowPlaying.alpha"
-                                            encoding:NSUTF8StringEncoding error:nil];
-    if (s) {
-        v = s.doubleValue;
-        if (v < 0.05) v = 0.05;
-        if (v > 1.0) v = 1.0;
+    CFTypeRef pv = CFPreferencesCopyAppValue(CFSTR("bgAlpha"), CFSTR("com.aha.hidenowplaying"));
+    if (pv) {
+        v = (CGFloat)[(__bridge NSNumber *)pv doubleValue];
+        CFRelease(pv);
+    } else {
+        NSString *s = [NSString stringWithContentsOfFile:@"/var/mobile/Documents/HideNowPlaying.alpha"
+                                                encoding:NSUTF8StringEncoding error:nil];
+        if (s) v = s.doubleValue;
     }
-    cached = v;
-    cachedAt = CFAbsoluteTimeGetCurrent();
+    if (v < 0.05) v = 0.05;
+    if (v > 1.0) v = 1.0;
+    hnpmBgAlphaCached = v;
+    hnpmBgAlphaCachedAt = CFAbsoluteTimeGetCurrent();
     return v;
 }
 
@@ -1545,6 +1563,58 @@ static void HNPMStartRestorePolling(void) {
     });
 }
 
+// v0.0.76: 设置面板"隐藏音乐卡片"开关的应用 — 开=找在场媒体卡走与左滑一致的隐藏链
+//          (先 MR 裁决有播放会话才动手, 防止误伤纯实时活动场景); 关=立即恢复显示。
+static void HNPMPrefApplyCardHidden(void) {
+    if (!HNPMPrefCardHidden()) {
+        if (hnpmHidden) {
+            HNPMSetHidden(NO, @"设置开关恢复", YES);
+            HNPMAppendLog(@"[设置] 隐藏音乐卡片=关 → 恢复显示");
+        }
+        return;
+    }
+    if (hnpmHidden) return;    // 已在隐藏态
+    if (!hnpmGetInfo) return;  // 无 MR 符号: 保守不自动藏(与左滑裁决同门槛)
+    hnpmGetInfo(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^(CFDictionaryRef info) {
+        BOOL hasInfo = (info != NULL && CFDictionaryGetCount(info) > 0);
+        dispatch_async(dispatch_get_main_queue(), ^{
+            @try {
+                if (!HNPMPrefCardHidden() || hnpmHidden) return;
+                if (!hasInfo) {
+                    HNPMAppendLog(@"[设置] 隐藏音乐卡片=开 → 无播放会话(纯实时活动场景)不自动藏");
+                    return;
+                }
+                UIView *target = nil;
+                CGFloat bestY = -CGFLOAT_MAX;
+                for (UIView *c in hnpmCardCells) {
+                    if (!c.window || c.hidden || HNPMCardHiddenGet(c) || !HNPMCellHasLiveMedia(c)) continue;
+                    CGRect cr = [c convertRect:c.bounds toView:nil];
+                    CGFloat cy = cr.origin.y + cr.size.height;
+                    if (cy > bestY) { bestY = cy; target = c; }
+                }
+                if (!target) {
+                    HNPMAppendLog(@"[设置] 隐藏音乐卡片=开 → 暂无在场媒体卡(等登记触发)");
+                    return;
+                }
+                HNPMHideCard(target);
+                HNPMSetHidden(YES, @"设置-隐藏音乐卡片", YES);
+                HNPMStartRestorePolling();
+                HNPMAppendLog(@"[设置] 隐藏音乐卡片=开 → 自动隐藏(岛联动)");
+            } @catch (NSException *e) {}
+        });
+    });
+}
+
+// v0.0.76: 设置面板改动回调(Root.plist 的 PostNotification → darwin notify)
+//          清透明度缓存 + 立即应用隐藏开关(免等登记/轮询)。
+static void HNPMPrefsChangedCB(CFNotificationCenterRef center, void *observer, CFNameRef name, void *object, CFDictionaryRef userInfo) {
+    CFPreferencesAppSynchronize(CFSTR("com.aha.hidenowplaying"));
+    HNPMBgAlphaInvalidate();
+    dispatch_async(dispatch_get_main_queue(), ^{
+        @try { HNPMPrefApplyCardHidden(); } @catch (NSException *e) {}
+    });
+}
+
 // v0.0.68: 左滑后的身份裁决 — 本地特征分类在真机失灵(CSActivityItemContentView 内容是
 // 远程渲染的, 本地视图树里没有 UILabel/UIButton, 特征评分只剩高度一项, 音乐卡也被判类别2),
 // 只能借 MediaRemote 会话状态: 有活跃会话(播放或暂停) → 按音乐卡走恢复通道; 无会话 → 纯实时活动。
@@ -1769,6 +1839,14 @@ static void HNPMAttachPanIfNeeded(UIView *view) {
                 if (!HNPMCardHiddenGet(cell) && !cell.hidden) {
                     HNPMClearActivitySuppressionIfMatch(cell, kind);
                 }
+                // v0.0.76: 设置"隐藏音乐卡片"=开 → 登记后自动隐藏(覆盖锁屏进入/respring/卡片重建;
+                //          HNPMPrefApplyCardHidden 内部有 MR 会话裁决, 防误伤纯实时活动场景)
+                if (!hnpmHidden && HNPMPrefCardHidden() && !HNPMCardHiddenGet(cell) && HNPMCellHasLiveMedia(cell)) {
+                    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.4 * NSEC_PER_SEC)),
+                                   dispatch_get_main_queue(), ^{
+                        @try { HNPMPrefApplyCardHidden(); } @catch (NSException *e) {}
+                    });
+                }
             } @catch (NSException *e) {}
         });
     } @catch (NSException *e) {}
@@ -1826,7 +1904,7 @@ static void HNPMAttachPanIfNeeded(UIView *view) {
 #pragma mark - 入口
 
 __attribute__((constructor)) static void HNPMRawCtor(void) {
-    HNPMAppendLog(@"v0.0.75: dylib 构造函数已执行(dyld 加载成功)");
+    HNPMAppendLog(@"v0.0.76: dylib 构造函数已执行(dyld 加载成功)");
 }
 
 // v0.0.50/51: 岛元素抑制策略钩子 — 隐藏期让系统把 NowPlaying 元素当作"应被抑制",
@@ -1889,7 +1967,7 @@ __attribute__((constructor)) static void HNPMRawCtor(void) {
 
 %ctor {
     @autoreleasepool {
-        HNPMAppendLog(@"v0.0.75: logos %ctor 进入");
+        HNPMAppendLog(@"v0.0.76: logos %ctor 进入");
 
         if ([[NSFileManager defaultManager] fileExistsAtPath:@"/var/mobile/Documents/HideNowPlaying.off"]) {
             HNPMAppendLog(@"检测到开关文件 HideNowPlaying.off, 不注册任何 hook");
@@ -1961,6 +2039,11 @@ __attribute__((constructor)) static void HNPMRawCtor(void) {
                            HNPMIslandModeName(m),
                            (m == 2) ? @"未检出" : @"已检出/强制"]);
         });
-        HNPMAppendLog(@"v0.0.75: %ctor 正常完成");
+        // v0.0.76: 设置面板(设置 → HideNowPlaying) — 改动即时生效(darwin 通知 → 清缓存/应用开关)
+        CFNotificationCenterAddObserver(CFNotificationCenterGetDarwinNotifyCenter(), NULL,
+                                        HNPMPrefsChangedCB, CFSTR("com.aha.hidenowplaying/prefschanged"),
+                                        NULL, CFNotificationSuspensionBehaviorDeliverImmediately);
+        HNPMAppendLog(@"v0.0.76: 设置面板通知观察者已挂");
+        HNPMAppendLog(@"v0.0.76: %ctor 正常完成");
     }
 }
