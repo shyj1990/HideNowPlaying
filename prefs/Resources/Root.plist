@@ -1,0 +1,55 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>title</key>
+	<string>HideNowPlaying</string>
+	<key>items</key>
+	<array>
+		<dict>
+			<key>cell</key>
+			<string>PSGroupCell</string>
+			<key>footerText</key>
+			<string>开启后锁屏音乐卡片默认隐藏(灵动岛同步隐藏)，暂停/继续播放不再自动恢复；关闭开关立即恢复显示。左滑隐藏功能不受影响。</string>
+		</dict>
+		<dict>
+			<key>cell</key>
+			<string>PSSwitchCell</string>
+			<key>default</key>
+			<false/>
+			<key>defaults</key>
+			<string>com.aha.hidenowplaying</string>
+			<key>key</key>
+			<string>cardHidden</string>
+			<key>label</key>
+			<string>隐藏音乐卡片</string>
+			<key>PostNotification</key>
+			<string>com.aha.hidenowplaying/prefschanged</string>
+		</dict>
+		<dict>
+			<key>cell</key>
+			<string>PSGroupCell</string>
+			<key>footerText</key>
+			<string>卡片背景透明度：只淡化白色背景板，文字/封面不受影响。1.0 = 不透明(功能关闭)，0.05 = 接近全透。改动即时生效。</string>
+		</dict>
+		<dict>
+			<key>cell</key>
+			<string>PSSliderCell</string>
+			<key>default</key>
+			<real>0.55</real>
+			<key>defaults</key>
+			<string>com.aha.hidenowplaying</string>
+			<key>key</key>
+			<string>bgAlpha</string>
+			<key>min</key>
+			<real>0.05</real>
+			<key>max</key>
+			<real>1</real>
+			<key>isVertical</key>
+			<false/>
+			<key>PostNotification</key>
+			<string>com.aha.hidenowplaying/prefschanged</string>
+		</dict>
+	</array>
+</dict>
+</plist>
