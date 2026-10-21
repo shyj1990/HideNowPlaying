@@ -802,26 +802,10 @@ static void HNPMApplyCardBackgroundAlpha(UIView *cell, int kind) {
             HNPMAppendLog([NSString stringWithFormat:@"[透明] 类别2 卡外托盘材质层%d个 alpha→%.2f", outHits, a]);
             return;
         }
-        // C. 全找不到 → 背景是远端画的; 上完整诊断
-        NSMutableArray *diag = [NSMutableArray array];
-        if (cell.backgroundColor) [diag addObject:[NSString stringWithFormat:@"cellBg=%@", cell.backgroundColor]];
-        for (UIView *v in cell.subviews) {
-            if (v.backgroundColor) [diag addObject:[NSString stringWithFormat:@"%@bg=%@", NSStringFromClass([v class]), v.backgroundColor]];
-        }
-        level = cell.superview;
-        depth = 0;
-        while (level && depth < 3) {
-            NSMutableArray *names = [NSMutableArray array];
-            for (UIView *sib in level.subviews) {
-                if (!sib || sib == cell || [sib isDescendantOfView:cell]) continue;
-                [names addObject:[NSString stringWithFormat:@"%@(%.0fx%.0f)", NSStringFromClass([sib class]), sib.bounds.size.width, sib.bounds.size.height]];
-                if (names.count >= 8) break;
-            }
-            [diag addObject:[NSString stringWithFormat:@"L%d[%@]", depth, [names componentsJoinedByString:@" "]]];
-            level = level.superview;
-            depth++;
-        }
-        HNPMAppendLog([NSString stringWithFormat:@"[透明] 类别2 无本地材质层(背景疑为远端绘制) %@", [diag componentsJoinedByString:@" | "]]);
+        // C. 全找不到 → 白底是远端内容自绘的(宿主进程渲染), 本地没有任何可压的背景层。
+        // v0.0.73: 退而求其次 → 整卡淡化(文字/图片也会一并半透明, 深浅由配置值权衡)。
+        if (fabs(cell.alpha - a) > 0.01) cell.alpha = a;
+        HNPMAppendLog([NSString stringWithFormat:@"[透明] 类别2 背景为远端绘制 → 整卡淡化 alpha=%.2f (文字一并半透明)", a]);
     } @catch (NSException *e) {}
 }
 
@@ -1156,6 +1140,12 @@ static void HNPMClearActivitySuppressionIfMatch(UIView *cell, int kind) {
     if (hit) HNPMClearActivitySuppression(@"活动卡重新在场");
 }
 
+// v0.0.73: 卡片显示动画的目标 alpha — 背景透明功能开启时 = 配置值(整卡淡化), 否则 1.0
+static CGFloat HNPMCardTargetAlpha(void) {
+    CGFloat a = HNPMBgAlpha();
+    return a >= 0.99 ? 1.0 : a;
+}
+
 // v0.0.47: "媒体元素全家桶"隐藏 —— 内容视图 + 其祖先 + 尺寸带内与媒体 frame 重叠的外壳
 // v0.0.53: 其他元素(通知/实时活动/待机小图标)的内容视图及其祖先记入"共享"集合, 绝不隐藏
 //   (修复: 隐藏期来通知, 媒体视图被重挂进共享容器 → 连带藏掉状态栏/待机链 → 状态栏全空)
@@ -1339,7 +1329,7 @@ static void HNPMShowCards(void) {
                                     options:UIViewAnimationOptionCurveEaseOut
                                  animations:^{
                 cell.transform = CGAffineTransformIdentity;
-                cell.alpha = 1.0;
+                cell.alpha = HNPMCardTargetAlpha();   // v0.0.73: 透明开启时恢复到配置 alpha
             }
                                  completion:nil];
             HNPMAppendLog(@"[卡片] 恢复显示(带媒体内容的单元格)");
@@ -1680,7 +1670,7 @@ static void HNPMAttachPanIfNeeded(UIView *view) {
                     cell.alpha = 0.0;
                     cell.hidden = NO;
                     HNPMCardShiftSet(cell, 0.0);
-                    [UIView animateWithDuration:0.35 animations:^{ cell.alpha = 1.0; }];
+                    [UIView animateWithDuration:0.35 animations:^{ cell.alpha = HNPMCardTargetAlpha(); }];   // v0.0.73: 透明开启时恢复到配置 alpha
                     HNPMAppendLog(@"[卡片] 恢复期登记 → 自动恢复显示");
                 }
                 HNPMApplyCardLayout(YES);   // 登记/重建后重算补位
@@ -1746,7 +1736,7 @@ static void HNPMAttachPanIfNeeded(UIView *view) {
 #pragma mark - 入口
 
 __attribute__((constructor)) static void HNPMRawCtor(void) {
-    HNPMAppendLog(@"v0.0.72: dylib 构造函数已执行(dyld 加载成功)");
+    HNPMAppendLog(@"v0.0.73: dylib 构造函数已执行(dyld 加载成功)");
 }
 
 // v0.0.50/51: 岛元素抑制策略钩子 — 隐藏期让系统把 NowPlaying 元素当作"应被抑制",
@@ -1809,7 +1799,7 @@ __attribute__((constructor)) static void HNPMRawCtor(void) {
 
 %ctor {
     @autoreleasepool {
-        HNPMAppendLog(@"v0.0.72: logos %ctor 进入");
+        HNPMAppendLog(@"v0.0.73: logos %ctor 进入");
 
         if ([[NSFileManager defaultManager] fileExistsAtPath:@"/var/mobile/Documents/HideNowPlaying.off"]) {
             HNPMAppendLog(@"检测到开关文件 HideNowPlaying.off, 不注册任何 hook");
@@ -1881,6 +1871,6 @@ __attribute__((constructor)) static void HNPMRawCtor(void) {
                            HNPMIslandModeName(m),
                            (m == 2) ? @"未检出" : @"已检出/强制"]);
         });
-        HNPMAppendLog(@"v0.0.72: %ctor 正常完成");
+        HNPMAppendLog(@"v0.0.73: %ctor 正常完成");
     }
 }
