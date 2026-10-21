@@ -1,4 +1,15 @@
-// HideNowPlaying v0.0.68 — 真机修正: 本地特征分类在远程渲染下失灵, 身份裁决改走 MR 会话
+// HideNowPlaying v0.0.69 — 实时活动岛联动(模型级) + 身份探针 + 手势节流
+//
+// v0.0.69 三件套:
+//   ①岛联动: 真机样本实锤实时活动上岛后 eid 形如 activity:<UUID>:<addr>。左滑实时活动卡 →
+//     从锁屏单元格 ivar 树(对象型, 40个封顶, 2级父类)探 UUID/身份串 → 模型级抑制岛上含同身份的
+//     activity: 元素(走 shouldSuppressElement* 苹果同款通道, 与 NativeIsland 共存安全;
+//     探不到身份时兜底匹配全部 activity: 元素)。解除时机: 被抑制活动重新在场(登记身份匹配)/恢复锚
+//     带同身份/兜底模式下任一类别2卡重新在场。+2s/+6s 重申防元素重建。
+//   ②身份探针(HNPMProbeActivityUUIDs): 沿单元格 ivar 收集 UUID/activity: 形字符串, 命中上日志
+//     ([身份] ivar=xxx 值=yyy), 为后续精确匹配积累样本。不缓存(单元格对象被系统复用)。
+//   ③手势节流: 一次手势只触发一次隐藏/裁决(此前 Changed/Ended 多次过阈值, 一秒N次裁决+侦察)。
+//   附带: HideCard 日志中性化(身份失灵期间音乐卡也曾被记成"实时活动")。
 //
 // v0.0.68 真机实锤(2026-10-21 日志): 所有卡(含音乐卡)全部登记为类别2、eid=(nil) —
 //   CSActivityItemContentView 的内容是远程渲染的, 本地视图树没有 UILabel/UIButton/滑条,
@@ -103,6 +114,10 @@ static void HNPMAppendLog(NSString *text) {
 
 static BOOL hnpmHidden = NO;
 static BOOL hnpmIslandLinked = NO;   // v0.0.68: 本次隐藏期是否允许碰岛(单卡/类别1 才开; 轮询与岛hook统一把门)
+// v0.0.69: 实时活动岛联动(模型级) — 左滑实时活动卡 → 岛上 activity:<UUID>:<addr> 元素同步抑制
+static BOOL hnpmActivitySuppress = NO;
+static NSArray *hnpmActivityUUIDs = nil;      // 被滑卡探出的身份串(UUID或完整activity:串); 空=兜底匹配全部activity:元素
+static NSHashTable *hnpmActivityTable = nil;  // 弱引用: 见过的 activity: 岛元素
 static BOOL hnpmBaseline = NO;
 static BOOL hnpmLastPlaying = NO;
 static int  hnpmPauseStreak = 0;
@@ -868,6 +883,168 @@ static BOOL HNPMInMediaSizeBand(CGSize size) {
             && size.height >= 30.0 && size.height <= 80.0);
 }
 
+// ---- v0.0.69: 实时活动岛元素联动(模型级) ----
+// 真机样本(2026-10-21 岛侦察): 岛上实时活动元素 eid 形如 activity:<UUID>:<addr>。
+// 链路: 左滑实时活动卡 → 从锁屏单元格 ivar 树探 UUID → 抑制岛上含同 UUID 的 activity: 元素
+// (走苹果 shouldSuppressElement* 同款模型级通道, 与 NativeIsland 共存安全; 视图级不碰)。
+
+static BOOL HNPMIsUUIDString(NSString *s) {
+    if (s.length != 36) return NO;
+    for (NSUInteger i = 0; i < 36; i++) {
+        unichar c = [s characterAtIndex:i];
+        if (i == 8 || i == 13 || i == 18 || i == 23) { if (c != '-') return NO; }
+        else if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F'))) return NO;
+    }
+    return YES;
+}
+
+// 沿单元格 ivar 树(对象型, 最多扫40个对象, 每类2级父类)收集 UUID 形/activity: 形字符串。
+// 注意: 结果不缓存 — NCNotificationListCell 对象会被系统复用, 缓存会张冠李戴。
+static NSArray *HNPMProbeActivityUUIDs(UIView *cell, BOOL logFound) {
+    NSMutableArray *out = [NSMutableArray array];
+    if (!cell) return out;
+    @try {
+        NSMutableArray *work = [NSMutableArray arrayWithObject:cell];
+        int scanned = 0;
+        while (work.count > 0 && scanned < 40) {
+            id obj = work.firstObject;
+            [work removeObjectAtIndex:0];
+            if (!obj) continue;
+            scanned++;
+            Class c = [obj class];
+            int cd = 0;
+            while (c && cd < 2) {
+                unsigned int n = 0;
+                Ivar *ivs = class_copyIvarList(c, &n);
+                for (unsigned int i = 0; i < n && i < 64; i++) {
+                    const char *ty = ivar_getTypeEncoding(ivs[i]);
+                    if (!ty || ty[0] != '@') continue;
+                    id v = nil;
+                    @try { v = object_getIvar(obj, ivs[i]); } @catch (NSException *e) { continue; }
+                    if (!v || v == obj || [work containsObject:v]) continue;
+                    if ([v isKindOfClass:[NSString class]]) {
+                        NSString *sv = v;
+                        BOOL hit = HNPMIsUUIDString(sv)
+                            || (sv.length >= 10 && sv.length <= 120 && [sv lowercaseString] containsString:@"activity:");
+                        if (hit && ![out containsObject:sv]) {
+                            [out addObject:sv];
+                            if (logFound) {
+                                NSString *show = (sv.length > 72) ? [NSString stringWithFormat:@"%@…", [sv substringToIndex:72]] : sv;
+                                HNPMAppendLog([NSString stringWithFormat:@"[身份] 命中 ivar=%s 值=%@",
+                                               ivar_getName(ivs[i]), show]);
+                            }
+                        }
+                    } else if ([v isKindOfClass:[NSObject class]]) {
+                        [work addObject:v];   // 嵌套模型对象再挖(总数封顶40)
+                    }
+                }
+                if (ivs) free(ivs);
+                c = [c superclass];
+                cd++;
+            }
+        }
+    } @catch (NSException *e) {}
+    return out;
+}
+
+// 岛 activity: 元素匹配: UUID 精确(被滑卡身份串出现在 eid 中)或兜底全部
+static BOOL HNPMIsActivityElement(id el) {
+    @try {
+        if (!el || !hnpmActivitySuppress) return NO;
+        SEL gi = NSSelectorFromString(@"elementIdentifier");
+        if (![el respondsToSelector:gi]) return NO;
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Warc-performSelector-leaks"
+        id v = [el performSelector:gi];
+#pragma clang diagnostic pop
+        if (![v isKindOfClass:[NSString class]]) return NO;
+        NSString *eid = v;
+        if (![eid hasPrefix:@"activity:"]) return NO;
+        if (hnpmActivityUUIDs.count == 0) return YES;   // 兜底: 探不到身份时匹配全部 activity: 元素
+        for (NSString *k in hnpmActivityUUIDs) {
+            if (k.length > 0 && [eid containsString:k]) return YES;
+        }
+        return NO;
+    } @catch (NSException *e) { return NO; }
+}
+
+// 模型级抑制(同 NowPlaying 通道): setRequiresSuppressionFromSystemAperture + 重评估
+static void HNPMSetActivitySuppression(BOOL suppress, NSString *tag) {
+    if (HNPMIslandMode() < 1) return;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        @try {
+            NSMutableArray *targets = [NSMutableArray array];
+            if (hnpmActivityTable) {
+                NSArray *snap = nil;
+                @synchronized(hnpmActivityTable) { snap = [[hnpmActivityTable allObjects] copy]; }
+                for (id e in snap) {
+                    if (e && HNPMIsActivityElement(e) && ![targets containsObject:e]) [targets addObject:e];
+                }
+            }
+            id ctrl = HNPMIslandController();
+            if (ctrl) {
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Warc-performSelector-leaks"
+                SEL fe = NSSelectorFromString(@"_currentFirstElement");
+                if ([ctrl respondsToSelector:fe]) {
+                    id el = [ctrl performSelector:fe];
+                    if (el && HNPMIsActivityElement(el) && ![targets containsObject:el]) [targets addObject:el];
+                }
+#pragma clang diagnostic pop
+            }
+            SEL rs = NSSelectorFromString(@"setRequiresSuppressionFromSystemAperture:");
+            int set = 0;
+            for (id el in targets) {
+                @try {
+                    if ([el respondsToSelector:rs]) {
+                        void (*setSup)(id, SEL, BOOL) = (void (*)(id, SEL, BOOL))objc_msgSend;
+                        setSup(el, rs, suppress);
+                        set++;
+                    }
+                } @catch (NSException *e) {}
+            }
+            int ree = 0;
+            if (ctrl) {
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Warc-performSelector-leaks"
+                SEL re = NSSelectorFromString(@"_reevaluateSystemApertureCompleteSuppression");
+                if ([ctrl respondsToSelector:re]) { [ctrl performSelector:re]; ree = 1; }
+#pragma clang diagnostic pop
+            }
+            HNPMAppendLog([NSString stringWithFormat:@"[抑制活%@] 目标%d 置%d 重评估%d 匹配%@",
+                           tag, (int)targets.count, set, ree,
+                           hnpmActivityUUIDs.count > 0 ? @"精确(UUID)" : @"全部(activity:)"]);
+        } @catch (NSException *e) {
+            HNPMAppendLog([NSString stringWithFormat:@"[抑制活%@] 异常: %@", tag, e.reason]);
+        }
+    });
+}
+
+static void HNPMClearActivitySuppression(NSString *tag) {
+    if (!hnpmActivitySuppress) return;
+    hnpmActivitySuppress = NO;
+    HNPMSetActivitySuppression(NO, tag);
+    hnpmActivityUUIDs = nil;
+}
+
+// 在场卡重新登记时, 若其身份与被抑制的实时活动匹配 → 解除(活动重新呈现了)
+static void HNPMClearActivitySuppressionIfMatch(UIView *cell, int kind) {
+    if (!hnpmActivitySuppress) return;
+    BOOL hit = NO;
+    if (hnpmActivityUUIDs.count == 0) {
+        hit = (kind == 2);   // 兜底模式: 任一实时活动卡重新在场即解除
+    } else {
+        NSArray *u = HNPMProbeActivityUUIDs(cell, NO);
+        for (NSString *k in hnpmActivityUUIDs) {
+            for (NSString *p in u) {
+                if (p.length > 0 && ([p containsString:k] || [k containsString:p])) { hit = YES; break; }
+            }
+            if (hit) break;
+        }
+    }
+    if (hit) HNPMClearActivitySuppression(@"活动卡重新在场");
+}
+
 // v0.0.47: "媒体元素全家桶"隐藏 —— 内容视图 + 其祖先 + 尺寸带内与媒体 frame 重叠的外壳
 // v0.0.53: 其他元素(通知/实时活动/待机小图标)的内容视图及其祖先记入"共享"集合, 绝不隐藏
 //   (修复: 隐藏期来通知, 媒体视图被重挂进共享容器 → 连带藏掉状态栏/待机链 → 状态栏全空)
@@ -1016,7 +1193,7 @@ static void HNPMHideCard(UIView *cell) {
             }];
         } @catch (NSException *e) {}
     });
-    if (!isMusic) HNPMAppendLog(@"[卡片] 其他App实时活动 → 左滑隐藏(岛不受影响)");
+    if (!isMusic) HNPMAppendLog([NSString stringWithFormat:@"[卡片] 左滑隐藏(类别%d, 通道待MR裁决)", HNPMCellClassGet(cell)]);
 }
 
 static void HNPMShowCards(void) {
@@ -1055,6 +1232,22 @@ static void HNPMShowCards(void) {
             }
                                  completion:nil];
             HNPMAppendLog(@"[卡片] 恢复显示(带媒体内容的单元格)");
+            // v0.0.69: 恢复锚若带实时活动身份(误入音乐通道的实时活动卡) → 解除其岛抑制
+            if (hnpmActivitySuppress) {
+                NSArray *u = HNPMProbeActivityUUIDs(cell, NO);
+                BOOL hit = (hnpmActivityUUIDs.count == 0)
+                    ? (HNPMCellClassGet(cell) == 2)
+                    : NO;
+                if (!hit) {
+                    for (NSString *k in hnpmActivityUUIDs) {
+                        for (NSString *p in u) {
+                            if (p.length > 0 && ([p containsString:k] || [k containsString:p])) { hit = YES; break; }
+                        }
+                        if (hit) break;
+                    }
+                }
+                if (hit) HNPMClearActivitySuppression(@"恢复通道");
+            }
             // 恢复动画结束后再补位(下方实时活动藏过 → 音乐卡落到低位)
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.45 * NSEC_PER_SEC)),
                            dispatch_get_main_queue(), ^{ HNPMApplyCardLayout(YES); });
@@ -1184,14 +1377,38 @@ static void HNPMSwipeSettle(UIView *cell, int kind) {
                         HNPMAppendLog(@"[裁决] 返回时卡片已不在场 → 忽略");
                         return;
                     }
+                    // v0.0.69: 身份探针(两种通道都探) — UUID 精确匹配岛上 activity: 元素
+                    NSArray *uuids = HNPMProbeActivityUUIDs(cell, YES);
                     if (!hasInfo) {
-                        HNPMAppendLog(@"[裁决] MR无媒体会话 → 纯实时活动卡(不进恢复通道/不联动岛)");
+                        HNPMAppendLog(@"[裁决] MR无媒体会话 → 纯实时活动卡(不进恢复通道/不联动NowPlaying岛)");
+                        // 岛联动: 探到UUID→精确匹配; 探不到→兜底全部activity:元素
+                        hnpmActivitySuppress = YES;
+                        hnpmActivityUUIDs = uuids;
+                        HNPMSetActivitySuppression(YES, @"·隐");
+                        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)),
+                                       dispatch_get_main_queue(), ^{
+                            @try { if (hnpmActivitySuppress) HNPMSetActivitySuppression(YES, @"·隐2"); } @catch (NSException *e) {}
+                        });
+                        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(6.0 * NSEC_PER_SEC)),
+                                       dispatch_get_main_queue(), ^{
+                            @try { if (hnpmActivitySuppress) HNPMSetActivitySuppression(YES, @"·隐3"); } @catch (NSException *e) {}
+                        });
                         return;
                     }
                     BOOL single = (hnpmCardCells.count <= 1);
                     HNPMAppendLog([NSString stringWithFormat:@"[裁决] MR会话活跃(rate=%.2f, 在场卡片%lu张, 单卡=%d) → 按音乐卡处理(岛联动=%d)",
                                    rate, (unsigned long)hnpmCardCells.count, single ? 1 : 0, (single || kind == 1) ? 1 : 0]);
                     hnpmHiddenCard = cell;   // 恢复锚: 被滑的那张(身份分类失灵, 不再区分)
+                    if (uuids.count > 0) {
+                        // v0.0.69: 被滑卡带实时活动身份 → 精确抑制其岛上元素(即便误入音乐通道)
+                        hnpmActivitySuppress = YES;
+                        hnpmActivityUUIDs = uuids;
+                        HNPMSetActivitySuppression(YES, @"·精");
+                        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)),
+                                       dispatch_get_main_queue(), ^{
+                            @try { if (hnpmActivitySuppress) HNPMSetActivitySuppression(YES, @"·精2"); } @catch (NSException *e) {}
+                        });
+                    }
                     if (!hnpmHidden) {
                         HNPMSetHidden(YES, @"锁屏播放卡片左滑", single || kind == 1);
                         HNPMStartRestorePolling();
@@ -1230,8 +1447,12 @@ static void HNPMSwipeSettle(UIView *cell, int kind) {
         if (!accept) return;
         CGPoint t = [gr translationInView:gr.view];
         CGPoint v = [gr velocityInView:gr.view];
+        // v0.0.69: 一次手势只触发一次(Changed/Ended多次过阈值曾致一秒内N次裁决+侦察)
+        static BOOL hnpmPanFired = NO;
+        if (gr.state == UIGestureRecognizerStateBegan) hnpmPanFired = NO;
         if (gr.state == UIGestureRecognizerStateChanged) {
-            if (t.x < -60 && fabs(t.x) > fabs(t.y) * 1.5) {
+            if (t.x < -60 && fabs(t.x) > fabs(t.y) * 1.5 && !hnpmPanFired) {
+                hnpmPanFired = YES;
                 HNPMHideCard(p);
                 HNPMApplyCardLayout(YES);   // 下方藏卡 → 上方可见卡下移补位
                 HNPMLayoutRetryBurst();
@@ -1239,7 +1460,8 @@ static void HNPMSwipeSettle(UIView *cell, int kind) {
                 HNPMSwipeSettle(p, kind);   // v0.0.68: MR异步裁决音乐/实时活动通道
             }
         } else if (gr.state == UIGestureRecognizerStateEnded) {
-            if (t.x < -55 && fabs(t.x) > fabs(t.y) * 1.2 && v.x < -300) {
+            if (t.x < -55 && fabs(t.x) > fabs(t.y) * 1.2 && v.x < -300 && !hnpmPanFired) {
+                hnpmPanFired = YES;
                 HNPMHideCard(p);
                 HNPMApplyCardLayout(YES);
                 HNPMLayoutRetryBurst();
@@ -1346,6 +1568,10 @@ static void HNPMAttachPanIfNeeded(UIView *view) {
                     HNPMAppendLog(@"[卡片] 恢复期登记 → 自动恢复显示");
                 }
                 HNPMApplyCardLayout(YES);   // 登记/重建后重算补位
+                // v0.0.69: 在场卡的登记若与被抑制的实时活动身份匹配 → 解除岛抑制(活动重新呈现了)
+                if (!HNPMCardHiddenGet(cell) && !cell.hidden) {
+                    HNPMClearActivitySuppressionIfMatch(cell, kind);
+                }
             } @catch (NSException *e) {}
         });
     } @catch (NSException *e) {}
@@ -1403,7 +1629,7 @@ static void HNPMAttachPanIfNeeded(UIView *view) {
 #pragma mark - 入口
 
 __attribute__((constructor)) static void HNPMRawCtor(void) {
-    HNPMAppendLog(@"v0.0.68: dylib 构造函数已执行(dyld 加载成功)");
+    HNPMAppendLog(@"v0.0.69: dylib 构造函数已执行(dyld 加载成功)");
 }
 
 // v0.0.50/51: 岛元素抑制策略钩子 — 隐藏期让系统把 NowPlaying 元素当作"应被抑制",
@@ -1413,13 +1639,18 @@ __attribute__((constructor)) static void HNPMRawCtor(void) {
 %hook SBSystemApertureSceneElement
 
 // v0.0.51: 元素跟踪 — 记录见过的 NowPlaying 元素(弱引用), 供解除抑制时定位
+// v0.0.69: 另跟踪 activity: 实时活动元素(弱引用), 供活动岛联动定位
 - (NSString *)elementIdentifier {
     NSString *v = %orig;
     @try {
-        if (hnpmElementTable && [v isKindOfClass:[NSString class]]
-            && [(NSString *)v containsString:@"NowPlaying"]) {
+        if (hnpmElementTable && [v isKindOfClass:[NSString class]]) {
             @synchronized(hnpmElementTable) {
-                if (![hnpmElementTable containsObject:self]) [hnpmElementTable addObject:self];
+                if ([(NSString *)v containsString:@"NowPlaying"]
+                    && ![hnpmElementTable containsObject:self]) [hnpmElementTable addObject:self];
+            }
+            @synchronized(hnpmActivityTable) {
+                if ([(NSString *)v hasPrefix:@"activity:"]
+                    && ![hnpmActivityTable containsObject:self]) [hnpmActivityTable addObject:self];
             }
         }
     } @catch (NSException *e) {}
@@ -1428,26 +1659,31 @@ __attribute__((constructor)) static void HNPMRawCtor(void) {
 
 - (BOOL)requiresSuppressionFromSystemAperture {
     if (hnpmHidden && HNPMIsNowPlayingElement(self)) return YES;
+    if (hnpmActivitySuppress && HNPMIsActivityElement(self)) return YES;   // v0.0.69: 实时活动联动
     return %orig;
 }
 
 - (BOOL)shouldSuppressElementWhileOnCoversheet {
     if (hnpmHidden && HNPMIsNowPlayingElement(self)) return YES;
+    if (hnpmActivitySuppress && HNPMIsActivityElement(self)) return YES;
     return %orig;
 }
 
 - (BOOL)shouldSuppressElementWhilePresentingNoAppsOrScenes {
     if (hnpmHidden && HNPMIsNowPlayingElement(self)) return YES;
+    if (hnpmActivitySuppress && HNPMIsActivityElement(self)) return YES;
     return %orig;
 }
 
 - (BOOL)shouldSuppressElementWhilePresentingAppWithBundleId:(id)bundleId {
     if (hnpmHidden && HNPMIsNowPlayingElement(self)) return YES;
+    if (hnpmActivitySuppress && HNPMIsActivityElement(self)) return YES;
     return %orig;
 }
 
 - (BOOL)shouldSuppressElementWhilePresentingSceneWithIdentifier:(id)sceneId {
     if (hnpmHidden && HNPMIsNowPlayingElement(self)) return YES;
+    if (hnpmActivitySuppress && HNPMIsActivityElement(self)) return YES;
     return %orig;
 }
 
@@ -1456,7 +1692,7 @@ __attribute__((constructor)) static void HNPMRawCtor(void) {
 
 %ctor {
     @autoreleasepool {
-        HNPMAppendLog(@"v0.0.68: logos %ctor 进入");
+        HNPMAppendLog(@"v0.0.69: logos %ctor 进入");
 
         if ([[NSFileManager defaultManager] fileExistsAtPath:@"/var/mobile/Documents/HideNowPlaying.off"]) {
             HNPMAppendLog(@"检测到开关文件 HideNowPlaying.off, 不注册任何 hook");
@@ -1467,6 +1703,7 @@ __attribute__((constructor)) static void HNPMRawCtor(void) {
         hnpmCardContents = [NSHashTable weakObjectsHashTable];
         hnpmIslandViews = [NSHashTable weakObjectsHashTable];
         hnpmElementTable = [NSHashTable weakObjectsHashTable];
+        hnpmActivityTable = [NSHashTable weakObjectsHashTable];   // v0.0.69: activity: 实时活动元素跟踪
         hnpmPanTarget = [[HNPMPanTarget alloc] init];
 
         // v0.0.66: 宽限期时间基准 — 15 秒内岛侧模式动态评估(防 tweak 加载顺序竞态:
@@ -1527,6 +1764,6 @@ __attribute__((constructor)) static void HNPMRawCtor(void) {
                            HNPMIslandModeName(m),
                            (m == 2) ? @"未检出" : @"已检出/强制"]);
         });
-        HNPMAppendLog(@"v0.0.68: %ctor 正常完成");
+        HNPMAppendLog(@"v0.0.69: %ctor 正常完成");
     }
 }
