@@ -743,6 +743,22 @@ static CGFloat HNPMBgAlpha(void) {
     return v;
 }
 
+// v0.0.75: 托盘内部结构一次性诊断 — 确认 backgroundView(白底)/customContentView(内容)分层,
+//          供排障; 每次解锁进程只 dump 一次。
+static BOOL sHNPMPlatterDiagDumped = NO;
+static void HNPMPlatterDiagDump(UIView *platter, UIView *bg, NSString *via) {
+    if (sHNPMPlatterDiagDumped) return;
+    sHNPMPlatterDiagDumped = YES;
+    @try {
+        NSMutableArray *rows = [NSMutableArray array];
+        [rows addObject:[NSString stringWithFormat:@"托盘%@ f=%@ via=%@(%@)", NSStringFromClass([platter class]), NSStringFromCGRect(platter.frame), via, NSStringFromCGRect(bg.frame)]];
+        for (UIView *s in platter.subviews) {
+            [rows addObject:[NSString stringWithFormat:@"%@ f=%@ a=%.2f h=%d", NSStringFromClass([s class]), NSStringFromCGRect(s.frame), s.alpha, s.isHidden ? 1 : 0]];
+        }
+        HNPMAppendLog([NSString stringWithFormat:@"[透明·诊断] %@", [rows componentsJoinedByString:@" || "]]);
+    } @catch (NSException *e) {}
+}
+
 // 把登记卡的背景压到目标 alpha。
 // v0.0.72: 真机实锤卡内子树没有 UIVisualEffectView(白底不在卡里)。
 // v0.0.74: 头文件实锤(iOS17 运行时头, CoverSheet/UserNotificationsUIKit/PlatterKit) —
@@ -757,8 +773,9 @@ static void HNPMApplyCardBackgroundAlpha(UIView *cell, int kind) {
         CGFloat a = HNPMBgAlpha();
         if (a >= 0.99) return;   // 1.0 = 功能关闭
         NSMutableSet *touched = [NSMutableSet set];
-        // P. v0.0.74: 托盘扫(不深入远程内容子树)
+        // P. v0.0.74: 托盘扫(不深入远程内容子树); v0.0.75 只压其背景子层
         int pHits = 0;
+        NSString *pVia = @"";
         Class platterCls = NSClassFromString(@"PLPlatterView");
         if (platterCls) {
             @try {
@@ -771,9 +788,31 @@ static void HNPMApplyCardBackgroundAlpha(UIView *cell, int kind) {
                     NSString *cls = NSStringFromClass([v class]);
                     if ([cls containsString:@"Remote"]) continue;
                     if ([v isKindOfClass:platterCls]) {
-                        if (fabs(v.alpha - a) > 0.01) v.alpha = a;
-                        [touched addObject:v];
-                        pHits++;
+                        // v0.0.75: 只压托盘的"背景子层" — 真机实测(v0.0.74)压整个托盘时内容
+                        //          (customContentView 里的 hostedView)被连带淡化 = 幽灵卡复现。
+                        //          头文件分层: backgroundView(白底材质) / customContentView(内容)。
+                        UIView *bg = nil; NSString *via = @"";
+                        @try {
+                            id x = [v valueForKey:@"backgroundView"];
+                            if ([x isKindOfClass:[UIView class]]) { bg = x; via = @"backgroundView"; }
+                        } @catch (NSException *e) {}
+                        if (!bg) {
+                            @try {
+                                id x = [v valueForKey:@"backgroundMaterialView"];
+                                if ([x isKindOfClass:[UIView class]]) { bg = x; via = @"backgroundMaterialView"; }
+                            } @catch (NSException *e) {}
+                        }
+                        if (bg) {
+                            if (fabs(bg.alpha - a) > 0.01) bg.alpha = a;
+                            [touched addObject:bg];
+                            pHits++; pVia = via;
+                            HNPMPlatterDiagDump(v, bg, via);
+                        } else {
+                            // 托盘无背景子层(罕见) → 整托盘淡化(旧路兜底, 内容会连带)
+                            if (fabs(v.alpha - a) > 0.01) v.alpha = a;
+                            [touched addObject:v];
+                            pHits++; pVia = @"整托盘";
+                        }
                     }
                     [stack addObjectsFromArray:v.subviews];
                 }
@@ -782,7 +821,7 @@ static void HNPMApplyCardBackgroundAlpha(UIView *cell, int kind) {
         if (pHits > 0) {
             HNPMAlphaRetrySet(cell, 0);                            // cell 复用时重置重试计数
             if (fabs(cell.alpha - 1.0) > 0.01) cell.alpha = 1.0;   // 托盘生效 → 撤销整卡淡化兜底
-            HNPMAppendLog([NSString stringWithFormat:@"[透明] 类别2 托盘PLPlatterView%d个 alpha→%.2f (文字不受影响)", pHits, a]);
+            HNPMAppendLog([NSString stringWithFormat:@"[透明] 类别2 托盘背景层%d个(%@) alpha→%.2f (文字不受影响)", pHits, pVia, a]);
             return;
         }
         // A. 卡内扫(不深入远程内容子树)
@@ -1787,7 +1826,7 @@ static void HNPMAttachPanIfNeeded(UIView *view) {
 #pragma mark - 入口
 
 __attribute__((constructor)) static void HNPMRawCtor(void) {
-    HNPMAppendLog(@"v0.0.74: dylib 构造函数已执行(dyld 加载成功)");
+    HNPMAppendLog(@"v0.0.75: dylib 构造函数已执行(dyld 加载成功)");
 }
 
 // v0.0.50/51: 岛元素抑制策略钩子 — 隐藏期让系统把 NowPlaying 元素当作"应被抑制",
@@ -1850,7 +1889,7 @@ __attribute__((constructor)) static void HNPMRawCtor(void) {
 
 %ctor {
     @autoreleasepool {
-        HNPMAppendLog(@"v0.0.74: logos %ctor 进入");
+        HNPMAppendLog(@"v0.0.75: logos %ctor 进入");
 
         if ([[NSFileManager defaultManager] fileExistsAtPath:@"/var/mobile/Documents/HideNowPlaying.off"]) {
             HNPMAppendLog(@"检测到开关文件 HideNowPlaying.off, 不注册任何 hook");
@@ -1922,6 +1961,6 @@ __attribute__((constructor)) static void HNPMRawCtor(void) {
                            HNPMIslandModeName(m),
                            (m == 2) ? @"未检出" : @"已检出/强制"]);
         });
-        HNPMAppendLog(@"v0.0.74: %ctor 正常完成");
+        HNPMAppendLog(@"v0.0.75: %ctor 正常完成");
     }
 }
