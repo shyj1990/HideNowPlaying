@@ -617,17 +617,8 @@ static int HNPMClassifyListCell(UIView *cell, NSString **eidOut) {
     return -1;   // ③ 存疑 → 调用方决定(退回位置启发式)
 }
 
-// 最终判定(登记/手势/重建/恢复四处统一走这里): 身份优先, 存疑才退回"最底下"
-static BOOL HNPMIsNowPlayingCell(UIView *cell) {
-    if (!cell || !cell.window) return NO;
-    int k = HNPMCellClassGet(cell);
-    if (k >= 0) return k == 1;   // 已定性
-    k = HNPMClassifyListCell(cell, NULL);
-    if (k >= 0) { HNPMCellClassSet(cell, k); return k == 1; }
-    k = HNPMIsBottomMostMediaCell(cell) ? 1 : 2;   // 存疑 → 位置兜底
-    HNPMCellClassSet(cell, k);
-    return k == 1;
-}
+// v0.0.68: HNPMIsNowPlayingCell 已删除 — 真机实锤远程渲染导致本地分类全军覆没(全判类别2),
+// 该判定无调用价值; 音乐/实时活动通道改由 HNPMSwipeSettle 的 MR 会话裁决 + 恢复锚机制承担。
 
 // ---- 每卡独立状态: 左滑隐藏标志 / 已应用的下移位移 ----
 static void *kHNPMCardHiddenKey = &kHNPMCardHiddenKey;
