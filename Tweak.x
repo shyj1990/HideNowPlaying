@@ -84,7 +84,7 @@
 #pragma mark - 前置声明
 
 static void HNPMSetHidden(BOOL hide, NSString *reason, BOOL linkIsland);
-static BOOL HNPMPrefCardHidden(void);   // v0.0.76: 前置声明(设置面板开关, 定义在后)
+static BOOL HNPMPrefCardHidden(void);   // v0.0.78: 前置声明(设置面板开关, 定义在后)
 static void HNPMStartRestorePolling(void);
 
 #pragma mark - 日志
@@ -214,7 +214,7 @@ static void HNPMQueryNowPlayingOnce(void) {
                         hnpmPauseStreak++;
                     } else {
                         if (!hnpmLastPlaying && hnpmPauseStreak >= 2) {
-                            // v0.0.76: 设置"隐藏音乐卡片"=开 → 暂停恢复不再还原(保持默认隐藏)
+                            // v0.0.78: 设置"隐藏音乐卡片"=开 → 暂停恢复不再还原(保持默认隐藏)
                             if (HNPMPrefCardHidden()) {
                                 HNPMAppendLog(@"[设置] 隐藏音乐卡片=开 → 忽略暂停恢复(保持隐藏)");
                             } else {
@@ -730,13 +730,13 @@ static void HNPMLayoutRetryBurst(void) {
 }
 
 // ---- v0.0.71: 卡片背景透明度 ----
-// v0.0.76: 配置优先级 = 设置面板(CFPreferences bgAlpha) > 文件(/var/mobile/Documents/HideNowPlaying.alpha)
+// v0.0.78: 配置优先级 = 设置面板(CFPreferences bgAlpha) > 文件(/var/mobile/Documents/HideNowPlaying.alpha)
 //          > 默认 0.55; 1.0 = 关闭功能; 5s 缓存防频繁读盘, 面板改动经 darwin 通知即时清缓存。
 static CGFloat hnpmBgAlphaCached = -1.0;
 static CFAbsoluteTime hnpmBgAlphaCachedAt = 0;
 static void HNPMBgAlphaInvalidate(void) { hnpmBgAlphaCached = -1.0; }
 
-// v0.0.76: 设置面板"隐藏音乐卡片"开关(CFPreferences)
+// v0.0.78: 设置面板"隐藏音乐卡片"开关(CFPreferences)
 static BOOL HNPMPrefCardHidden(void) {
     Boolean ok = NO;
     BOOL v = CFPreferencesGetAppBooleanValue(CFSTR("cardHidden"), CFSTR("com.aha.hidenowplaying"), &ok);
@@ -1564,7 +1564,7 @@ static void HNPMStartRestorePolling(void) {
     });
 }
 
-// v0.0.76: 设置面板"隐藏音乐卡片"开关的应用 — 开=找在场媒体卡走与左滑一致的隐藏链
+// v0.0.78: 设置面板"隐藏音乐卡片"开关的应用 — 开=找在场媒体卡走与左滑一致的隐藏链
 //          (先 MR 裁决有播放会话才动手, 防止误伤纯实时活动场景); 关=立即恢复显示。
 static void HNPMPrefApplyCardHidden(void) {
     if (!HNPMPrefCardHidden()) {
@@ -1606,7 +1606,7 @@ static void HNPMPrefApplyCardHidden(void) {
     });
 }
 
-// v0.0.76: 设置面板改动回调(Root.plist 的 PostNotification → darwin notify)
+// v0.0.78: 设置面板改动回调(Root.plist 的 PostNotification → darwin notify)
 //          清透明度缓存 + 立即应用隐藏开关(免等登记/轮询)。
 static void HNPMPrefsChangedCB(CFNotificationCenterRef center, void *observer, CFStringRef name, const void *object, CFDictionaryRef userInfo) {
     CFPreferencesAppSynchronize(CFSTR("com.aha.hidenowplaying"));
@@ -1840,7 +1840,7 @@ static void HNPMAttachPanIfNeeded(UIView *view) {
                 if (!HNPMCardHiddenGet(cell) && !cell.hidden) {
                     HNPMClearActivitySuppressionIfMatch(cell, kind);
                 }
-                // v0.0.76: 设置"隐藏音乐卡片"=开 → 登记后自动隐藏(覆盖锁屏进入/respring/卡片重建;
+                // v0.0.78: 设置"隐藏音乐卡片"=开 → 登记后自动隐藏(覆盖锁屏进入/respring/卡片重建;
                 //          HNPMPrefApplyCardHidden 内部有 MR 会话裁决, 防误伤纯实时活动场景)
                 if (!hnpmHidden && HNPMPrefCardHidden() && !HNPMCardHiddenGet(cell) && HNPMCellHasLiveMedia(cell)) {
                     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.4 * NSEC_PER_SEC)),
@@ -1905,7 +1905,7 @@ static void HNPMAttachPanIfNeeded(UIView *view) {
 #pragma mark - 入口
 
 __attribute__((constructor)) static void HNPMRawCtor(void) {
-    HNPMAppendLog(@"v0.0.77: dylib 构造函数已执行(dyld 加载成功)");
+    HNPMAppendLog(@"v0.0.78: dylib 构造函数已执行(dyld 加载成功)");
 }
 
 // v0.0.50/51: 岛元素抑制策略钩子 — 隐藏期让系统把 NowPlaying 元素当作"应被抑制",
@@ -1968,7 +1968,7 @@ __attribute__((constructor)) static void HNPMRawCtor(void) {
 
 %ctor {
     @autoreleasepool {
-        HNPMAppendLog(@"v0.0.77: logos %ctor 进入");
+        HNPMAppendLog(@"v0.0.78: logos %ctor 进入");
 
         if ([[NSFileManager defaultManager] fileExistsAtPath:@"/var/mobile/Documents/HideNowPlaying.off"]) {
             HNPMAppendLog(@"检测到开关文件 HideNowPlaying.off, 不注册任何 hook");
@@ -2040,11 +2040,11 @@ __attribute__((constructor)) static void HNPMRawCtor(void) {
                            HNPMIslandModeName(m),
                            (m == 2) ? @"未检出" : @"已检出/强制"]);
         });
-        // v0.0.76: 设置面板(设置 → HideNowPlaying) — 改动即时生效(darwin 通知 → 清缓存/应用开关)
+        // v0.0.78: 设置面板(设置 → HideNowPlaying) — 改动即时生效(darwin 通知 → 清缓存/应用开关)
         CFNotificationCenterAddObserver(CFNotificationCenterGetDarwinNotifyCenter(), NULL,
                                         HNPMPrefsChangedCB, CFSTR("com.aha.hidenowplaying/prefschanged"),
                                         NULL, CFNotificationSuspensionBehaviorDeliverImmediately);
-        HNPMAppendLog(@"v0.0.76: 设置面板通知观察者已挂");
-        HNPMAppendLog(@"v0.0.77: %ctor 正常完成");
+        HNPMAppendLog(@"v0.0.78: 设置面板通知观察者已挂");
+        HNPMAppendLog(@"v0.0.78: %ctor 正常完成");
     }
 }
