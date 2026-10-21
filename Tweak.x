@@ -1608,7 +1608,7 @@ static void HNPMPrefApplyCardHidden(void) {
 
 // v0.0.76: 设置面板改动回调(Root.plist 的 PostNotification → darwin notify)
 //          清透明度缓存 + 立即应用隐藏开关(免等登记/轮询)。
-static void HNPMPrefsChangedCB(CFNotificationCenterRef center, void *observer, CFNotificationName name, void *object, CFDictionaryRef userInfo) {
+static void HNPMPrefsChangedCB(CFNotificationCenterRef center, void *observer, CFStringRef name, const void *object, CFDictionaryRef userInfo) {
     CFPreferencesAppSynchronize(CFSTR("com.aha.hidenowplaying"));
     HNPMBgAlphaInvalidate();
     dispatch_async(dispatch_get_main_queue(), ^{
