@@ -714,6 +714,64 @@ static void HNPMLayoutRetryBurst(void) {
     }
 }
 
+// ---- v0.0.71: 卡片背景透明度 ----
+// 配置: /var/mobile/Documents/HideNowPlaying.alpha 写 0.05~1.0 的数字(如 0.4);
+//       无文件默认 0.55; 写 1.0 = 关闭功能。5s 缓存防频繁读盘。
+static CGFloat HNPMBgAlpha(void) {
+    static CGFloat cached = -1.0;
+    static CFAbsoluteTime cachedAt = 0;
+    if (cached >= 0 && CFAbsoluteTimeGetCurrent() - cachedAt < 5.0) return cached;
+    CGFloat v = 0.55;
+    NSString *s = [NSString stringWithContentsOfFile:@"/var/mobile/Documents/HideNowPlaying.alpha"
+                                            encoding:NSUTF8StringEncoding error:nil];
+    if (s) {
+        v = s.doubleValue;
+        if (v < 0.05) v = 0.05;
+        if (v > 1.0) v = 1.0;
+    }
+    cached = v;
+    cachedAt = CFAbsoluteTimeGetCurrent();
+    return v;
+}
+
+// 把登记卡的背景材质层(UIVisualEffectView 系)压到目标 alpha。
+// 不深入远程内容子树(类名含 Remote) — 远端画的改不到, 本地托盘才归我们管。
+// 每次登记都重申(内容更新会重建托盘, 系统会重置 alpha)。
+static void HNPMApplyCardBackgroundAlpha(UIView *cell, int kind) {
+    @try {
+        CGFloat a = HNPMBgAlpha();
+        if (a >= 0.99) return;   // 1.0 = 功能关闭
+        NSMutableArray *stack = [NSMutableArray arrayWithObject:cell];
+        int guard = 0, hits = 0, effects = 0;
+        while (stack.count > 0 && guard++ < 200) {
+            UIView *v = stack.firstObject;
+            [stack removeObjectAtIndex:0];
+            if (!v) continue;
+            NSString *cls = NSStringFromClass([v class]);
+            if ([cls containsString:@"Remote"]) continue;   // 远程内容子树不碰
+            if ([v isKindOfClass:[UIVisualEffectView class]]) {
+                effects++;
+                if (fabs(v.alpha - a) > 0.01) { v.alpha = a; hits++; }
+            }
+            [stack addObjectsFromArray:v.subviews];
+        }
+        if (effects > 0) {
+            HNPMAppendLog([NSString stringWithFormat:@"[透明] 类别%d 材质层%d个 alpha→%.2f(调整%d)",
+                           kind, effects, a, hits]);
+        } else {
+            // 没找到材质层 → 上报两级子视图类名, 为下一版定位真实背景视图留样本
+            NSMutableArray *names = [NSMutableArray array];
+            for (UIView *v in cell.subviews) {
+                [names addObject:NSStringFromClass([v class])];
+                for (UIView *s2 in v.subviews) {
+                    if (names.count < 10) [names addObject:[NSString stringWithFormat:@" ·%@", NSStringFromClass([s2 class])]];
+                }
+            }
+            HNPMAppendLog([NSString stringWithFormat:@"[透明] 类别%d 未找到材质层 子视图:%@", kind, [names componentsJoinedByString:@" "]]);
+        }
+    } @catch (NSException *e) {}
+}
+
 // v0.0.67: 实时活动卡被藏时的岛侧侦察 — 把 Aperture 窗口里每个元素内容视图的
 // 归属标识/类别/frame dump 进日志。
 // 背景: 岛侧"其他元素"(kind2)是保护名单(通知/实时活动/待机小图标混在一起, v0.0.5x 时代
@@ -1573,6 +1631,7 @@ static void HNPMAttachPanIfNeeded(UIView *view) {
                     HNPMAppendLog(@"[卡片] 恢复期登记 → 自动恢复显示");
                 }
                 HNPMApplyCardLayout(YES);   // 登记/重建后重算补位
+                HNPMApplyCardBackgroundAlpha(cell, kind);   // v0.0.71: 背景材质层压透明(每次登记重申)
                 // v0.0.69: 在场卡的登记若与被抑制的实时活动身份匹配 → 解除岛抑制(活动重新呈现了)
                 if (!HNPMCardHiddenGet(cell) && !cell.hidden) {
                     HNPMClearActivitySuppressionIfMatch(cell, kind);
@@ -1634,7 +1693,7 @@ static void HNPMAttachPanIfNeeded(UIView *view) {
 #pragma mark - 入口
 
 __attribute__((constructor)) static void HNPMRawCtor(void) {
-    HNPMAppendLog(@"v0.0.70: dylib 构造函数已执行(dyld 加载成功)");
+    HNPMAppendLog(@"v0.0.71: dylib 构造函数已执行(dyld 加载成功)");
 }
 
 // v0.0.50/51: 岛元素抑制策略钩子 — 隐藏期让系统把 NowPlaying 元素当作"应被抑制",
@@ -1697,7 +1756,7 @@ __attribute__((constructor)) static void HNPMRawCtor(void) {
 
 %ctor {
     @autoreleasepool {
-        HNPMAppendLog(@"v0.0.70: logos %ctor 进入");
+        HNPMAppendLog(@"v0.0.71: logos %ctor 进入");
 
         if ([[NSFileManager defaultManager] fileExistsAtPath:@"/var/mobile/Documents/HideNowPlaying.off"]) {
             HNPMAppendLog(@"检测到开关文件 HideNowPlaying.off, 不注册任何 hook");
@@ -1769,6 +1828,6 @@ __attribute__((constructor)) static void HNPMRawCtor(void) {
                            HNPMIslandModeName(m),
                            (m == 2) ? @"未检出" : @"已检出/强制"]);
         });
-        HNPMAppendLog(@"v0.0.70: %ctor 正常完成");
+        HNPMAppendLog(@"v0.0.71: %ctor 正常完成");
     }
 }
