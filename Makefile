@@ -11,3 +11,7 @@ HideNowPlaying_CFLAGS = -fobjc-arc
 HideNowPlaying_FRAMEWORKS = UIKit Foundation
 
 include $(THEOS_MAKE_PATH)/tweak.mk
+
+# v0.0.76: 设置面板子项目(PreferenceLoader + CFPreferences)
+SUBPROJECTS += prefs
+include $(THEOS_MAKE_PATH)/aggregate.mk
