@@ -1,0 +1,8 @@
+--- !tapi-tbd-v3
+archs:           [ arm64, arm64e ]
+platform:        ios
+install-name:    /System/Library/PrivateFrameworks/Preferences.framework/Preferences
+current-version: 1.0
+exports:
+  - archs:           [ arm64, arm64e ]
+    symbols:         [ _OBJC_CLASS_$_PSListController, _OBJC_METACLASS_$_PSListController ]
