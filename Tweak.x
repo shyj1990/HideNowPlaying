@@ -925,7 +925,7 @@ static NSArray *HNPMProbeActivityUUIDs(UIView *cell, BOOL logFound) {
                     if ([v isKindOfClass:[NSString class]]) {
                         NSString *sv = v;
                         BOOL hit = HNPMIsUUIDString(sv)
-                            || (sv.length >= 10 && sv.length <= 120 && [sv lowercaseString] containsString:@"activity:");
+                            || (sv.length >= 10 && sv.length <= 120 && [[sv lowercaseString] containsString:@"activity:"]);
                         if (hit && ![out containsObject:sv]) {
                             [out addObject:sv];
                             if (logFound) {
