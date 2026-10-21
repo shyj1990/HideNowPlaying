@@ -735,40 +735,93 @@ static CGFloat HNPMBgAlpha(void) {
 }
 
 // 把登记卡的背景材质层(UIVisualEffectView 系)压到目标 alpha。
-// 不深入远程内容子树(类名含 Remote) — 远端画的改不到, 本地托盘才归我们管。
-// 每次登记都重申(内容更新会重建托盘, 系统会重置 alpha)。
+// v0.0.72: 真机实锤卡内子树没有材质层(白底不在卡里) → 托盘在卡外(父容器管理的兄弟视图)。
+// 策略: A.卡内扫(保留) B.沿上层容器(≤4级)找与卡frame重叠的兄弟, 扫其子树材质层并压alpha
+//       C.全找不到 → 背景是远端画的, 上完整诊断(背景色/兄弟类名清单)。
 static void HNPMApplyCardBackgroundAlpha(UIView *cell, int kind) {
     @try {
         CGFloat a = HNPMBgAlpha();
         if (a >= 0.99) return;   // 1.0 = 功能关闭
-        NSMutableArray *stack = [NSMutableArray arrayWithObject:cell];
-        int guard = 0, hits = 0, effects = 0;
-        while (stack.count > 0 && guard++ < 200) {
-            UIView *v = stack.firstObject;
-            [stack removeObjectAtIndex:0];
-            if (!v) continue;
-            NSString *cls = NSStringFromClass([v class]);
-            if ([cls containsString:@"Remote"]) continue;   // 远程内容子树不碰
-            if ([v isKindOfClass:[UIVisualEffectView class]]) {
-                effects++;
-                if (fabs(v.alpha - a) > 0.01) { v.alpha = a; hits++; }
-            }
-            [stack addObjectsFromArray:v.subviews];
-        }
-        if (effects > 0) {
-            HNPMAppendLog([NSString stringWithFormat:@"[透明] 类别%d 材质层%d个 alpha→%.2f(调整%d)",
-                           kind, effects, a, hits]);
-        } else {
-            // 没找到材质层 → 上报两级子视图类名, 为下一版定位真实背景视图留样本
-            NSMutableArray *names = [NSMutableArray array];
-            for (UIView *v in cell.subviews) {
-                [names addObject:NSStringFromClass([v class])];
-                for (UIView *s2 in v.subviews) {
-                    if (names.count < 10) [names addObject:[NSString stringWithFormat:@" ·%@", NSStringFromClass([s2 class])]];
+        NSMutableSet *touched = [NSMutableSet set];
+        // A. 卡内扫(不深入远程内容子树)
+        int inHits = 0;
+        @try {
+            NSMutableArray *stack = [NSMutableArray arrayWithObject:cell];
+            int guard = 0;
+            while (stack.count > 0 && guard++ < 200) {
+                UIView *v = stack.firstObject;
+                [stack removeObjectAtIndex:0];
+                if (!v) continue;
+                NSString *cls = NSStringFromClass([v class]);
+                if ([cls containsString:@"Remote"]) continue;
+                if ([v isKindOfClass:[UIVisualEffectView class]]) {
+                    if (fabs(v.alpha - a) > 0.01) v.alpha = a;
+                    [touched addObject:v];
+                    inHits++;
                 }
+                [stack addObjectsFromArray:v.subviews];
             }
-            HNPMAppendLog([NSString stringWithFormat:@"[透明] 类别%d 未找到材质层 子视图:%@", kind, [names componentsJoinedByString:@" "]]);
+        } @catch (NSException *e) {}
+        if (inHits > 0) {
+            HNPMAppendLog([NSString stringWithFormat:@"[透明] 类别2 卡内材质层%d个 alpha→%.2f", inHits, a]);
+            return;
         }
+        // B. 卡外: 沿上层容器找与卡重叠的兄弟视图, 扫其子树材质层
+        int outHits = 0;
+        UIView *level = cell.superview;
+        int depth = 0;
+        @try {
+            while (level && depth < 4) {
+                for (UIView *sib in [level.subviews copy]) {
+                    if (!sib || sib == cell || [sib isDescendantOfView:cell] || [cell isDescendantOfView:sib]) continue;
+                    if ([touched containsObject:sib]) continue;
+                    CGRect sr = [sib convertRect:sib.bounds toView:nil];
+                    CGRect cr = [cell convertRect:cell.bounds toView:nil];
+                    if (sr.size.height < 30.0 || sr.size.width < 100.0 || !CGRectIntersectsRect(sr, cr)) continue;
+                    NSMutableArray *stack = [NSMutableArray arrayWithObject:sib];
+                    int guard = 0;
+                    while (stack.count > 0 && guard++ < 150) {
+                        UIView *v = stack.firstObject;
+                        [stack removeObjectAtIndex:0];
+                        if (!v) continue;
+                        NSString *cls = NSStringFromClass([v class]);
+                        if ([cls containsString:@"Remote"]) continue;
+                        if ([v isKindOfClass:[UIVisualEffectView class]] && ![touched containsObject:v]) {
+                            if (fabs(v.alpha - a) > 0.01) v.alpha = a;
+                            [touched addObject:v];
+                            outHits++;
+                        }
+                        [stack addObjectsFromArray:v.subviews];
+                    }
+                }
+                level = level.superview;
+                depth++;
+            }
+        } @catch (NSException *e) {}
+        if (outHits > 0) {
+            HNPMAppendLog([NSString stringWithFormat:@"[透明] 类别2 卡外托盘材质层%d个 alpha→%.2f", outHits, a]);
+            return;
+        }
+        // C. 全找不到 → 背景是远端画的; 上完整诊断
+        NSMutableArray *diag = [NSMutableArray array];
+        if (cell.backgroundColor) [diag addObject:[NSString stringWithFormat:@"cellBg=%@", cell.backgroundColor]];
+        for (UIView *v in cell.subviews) {
+            if (v.backgroundColor) [diag addObject:[NSString stringWithFormat:@"%@bg=%@", NSStringFromClass([v class]), v.backgroundColor]];
+        }
+        level = cell.superview;
+        depth = 0;
+        while (level && depth < 3) {
+            NSMutableArray *names = [NSMutableArray array];
+            for (UIView *sib in level.subviews) {
+                if (!sib || sib == cell || [sib isDescendantOfView:cell]) continue;
+                [names addObject:[NSString stringWithFormat:@"%@(%.0fx%.0f)", NSStringFromClass([sib class]), sib.bounds.size.width, sib.bounds.size.height]];
+                if (names.count >= 8) break;
+            }
+            [diag addObject:[NSString stringWithFormat:@"L%d[%@]", depth, [names componentsJoinedByString:@" "]]];
+            level = level.superview;
+            depth++;
+        }
+        HNPMAppendLog([NSString stringWithFormat:@"[透明] 类别2 无本地材质层(背景疑为远端绘制) %@", [diag componentsJoinedByString:@" | "]]);
     } @catch (NSException *e) {}
 }
 
@@ -1693,7 +1746,7 @@ static void HNPMAttachPanIfNeeded(UIView *view) {
 #pragma mark - 入口
 
 __attribute__((constructor)) static void HNPMRawCtor(void) {
-    HNPMAppendLog(@"v0.0.71: dylib 构造函数已执行(dyld 加载成功)");
+    HNPMAppendLog(@"v0.0.72: dylib 构造函数已执行(dyld 加载成功)");
 }
 
 // v0.0.50/51: 岛元素抑制策略钩子 — 隐藏期让系统把 NowPlaying 元素当作"应被抑制",
@@ -1756,7 +1809,7 @@ __attribute__((constructor)) static void HNPMRawCtor(void) {
 
 %ctor {
     @autoreleasepool {
-        HNPMAppendLog(@"v0.0.71: logos %ctor 进入");
+        HNPMAppendLog(@"v0.0.72: logos %ctor 进入");
 
         if ([[NSFileManager defaultManager] fileExistsAtPath:@"/var/mobile/Documents/HideNowPlaying.off"]) {
             HNPMAppendLog(@"检测到开关文件 HideNowPlaying.off, 不注册任何 hook");
@@ -1828,6 +1881,6 @@ __attribute__((constructor)) static void HNPMRawCtor(void) {
                            HNPMIslandModeName(m),
                            (m == 2) ? @"未检出" : @"已检出/强制"]);
         });
-        HNPMAppendLog(@"v0.0.71: %ctor 正常完成");
+        HNPMAppendLog(@"v0.0.72: %ctor 正常完成");
     }
 }
