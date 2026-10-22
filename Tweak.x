@@ -836,6 +836,35 @@ static void HNPMPlatterReapplyOnLayout(UIView *platter) {
     } @catch (NSException *e) {}
 }
 
+// v0.0.89: 即时透明 — 亮屏时序实锤(v0.0.88 真机日志): 系统重建卡片 → 托盘首次布局时
+//          单元格尚未登记(登记走 0.3s 延迟) → hook 跳过 → 用户看到 ~1s 不透明。
+//          这里做两件事: ①挂载瞬间预登记合格单元格(尺寸门槛当场可判, 登记幂等) —
+//          让托盘 hook 在首次布局就命中; ②托盘已存在时立即压 alpha(无兜底无重试,
+//          托盘未建好则等 hook/登记路径, 不做整卡淡化避免文字闪烁)。
+static void HNPMInstantPlatterAlpha(UIView *cell) {
+    if (![NSThread isMainThread]) return;
+    @try {
+        CGFloat a = HNPMBgAlpha();
+        if (a >= 0.99) return;
+        if (cell.hidden || HNPMCardHiddenGet(cell)) return;
+        Class platterCls = NSClassFromString(@"PLPlatterView");
+        if (!platterCls) return;
+        NSMutableArray *stack = [NSMutableArray arrayWithObject:cell];
+        int guard = 0;
+        while (stack.count > 0 && guard++ < 120) {
+            UIView *v = stack.firstObject;
+            [stack removeObjectAtIndex:0];
+            if (!v) continue;
+            if ([NSStringFromClass([v class]) containsString:@"Remote"]) continue;
+            if ([v isKindOfClass:platterCls]) {
+                int hits = HNPMPlatterApplyBg(v, a);
+                if (hits > 0 && fabs(cell.alpha - 1.0) > 0.01) cell.alpha = 1.0;
+            }
+            [stack addObjectsFromArray:v.subviews];
+        }
+    } @catch (NSException *e) {}
+}
+
 // 把登记卡的背景压到目标 alpha。
 // v0.0.72: 真机实锤卡内子树没有 UIVisualEffectView(白底不在卡里)。
 // v0.0.74: 头文件实锤(iOS17 运行时头, CoverSheet/UserNotificationsUIKit/PlatterKit) —
@@ -1800,6 +1829,17 @@ static void HNPMAttachPanIfNeeded(UIView *view) {
     %orig;
     @try {
         if (!self.window) return;
+        // v0.0.89: 预登记 — 尺寸合格就立即入登记表并即时压托盘 alpha(消除亮屏首帧不透明);
+        //          分类/手势/补位仍走下方 0.3s 延迟路径(登记幂等, 重复 addObject 无害)
+        if (HNPMIsMediaSized(self.frame.size)) {
+            Class preCellCls = NSClassFromString(@"NCNotificationListCell");
+            UIView *p0 = self;
+            while (p0 && ![p0 isKindOfClass:preCellCls]) p0 = p0.superview;
+            if (p0) {
+                [hnpmCardCells addObject:p0];
+                HNPMInstantPlatterAlpha(p0);
+            }
+        }
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.3 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
             @try {
                 if (!self.window) return;
@@ -1933,7 +1973,7 @@ static void HNPMAttachPanIfNeeded(UIView *view) {
 #pragma mark - 入口
 
 __attribute__((constructor)) static void HNPMRawCtor(void) {
-    HNPMAppendLog(@"v0.0.88: dylib 构造函数已执行(dyld 加载成功)");
+    HNPMAppendLog(@"v0.0.89: dylib 构造函数已执行(dyld 加载成功)");
 }
 
 // v0.0.50/51: 岛元素抑制策略钩子 — 隐藏期让系统把 NowPlaying 元素当作"应被抑制",
@@ -1996,7 +2036,7 @@ __attribute__((constructor)) static void HNPMRawCtor(void) {
 
 %ctor {
     @autoreleasepool {
-        HNPMAppendLog(@"v0.0.88: logos %ctor 进入");
+        HNPMAppendLog(@"v0.0.89: logos %ctor 进入");
 
         if ([[NSFileManager defaultManager] fileExistsAtPath:@"/var/mobile/Documents/HideNowPlaying.off"]) {
             HNPMAppendLog(@"检测到开关文件 HideNowPlaying.off, 不注册任何 hook");
@@ -2074,7 +2114,7 @@ __attribute__((constructor)) static void HNPMRawCtor(void) {
         CFNotificationCenterAddObserver(CFNotificationCenterGetDarwinNotifyCenter(), NULL,
                                         HNPMPrefsChangedCB, CFSTR("com.aha.hidenowplaying/prefschanged"),
                                         NULL, CFNotificationSuspensionBehaviorDeliverImmediately);
-        HNPMAppendLog(@"v0.0.88: 设置面板通知观察者已挂");
-        HNPMAppendLog(@"v0.0.88: %ctor 正常完成");
+        HNPMAppendLog(@"v0.0.89: 设置面板通知观察者已挂");
+        HNPMAppendLog(@"v0.0.89: %ctor 正常完成");
     }
 }
