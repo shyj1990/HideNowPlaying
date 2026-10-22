@@ -950,15 +950,20 @@ static int sHNPMAlphaBurstStable = 0;         // v0.0.92: 稳定门 — 连续�
                 if (fabs(cur - a) > 0.01 && sHNPMAlphaBurstStable >= 1) {
                     sHNPMAlphaBurstStable = 0;
                     int total = 0;
+                    UIView *dumpCell = nil;   // v0.0.94: 首个实际修正的卡 → 深诊断对象
                     for (UIView *cell in [hnpmCardCells copy]) {
                         if (![cell isKindOfClass:[UIView class]]) continue;
-                        @try { total += HNPMInstantPlatterAlpha(cell); } @catch (NSException *e) {}
+                        int c = 0;
+                        @try { c = HNPMInstantPlatterAlpha(cell); } @catch (NSException *e) {}
+                        if (c > 0 && !dumpCell) dumpCell = cell;
+                        total += c;
                     }
                     if (total > 0) {
                         if (!sHNPMAlphaBurstLogged) {
                             sHNPMAlphaBurstLogged = YES;
                             HNPMAppendLog(@"[透明] 连扫修正(稳定偏差, 帧边界写入)");
                         }
+                        HNPMDeepDumpOnce(dumpCell);   // v0.0.94: 每次亮/灭屏后仅一次
                         sHNPMAlphaBurstEnd = CFAbsoluteTimeGetCurrent() + 1.0;   // 又发现重置 → 延长窗口
                     }
                 }
@@ -991,11 +996,46 @@ static void HNPMStartAlphaBurst(void) {
 //          "亮屏第一眼有时透明有时不透明"。
 //          补法: 订阅系统亮屏/锁屏 darwin 通知(hasBlankedScreen + lockstate),
 //          亮屏瞬间立即开连扫窗口, 与首帧渲染几乎同帧, 视觉无缝。
+static BOOL sHNPMDeepDumpArmed = NO;   // v0.0.94: 深诊断待触发(屏幕状态切换后武装, 首次修正时消耗)
+
 static void HNPMScreenStateCB(CFNotificationCenterRef center, void *observer,
                               CFStringRef name, const void *object, CFDictionaryRef userInfo) {
     HNPMAppendLog([NSString stringWithFormat:@"[透明] 屏幕状态通知(%@) → 连扫窗口开启",
                    (__bridge NSString *)name]);
     HNPMStartAlphaBurst();
+    sHNPMDeepDumpArmed = YES;   // v0.0.94: 本次亮/灭屏后的首次修正时做一次全树深诊断
+}
+
+// v0.0.94: 深诊断 — off 对照实锤「歌词行亮屏暗 ~1s 后亮」由插件引发, 但内容层我们从未写入过。
+//          历次诊断均未看过 Remote 子树内部, 且特征扫描只认时间格式文本 — 歌词 UILabel 若为
+//          本地视图(如 vibrancy 效果挂在材质上)此前完全不可见。此处一次性全树 dump(含 Remote):
+//          类名/alpha/hidden/UILabel 文本(截断)/特效视图标记 — 定位歌词视图归属。
+static void HNPMDeepDumpOnce(UIView *cell) {
+    if (!sHNPMDeepDumpArmed || !cell) return;
+    sHNPMDeepDumpArmed = NO;
+    @try {
+        NSMutableArray *rows = [NSMutableArray array];
+        NSMutableArray *stack = [NSMutableArray arrayWithObject:cell];
+        int guard = 0;
+        while (stack.count > 0 && guard++ < 200 && rows.count < 70) {
+            UIView *v = stack.firstObject;
+            [stack removeObjectAtIndex:0];
+            if (!v) continue;
+            NSString *cls = NSStringFromClass([v class]);
+            NSString *extra = @"";
+            if ([v isKindOfClass:[UILabel class]]) {
+                NSString *t = [(UILabel *)v text] ?: @"";
+                if (t.length > 16) t = [t substringWithRange:NSMakeRange(0, 16)];
+                extra = [NSString stringWithFormat:@" text=%@", t];
+            }
+            if ([v isKindOfClass:[UIVisualEffectView class]]) extra = [extra stringByAppendingString:@" <EFX>"];
+            [rows addObject:[NSString stringWithFormat:@"%@ a=%.2f h=%d%@",
+                             cls, v.alpha, v.hidden ? 1 : 0, extra]];
+            [stack addObjectsFromArray:v.subviews];
+        }
+        HNPMAppendLog([NSString stringWithFormat:@"[透明·深诊断] %lu视图: %@",
+                       (unsigned long)rows.count, [rows componentsJoinedByString:@" || "]]);
+    } @catch (NSException *e) {}
 }
 
 // v0.0.93: 空闲巡逻 — 连扫窗口只覆盖事件后 3s; 若系统在"无任何布局/挂载事件"的空闲期
@@ -2132,7 +2172,7 @@ static void HNPMAttachPanIfNeeded(UIView *view) {
 #pragma mark - 入口
 
 __attribute__((constructor)) static void HNPMRawCtor(void) {
-    HNPMAppendLog(@"v0.0.93: dylib 构造函数已执行(dyld 加载成功)");
+    HNPMAppendLog(@"v0.0.94: dylib 构造函数已执行(dyld 加载成功)");
 }
 
 // v0.0.50/51: 岛元素抑制策略钩子 — 隐藏期让系统把 NowPlaying 元素当作"应被抑制",
@@ -2195,7 +2235,7 @@ __attribute__((constructor)) static void HNPMRawCtor(void) {
 
 %ctor {
     @autoreleasepool {
-        HNPMAppendLog(@"v0.0.93: logos %ctor 进入");
+        HNPMAppendLog(@"v0.0.94: logos %ctor 进入");
 
         if ([[NSFileManager defaultManager] fileExistsAtPath:@"/var/mobile/Documents/HideNowPlaying.off"]) {
             HNPMAppendLog(@"检测到开关文件 HideNowPlaying.off, 不注册任何 hook");
@@ -2285,7 +2325,7 @@ __attribute__((constructor)) static void HNPMRawCtor(void) {
         HNPMAppendLog(@"v0.0.92: 设置面板通知观察者已挂");
         // v0.0.93: 空闲巡逻(0.5s 只读一次, 无在场卡自动停) — 堵"空闲期静默重置无事件触发"盲区
         HNPMIdleAlphaCheck();
-        HNPMAppendLog(@"v0.0.93: 空闲巡逻已启动");
-        HNPMAppendLog(@"v0.0.93: %ctor 正常完成");
+        HNPMAppendLog(@"v0.0.94: 空闲巡逻已启动");
+        HNPMAppendLog(@"v0.0.94: %ctor 正常完成");
     }
 }
