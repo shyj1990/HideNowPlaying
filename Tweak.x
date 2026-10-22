@@ -84,7 +84,7 @@
 #pragma mark - 前置声明
 
 static void HNPMSetHidden(BOOL hide, NSString *reason, BOOL linkIsland);
-static BOOL HNPMPrefSwipeHide(void);   // v0.0.86: 前置声明(设置面板"锁屏左滑隐藏"总闸, 定义在后)
+static BOOL HNPMPrefSwipeHide(void);   // v0.0.87: 前置声明(设置面板"锁屏左滑隐藏"总闸, 定义在后)
 static void HNPMStartRestorePolling(void);
 
 #pragma mark - 日志
@@ -214,7 +214,7 @@ static void HNPMQueryNowPlayingOnce(void) {
                         hnpmPauseStreak++;
                     } else {
                         if (!hnpmLastPlaying && hnpmPauseStreak >= 2) {
-                            // v0.0.86: 暂停→继续播放 无条件恢复(左滑功能开关只管手势, 不再接管恢复策略)
+                            // v0.0.87: 暂停→继续播放 无条件恢复(左滑功能开关只管手势, 不再接管恢复策略)
                             HNPMSetHidden(NO, @"检测到暂停后继续播放", YES);
                         }
                         hnpmLastPlaying = YES;
@@ -726,13 +726,13 @@ static void HNPMLayoutRetryBurst(void) {
 }
 
 // ---- v0.0.71: 卡片背景透明度 ----
-// v0.0.86: 配置优先级 = 设置面板(CFPreferences bgAlpha) > 文件(/var/mobile/Documents/HideNowPlaying.alpha)
+// v0.0.87: 配置优先级 = 设置面板(CFPreferences bgAlpha) > 文件(/var/mobile/Documents/HideNowPlaying.alpha)
 //          > 默认 0.55; 1.0 = 关闭功能; 5s 缓存防频繁读盘, 面板改动经 darwin 通知即时清缓存。
 static CGFloat hnpmBgAlphaCached = -1.0;
 static CFAbsoluteTime hnpmBgAlphaCachedAt = 0;
 static void HNPMBgAlphaInvalidate(void) { hnpmBgAlphaCached = -1.0; }
 
-// v0.0.86: 设置面板"锁屏左滑隐藏"功能总闸(CFPreferences; 无配置默认开)
+// v0.0.87: 设置面板"锁屏左滑隐藏"功能总闸(CFPreferences; 无配置默认开)
 //   开 = 锁屏左滑可隐藏音乐卡/实时活动卡并联动岛, 暂停→继续播放自动恢复;
 //   关 = 左滑手势不生效(已隐藏的立即恢复)。
 static BOOL HNPMPrefSwipeHide(void) {
@@ -1562,7 +1562,7 @@ static void HNPMStartRestorePolling(void) {
     });
 }
 
-// v0.0.86: 设置面板改动回调(PostNotification → darwin notify)
+// v0.0.87: 设置面板改动回调(PostNotification → darwin notify)
 //          清透明度缓存; "锁屏左滑隐藏"被关掉时若处于隐藏态 → 立即恢复。
 static void HNPMPrefsChangedCB(CFNotificationCenterRef center, void *observer, CFStringRef name, const void *object, CFDictionaryRef userInfo) {
     CFPreferencesAppSynchronize(CFSTR("com.aha.hidenowplaying"));
@@ -1656,7 +1656,7 @@ static void HNPMSwipeSettle(UIView *cell, int kind) {
         UIView *p = gr.view;
         while (p && ![p isKindOfClass:cellClass]) p = p.superview;
         if (!p) return;
-        // v0.0.86: 功能总闸 — 设置里"锁屏左滑隐藏"=关 → 手势完全失效(岛也不动)
+        // v0.0.87: 功能总闸 — 设置里"锁屏左滑隐藏"=关 → 手势完全失效(岛也不动)
         if (!HNPMPrefSwipeHide()) {
             if (gr.state == UIGestureRecognizerStateBegan) {
                 HNPMAppendLog(@"[设置] 锁屏左滑隐藏=关 → 手势忽略");
@@ -1865,7 +1865,7 @@ static void HNPMAttachPanIfNeeded(UIView *view) {
 #pragma mark - 入口
 
 __attribute__((constructor)) static void HNPMRawCtor(void) {
-    HNPMAppendLog(@"v0.0.86: dylib 构造函数已执行(dyld 加载成功)");
+    HNPMAppendLog(@"v0.0.87: dylib 构造函数已执行(dyld 加载成功)");
 }
 
 // v0.0.50/51: 岛元素抑制策略钩子 — 隐藏期让系统把 NowPlaying 元素当作"应被抑制",
@@ -1928,7 +1928,7 @@ __attribute__((constructor)) static void HNPMRawCtor(void) {
 
 %ctor {
     @autoreleasepool {
-        HNPMAppendLog(@"v0.0.86: logos %ctor 进入");
+        HNPMAppendLog(@"v0.0.87: logos %ctor 进入");
 
         if ([[NSFileManager defaultManager] fileExistsAtPath:@"/var/mobile/Documents/HideNowPlaying.off"]) {
             HNPMAppendLog(@"检测到开关文件 HideNowPlaying.off, 不注册任何 hook");
@@ -2000,11 +2000,11 @@ __attribute__((constructor)) static void HNPMRawCtor(void) {
                            HNPMIslandModeName(m),
                            (m == 2) ? @"未检出" : @"已检出/强制"]);
         });
-        // v0.0.86: 设置面板(设置 → HideNowPlaying) — 改动即时生效(darwin 通知 → 清缓存/应用开关)
+        // v0.0.87: 设置面板(设置 → HideNowPlaying) — 改动即时生效(darwin 通知 → 清缓存/应用开关)
         CFNotificationCenterAddObserver(CFNotificationCenterGetDarwinNotifyCenter(), NULL,
                                         HNPMPrefsChangedCB, CFSTR("com.aha.hidenowplaying/prefschanged"),
                                         NULL, CFNotificationSuspensionBehaviorDeliverImmediately);
-        HNPMAppendLog(@"v0.0.86: 设置面板通知观察者已挂");
-        HNPMAppendLog(@"v0.0.86: %ctor 正常完成");
+        HNPMAppendLog(@"v0.0.87: 设置面板通知观察者已挂");
+        HNPMAppendLog(@"v0.0.87: %ctor 正常完成");
     }
 }
