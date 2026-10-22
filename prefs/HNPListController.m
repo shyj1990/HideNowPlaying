@@ -1,19 +1,28 @@
 #import <UIKit/UIKit.h>
-#import <objc/runtime.h>
-#import <objc/message.h>
 #import <dlfcn.h>
 
-// v0.0.76: 运行时注册 HNPListController(PSListController 子类) — 彻底避免链接私有框架
-// Preferences(SDK 无 tbd, Xcode 15 新链接器也不认手写 tbd 文本)。
+// v0.0.79: 弃用运行时 objc_allocateClassPair(它的 class_getImageName 拿不到本 bundle 镜像 →
+// PSListController -bundle = bundleForClass 落到 Settings 主程序 → 任意 plist 都找不到 → 空页),
+// 改为「假头文件 + 编译期子类」— Preferences 框架只出现在 @interface 声明里, 从不链接其符号,
+// 运行时由 Settings 进程内已加载的 Preferences.framework 解析父类。编译进 bundle 的真实类
+// 自动携带正确的镜像信息, bundleForClass 天然正确(所有 tweak 的标准做法)。
 //
-// v0.0.78: 真机两轮空白页实锤根因 — PSListController 的 -bundle 实现为
-//   [NSBundle bundleForClass:[self class]](18.2 反编译), 而对 objc_allocateClassPair
-//   运行时创建的类 class_getImageName 拿不到本 bundle 镜像 → bundleForClass 退化成
-//   Settings 主程序 → 在错误 bundle 里找 plist → 永远空页无标题。
-//   修复: 给运行时类挂 bundle 重写 — dladdr 取本 dylib 真实路径 → 其父目录即
-//   HideNowPlayingPrefs.bundle → bundleWithPath: 返回正确 NSBundle。
-//   附 [PREFS] 设备侧日志(与主 tweak 同一日志文件), 下一轮可验证 bundle 是否真被加载。
+// 页面改为代码构建 specifiers: ①锁屏左滑隐藏 总开关(默认开) ②背景透明度 自定义滑条 cell
+// (UISlider + 实时数值标签, 拖动即写 CFPreferences 并 post darwin 通知)。
 
+// ---- 私有框架最小声明(仅编译期用, 不链接) ----
+@interface PSSpecifier : NSObject
++ (id)groupSpecifierWithNamed:(NSString *)name footerText:(NSString *)footer;
++ (id)preferenceSpecifierNamed:(NSString *)name target:(id)target set:(SEL)set get:(SEL)get detail:(id)detail cell:(NSInteger)cellType edit:(id)edit;
+- (void)setProperty:(id)property forKey:(NSString *)key;
+- (id)propertyForKey:(NSString *)key;
+@end
+
+@interface PSListController : UIViewController
+- (void)reloadSpecifiers;
+@end
+
+// ---- 设备侧日志(与主 tweak 同一文件) ----
 static void HNPPrefsLog(NSString *text) {
     @try {
         FILE *f = fopen("/var/mobile/Documents/HideNowPlaying.log", "a");
@@ -29,56 +38,136 @@ static void HNPPrefsLog(NSString *text) {
     } @catch (__unused id e) {}
 }
 
-// 本 prefs bundle 的路径: dladdr 命中本函数所在 dylib = .../HideNowPlayingPrefs.bundle/HideNowPlayingPrefs
-static NSString *HNPPrefsOwnBundlePath(void) {
-    static NSString *cached;
-    static dispatch_once_t once;
-    dispatch_once(&once, ^{
-        Dl_info info;
-        if (dladdr((void *)HNPPrefsOwnBundlePath, &info) && info.dli_fname) {
-            cached = [[NSString stringWithUTF8String:info.dli_fname] stringByDeletingLastPathComponent];
-        }
-    });
-    return cached;
+static NSString * const HNPDomain = @"com.aha.hidenowplaying";
+static NSString * const HNPNotifName = @"com.aha.hidenowplaying/prefschanged";
+
+static void HNPPostPrefsChanged(void) {
+    CFPreferencesAppSynchronize((__bridge CFStringRef)HNPDomain);
+    CFNotificationCenterPostNotification(CFNotificationCenterGetDarwinNotifyCenter(),
+                                         (__bridge CFStringRef)HNPNotifName, NULL, NULL, YES);
 }
 
-// -bundle 重写: 返回本 bundle; 拿不到则走父类默认
-static id HNPPrefs_bundle(id self, SEL _cmd) {
-    @try {
-        static BOOL logged = NO;
-        NSString *path = HNPPrefsOwnBundlePath();
-        if (path) {
-            NSBundle *b = [NSBundle bundleWithPath:path];
-            if (b && b.bundleIdentifier) {
-                if (!logged) {
-                    logged = YES;
-                    BOOL hasLabelPlist = [b pathForResource:@"HideNowPlaying" ofType:@"plist"] != nil;
-                    HNPPrefsLog([NSString stringWithFormat:@"bundle重写生效 path=%@ bundleId=%@ HideNowPlaying.plist存在=%d",
-                                 path, b.bundleIdentifier, hasLabelPlist]);
-                }
-                return b;
-            }
-        }
-        if (!logged) { logged = YES; HNPPrefsLog([NSString stringWithFormat:@"bundle重写未命中 path=%@ → 走父类默认", path]); }
-    } @catch (__unused id e) {}
-    struct objc_super sup = { (id)self, class_getSuperclass(object_getClass(self)) };
-    return ((id (*)(struct objc_super *, SEL))objc_msgSendSuper)(&sup, _cmd);
+// ---- 自定义滑条 cell: UISlider + 实时数值标签 ----
+@interface HNPSliderCell : UITableViewCell
+- (id)initWithSpecifier:(PSSpecifier *)specifier;
+@end
+
+@implementation HNPSliderCell {
+    UISlider *_slider;
+    UILabel *_label;
+    NSString *_key;
 }
+
+- (id)initWithSpecifier:(PSSpecifier *)spec {
+    self = [super initWithStyle:UITableViewCellStyleDefault reuseIdentifier:nil];
+    if (self) {
+        CGFloat v = 0.55, mn = 0.05, mx = 1.0;
+        NSNumber *p;
+        _key = [spec propertyForKey:@"key"] ?: @"bgAlpha";
+        if ((p = [spec propertyForKey:@"min"])) mn = p.doubleValue;
+        if ((p = [spec propertyForKey:@"max"])) mx = p.doubleValue;
+        CFTypeRef pv = CFPreferencesCopyAppValue((__bridge CFStringRef)_key, (__bridge CFStringRef)HNPDomain);
+        if (pv) { v = [(__bridge NSNumber *)pv doubleValue]; CFRelease(pv); }
+        else if ((p = [spec propertyForKey:@"default"])) v = p.doubleValue;
+        if (v < mn) v = mn;
+        if (v > mx) v = mx;
+
+        self.selectionStyle = UITableViewCellSelectionStyleNone;
+        self.backgroundColor = UIColor.clearColor;
+
+        _slider = [[UISlider alloc] initWithFrame:CGRectZero];
+        _slider.minimumValue = mn;
+        _slider.maximumValue = mx;
+        _slider.value = (float)v;
+        [_slider addTarget:self action:@selector(sliderChanged:) forControlEvents:UIControlEventValueChanged];
+        [self.contentView addSubview:_slider];
+
+        _label = [[UILabel alloc] initWithFrame:CGRectZero];
+        _label.textAlignment = NSTextAlignmentRight;
+        _label.font = [UIFont monospacedDigitSystemFontOfSize:15.0 weight:UIFontWeightRegular];
+        _label.textColor = [UIColor secondaryLabelColor];
+        [self updateLabel:v];
+        [self.contentView addSubview:_label];
+        HNPPrefsLog(@"HNPSliderCell 构建完成");
+    }
+    return self;
+}
+
+- (id)initWithStyle:(UITableViewCellStyle)style reuseIdentifier:(NSString *)rid {
+    // 兜底: 若 PSListController 走标准 init 路径也不崩(仅无滑条)
+    return [super initWithStyle:style reuseIdentifier:rid];
+}
+
+- (void)updateLabel:(CGFloat)v {
+    _label.text = [NSString stringWithFormat:@"%.2f", v];
+}
+
+- (void)sliderChanged:(UISlider *)s {
+    double v = s.value;
+    [self updateLabel:v];
+    CFPreferencesSetAppValue((__bridge CFStringRef)_key, (__bridge CFTypeRef)@(v), (__bridge CFStringRef)HNPDomain);
+    HNPPostPrefsChanged();   // 主 tweak darwin 回调 → 清缓存即时应用
+}
+
+- (void)layoutSubviews {
+    [super layoutSubviews];
+    CGFloat w = self.contentView.bounds.size.width;
+    CGFloat h = self.contentView.bounds.size.height;
+    _label.frame = CGRectMake(w - 66.0, 0, 56.0, h);
+    _slider.frame = CGRectMake(20.0, (h - 31.0) / 2.0, w - 66.0 - 20.0 - 12.0, 31.0);
+}
+
+@end
+
+// ---- 列表控制器(编译期子类, 镜像信息正确) ----
+static Class HNPValCellClass(void) { return [HNPSliderCell class]; }
+
+@interface HNPListController : PSListController
+@end
+
+@implementation HNPListController {
+    NSArray *_specs;
+}
+
+- (NSArray *)specifiers {
+    if (_specs) return _specs;
+    [self setTitle:@"HideNowPlaying"];
+    NSMutableArray *m = [NSMutableArray array];
+
+    [m addObject:[PSSpecifier groupSpecifierWithNamed:@""
+            footerText:@"开启后，锁屏音乐卡/实时活动卡支持左滑隐藏并同步隐藏灵动岛；暂停后继续播放会自动恢复显示。关闭后左滑手势不再生效，若已隐藏会立即恢复。"]];
+
+    PSSpecifier *sw = [PSSpecifier preferenceSpecifierNamed:@"锁屏左滑隐藏"
+            target:nil set:nil get:nil detail:nil cell:1 edit:nil];
+    [sw setProperty:HNPDomain forKey:@"defaults"];
+    [sw setProperty:@"swipeHide" forKey:@"key"];
+    [sw setProperty:@YES forKey:@"default"];
+    [sw setProperty:HNPNotifName forKey:@"PostNotification"];
+    [m addObject:sw];
+
+    [m addObject:[PSSpecifier groupSpecifierWithNamed:@""
+            footerText:@"卡片背景透明度：只淡化白色背景板，文字/封面不受影响。1.0 = 不透明(功能关闭)，0.05 = 接近全透。拖动即时生效。"]];
+
+    PSSpecifier *sl = [PSSpecifier preferenceSpecifierNamed:@"背景透明度"
+            target:nil set:nil get:nil detail:nil cell:4 edit:nil];
+    [sl setProperty:@0.05 forKey:@"min"];
+    [sl setProperty:@1.0 forKey:@"max"];
+    [sl setProperty:@0.55 forKey:@"default"];
+    [sl setProperty:@"bgAlpha" forKey:@"key"];
+    [sl setProperty:HNPDomain forKey:@"defaults"];
+    [sl setProperty:HNPValCellClass() forKey:@"cellClass"];
+    [m addObject:sl];
+
+    _specs = m;
+    HNPPrefsLog(@"specifiers 构建完成(代码构建)");
+    return _specs;
+}
+
+@end
 
 __attribute__((constructor))
 static void HNPPrefsBundleCtor(void) {
     @autoreleasepool {
-        HNPPrefsLog(@"ctor 进入");
-        Class superCls = NSClassFromString(@"PSListController");
-        if (!superCls) { HNPPrefsLog(@"PSListController 不存在(非 Settings 进程) → 跳过注册"); return; }
-        if (NSClassFromString(@"HNPListController")) { HNPPrefsLog(@"HNPListController 已存在 → 跳过"); return; }
-        Class cls = objc_allocateClassPair(superCls, "HNPListController", 0);
-        if (!cls) { HNPPrefsLog(@"allocateClassPair 失败!"); return; }
-        if (!class_addMethod(cls, @selector(bundle), (IMP)HNPPrefs_bundle, "@@:")) {
-            HNPPrefsLog(@"class_addMethod(bundle) 失败!");
-        }
-        objc_registerClassPair(cls);
-        HNPPrefsLog([NSString stringWithFormat:@"HNPListController 注册成功 bundlePath=%@",
-                     HNPPrefsOwnBundlePath() ?: @"(nil)"]);
+        HNPPrefsLog(@"bundle ctor 进入(编译期子类版)");
     }
 }

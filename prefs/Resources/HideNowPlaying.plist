@@ -10,19 +10,19 @@
 			<key>cell</key>
 			<string>PSGroupCell</string>
 			<key>footerText</key>
-			<string>开启后锁屏音乐卡片默认隐藏(灵动岛同步隐藏)，暂停/继续播放不再自动恢复；关闭开关立即恢复显示。左滑隐藏功能不受影响。</string>
+			<string>开启后，锁屏音乐卡/实时活动卡支持左滑隐藏并同步隐藏灵动岛；暂停后继续播放会自动恢复显示。关闭后左滑手势不再生效，若已隐藏会立即恢复。</string>
 		</dict>
 		<dict>
 			<key>cell</key>
 			<string>PSSwitchCell</string>
 			<key>default</key>
-			<false/>
+			<true/>
 			<key>defaults</key>
 			<string>com.aha.hidenowplaying</string>
 			<key>key</key>
-			<string>cardHidden</string>
+			<string>swipeHide</string>
 			<key>label</key>
-			<string>隐藏音乐卡片</string>
+			<string>锁屏左滑隐藏</string>
 			<key>PostNotification</key>
 			<string>com.aha.hidenowplaying/prefschanged</string>
 		</dict>
@@ -30,7 +30,7 @@
 			<key>cell</key>
 			<string>PSGroupCell</string>
 			<key>footerText</key>
-			<string>卡片背景透明度：只淡化白色背景板，文字/封面不受影响。1.0 = 不透明(功能关闭)，0.05 = 接近全透。改动即时生效。</string>
+			<string>卡片背景透明度：只淡化白色背景板，文字/封面不受影响。1.0 = 不透明(功能关闭)，0.05 = 接近全透。拖动即时生效。</string>
 		</dict>
 		<dict>
 			<key>cell</key>
