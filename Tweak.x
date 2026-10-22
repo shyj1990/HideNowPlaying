@@ -783,6 +783,24 @@ static void HNPMPlatterDiagDump(UIView *platter, UIView *bg, NSString *via) {
             [rows addObject:[NSString stringWithFormat:@"%@ f=%@ a=%.2f h=%d", NSStringFromClass([s class]), NSStringFromCGRect(s.frame), s.alpha, s.isHidden ? 1 : 0]];
         }
         HNPMAppendLog([NSString stringWithFormat:@"[透明·诊断] %@", [rows componentsJoinedByString:@" || "]]);
+        // v0.0.98: 官方旋钮探测 — PLPlatterView_17.h 揭示 materialRecipe(long long)/
+        //          backgroundBlurred/platterViewWithStyle:, 若能令系统自己渲半透明即可免 alpha 写入
+        @try {
+            if ([platter respondsToSelector:@selector(materialRecipe)]) {
+                id r = [platter valueForKey:@"materialRecipe"];
+                HNPMAppendLog([NSString stringWithFormat:@"[透明·诊断] materialRecipe=%@",
+                               [r description] ?: @"(nil)"]);
+            } else {
+                HNPMAppendLog(@"[透明·诊断] materialRecipe 选择器不存在");
+            }
+            if ([platter respondsToSelector:@selector(backgroundBlurred)]) {
+                id b = [platter valueForKey:@"backgroundBlurred"];
+                HNPMAppendLog([NSString stringWithFormat:@"[透明·诊断] backgroundBlurred=%@",
+                               [b description] ?: @"(nil)"]);
+            }
+        } @catch (NSException *e) {
+            HNPMAppendLog(@"[透明·诊断] 旋钮探测异常");
+        }
     } @catch (NSException *e) {}
 }
 
@@ -817,14 +835,24 @@ static void HNPMSetAlphaNoAnim(UIView *v, CGFloat a) {
     [CATransaction commit];
 }
 
+// v0.0.98: 被动钳制 — 给背景视图挂目标 alpha(associated object), 供 UIView setAlpha: 钩子
+//          在系统自己写入时当场钳回目标值(同一调用栈内, 不产生我们的主动写事件)。
+static char kHNPMTargetAlphaKey;
+static void HNPMMarkTargetAlpha(UIView *v, CGFloat a) {
+    objc_setAssociatedObject(v, &kHNPMTargetAlphaKey, a < 0.99 ? @(a) : nil,
+                             OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+}
+
 static int HNPMPlatterApplyBg(UIView *platter, CGFloat a) {
     int hits = 0;
     NSString *via = @"";
     UIView *bg = HNPMPlatterBgView(platter, &via);
     if (bg) {
+        HNPMMarkTargetAlpha(bg, a);   // v0.0.98: 无论是否需要写, 都让钳制钩子知道目标值
         if (fabs(bg.alpha - a) > 0.01) { HNPMSetAlphaNoAnim(bg, a); hits++; }
     } else {
         // 托盘无背景子层(罕见) → 整托盘淡化(旧路兜底, 内容会连带)
+        HNPMMarkTargetAlpha(platter, a);
         if (fabs(platter.alpha - a) > 0.01) { HNPMSetAlphaNoAnim(platter, a); hits++; }
     }
     return hits;
@@ -2215,6 +2243,36 @@ static void HNPMAttachPanIfNeeded(UIView *view) {
 %end
 %end
 
+// ---- v0.0.98: 材质写入被动钳制 ----
+// v0.0.97 日志裁决: 亮屏时场景宿主包装视图 a=1.00 p=1.00 全程无渐显(截断零命中),
+// 但卡片登记每 3~4s 重建一次且与我们的主动 alpha 写入时间相关(写入→重建→歌词暗 ~1s)。
+// 结论: 主动写入本身是扰动源。本组把"亮屏后系统把背景冲回不透明"的防御从
+// "我们侦测漂移→帧边界主动写"(仍是写事件) 改为 "系统调用 setAlpha: 时在同一调用栈内
+// 钳回目标值" — 不新增写事件, 系统材质配置按我们的值一次成型。
+// 登记路径/巡逻/连扫保留作兜底(系统若绕过 setAlpha: 直改 layer, 仍走旧链路)。
+static CFAbsoluteTime sHNPMCoerceLastLog = 0;
+%group HNPMAlphaCoerce
+%hook UIView
+- (void)setAlpha:(CGFloat)a {
+    NSNumber *t = objc_getAssociatedObject(self, &kHNPMTargetAlphaKey);
+    if (t) {
+        CGFloat target = t.doubleValue;
+        if (target < 0.99 && fabs(a - target) > 0.005) {
+            %orig(target);
+            CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
+            if (now - sHNPMCoerceLastLog > 1.0) {
+                sHNPMCoerceLastLog = now;
+                HNPMAppendLog([NSString stringWithFormat:@"[透明] 材质写入钳制 %.2f→%.2f(被动)",
+                               a, target]);
+            }
+            return;
+        }
+    }
+    %orig;
+}
+%end
+%end
+
 %group HNPMIslandElement
 %hook _SAUIElementViewContentView
 - (void)didMoveToWindow {
@@ -2263,7 +2321,7 @@ static void HNPMAttachPanIfNeeded(UIView *view) {
 #pragma mark - 入口
 
 __attribute__((constructor)) static void HNPMRawCtor(void) {
-    HNPMAppendLog(@"v0.0.97: dylib 构造函数已执行(dyld 加载成功)");
+    HNPMAppendLog(@"v0.0.98: dylib 构造函数已执行(dyld 加载成功)");
 }
 
 // v0.0.50/51: 岛元素抑制策略钩子 — 隐藏期让系统把 NowPlaying 元素当作"应被抑制",
@@ -2326,7 +2384,7 @@ __attribute__((constructor)) static void HNPMRawCtor(void) {
 
 %ctor {
     @autoreleasepool {
-        HNPMAppendLog(@"v0.0.97: logos %ctor 进入");
+        HNPMAppendLog(@"v0.0.98: logos %ctor 进入");
 
         if ([[NSFileManager defaultManager] fileExistsAtPath:@"/var/mobile/Documents/HideNowPlaying.off"]) {
             HNPMAppendLog(@"检测到开关文件 HideNowPlaying.off, 不注册任何 hook");
@@ -2386,7 +2444,11 @@ __attribute__((constructor)) static void HNPMRawCtor(void) {
 
         if (objc_getClass("CSActivityItemContentView"))      { %init(HNPMActivityCard); HNPMAppendLog(@"hook 已注册: 媒体卡片(高度>=150 过滤)"); }
         // v0.0.88: 托盘透明重申 hook(PLPlatterView 不一定在所有注入进程都存在, 存在才注册)
-        if (objc_getClass("PLPlatterView"))                  { %init(HNPMPlatterReset); HNPMAppendLog(@"hook 已注册: 托盘透明重申(PLPlatterView 亮屏防冲掉)"); }
+        if (objc_getClass("PLPlatterView"))                  {
+            %init(HNPMPlatterReset); HNPMAppendLog(@"hook 已注册: 托盘透明重申(PLPlatterView 亮屏防冲掉)");
+            // v0.0.98: 材质写入被动钳制(与托盘钩子同进程注册; 登记路径先 apply 挂目标值才生效)
+            %init(HNPMAlphaCoerce); HNPMAppendLog(@"hook 已注册: 材质写入被动钳制(UIView setAlpha:)");
+        }
         // v0.0.66: 岛相关 hook 全部无条件注册, 行为由调用层闸门按岛侧模式动态拦截
         // (注册时机≠行为时机 — NativeIsland 无论先后加载, 宽限期终判后闸门即正确)
         if (objc_getClass("_SAUIElementViewContentView"))    { %init(HNPMIslandElement); }
@@ -2416,7 +2478,7 @@ __attribute__((constructor)) static void HNPMRawCtor(void) {
         HNPMAppendLog(@"v0.0.92: 设置面板通知观察者已挂");
         // v0.0.93: 空闲巡逻(0.5s 只读一次, 无在场卡自动停) — 堵"空闲期静默重置无事件触发"盲区
         HNPMIdleAlphaCheck();
-        HNPMAppendLog(@"v0.0.97: 空闲巡逻已启动");
-        HNPMAppendLog(@"v0.0.97: %ctor 正常完成");
+        HNPMAppendLog(@"v0.0.98: 空闲巡逻已启动");
+        HNPMAppendLog(@"v0.0.98: %ctor 正常完成");
     }
 }
