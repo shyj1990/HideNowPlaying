@@ -818,10 +818,20 @@ static int HNPMPlatterApplyBg(UIView *platter, CGFloat a) {
     return hits;
 }
 
+// v0.0.92: 只读漂移检测 — 布局/挂载回调里的同步写 alpha 会与系统材质渲染管线打架:
+//          真机对照实锤(v0.0.91): 关闭插件(HideNowPlaying.off)亮屏进度条无延迟, 开启则 ~1s 滞后;
+//          时间线与 v0.0.88 引入的"布局回调内同步写"重合 → 该写入挤掉远端内容更新。
+//          故 hook 回调只侦测, 写入全部收敛到连扫窗口的帧边界。
+static BOOL HNPMPlatterBgDrift(UIView *platter, CGFloat a) {
+    UIView *bg = HNPMPlatterBgView(platter, NULL);
+    CGFloat cur = bg ? bg.alpha : platter.alpha;
+    return fabs(cur - a) > 0.01;
+}
+
 // v0.0.88: 亮屏重申 — 真机实锤: 锁屏亮屏后系统会重建/重置锁屏托盘(PLPlatterView),
 //          背景透明度被冲回 1.0, 而旧逻辑只在登记/恢复/1s重试路径重申 → 亮屏后约 1s 才变透。
-//          修复: hook 托盘的 didMoveToWindow/layoutSubviews, 已登记卡的托盘一旦 alpha 异
-//          立即补上(布局回调高频, 但 fabs 差值判断保证已是目标值时零成本)。
+// v0.0.92: 改为只侦测不写(原因见 HNPMPlatterBgDrift 注释) — 发现漂移只开连扫窗口,
+//          下一帧在帧边界修正(视觉无差, 布局回调内零写入)。
 static void HNPMPlatterReapplyOnLayout(UIView *platter) {
     if (![NSThread isMainThread]) return;
     @try {
@@ -836,12 +846,8 @@ static void HNPMPlatterReapplyOnLayout(UIView *platter) {
             p = p.superview;
         }
         if (!cell || cell.hidden || HNPMCardHiddenGet(cell) || !cell.window) return;
-        int hits = HNPMPlatterApplyBg(platter, a);
-        if (hits > 0) {
-            HNPMAlphaRetrySet(cell, 0);
-            if (fabs(cell.alpha - 1.0) > 0.01) cell.alpha = 1.0;   // 撤销整卡淡化兜底
-            HNPMAppendLog(@"[透明] 托盘重申(系统重置后即时补)");
-            HNPMStartAlphaBurst();   // v0.0.90: 重置事件 → 开连扫窗口(堵后续缝隙期重置)
+        if (HNPMPlatterBgDrift(platter, a)) {
+            HNPMStartAlphaBurst();
         }
     } @catch (NSException *e) {}
 }
@@ -878,6 +884,33 @@ static int HNPMInstantPlatterAlpha(UIView *cell) {
     return 0;
 }
 
+// v0.0.92: 只读 — 第一张在场登记卡的托盘背景 alpha(无卡/无托盘返回 -1), 供连扫稳定门
+static CGFloat HNPMCardPlatterBgAlphaRead(void) {
+    if (![NSThread isMainThread]) return -1;
+    @try {
+        Class platterCls = NSClassFromString(@"PLPlatterView");
+        if (!platterCls) return -1;
+        for (UIView *cell in [hnpmCardCells copy]) {
+            if (![cell isKindOfClass:[UIView class]]) continue;
+            if (cell.hidden || HNPMCardHiddenGet(cell) || !cell.window) continue;
+            NSMutableArray *stack = [NSMutableArray arrayWithObject:cell];
+            int guard = 0;
+            while (stack.count > 0 && guard++ < 120) {
+                UIView *v = stack.firstObject;
+                [stack removeObjectAtIndex:0];
+                if (!v) continue;
+                if ([NSStringFromClass([v class]) containsString:@"Remote"]) continue;
+                if ([v isKindOfClass:platterCls]) {
+                    UIView *bg = HNPMPlatterBgView(v, NULL);
+                    return bg ? bg.alpha : v.alpha;
+                }
+                [stack addObjectsFromArray:v.subviews];
+            }
+        }
+    } @catch (NSException *e) {}
+    return -1;
+}
+
 // ---- v0.0.90: 亮屏逐帧连扫 ----
 // v0.0.89 真机日志实锤: 亮屏瞬间(08:34:00)hook 已秒补, 但 2 秒后(08:34:02)系统又重建卡片
 // 并把 alpha 重置 —— 重置点落在"预登记之后、托盘首次布局之前"的缝隙, 事件驱动堵不死。
@@ -887,6 +920,8 @@ static int HNPMInstantPlatterAlpha(UIView *cell) {
 static CADisplayLink *sHNPMAlphaBurst = nil;
 static CFAbsoluteTime sHNPMAlphaBurstEnd = 0;
 static BOOL sHNPMAlphaBurstLogged = NO;
+static CGFloat sHNPMAlphaBurstLastObs = -1;   // v0.0.92: 稳定门 — 上一帧观测值
+static int sHNPMAlphaBurstStable = 0;         // v0.0.92: 稳定门 — 连续相同观测计数
 
 @interface HNPMBurstTarget : NSObject
 @end
@@ -899,17 +934,35 @@ static BOOL sHNPMAlphaBurstLogged = NO;
             if (sHNPMAlphaBurst == dl) sHNPMAlphaBurst = nil;
             return;
         }
-        int total = 0;
-        for (UIView *cell in [hnpmCardCells copy]) {
-            if (![cell isKindOfClass:[UIView class]]) continue;
-            @try { total += HNPMInstantPlatterAlpha(cell); } @catch (NSException *e) {}
-        }
-        if (total > 0) {
-            if (!sHNPMAlphaBurstLogged) {
-                sHNPMAlphaBurstLogged = YES;
-                HNPMAppendLog(@"[透明] 亮屏连扫补上(逐帧)");
+        // v0.0.92: 稳定门 — 连续两帧观测到同一静态偏差才写。系统动画/过渡中的瞬时 alpha
+        //          一律不追(逐帧写 alpha 会与材质渲染打架 → 远端内容更新被挤掉, 进度条滞后);
+        //          静态重置则第二帧即写(≈8-16ms, 视觉无差)。
+        CGFloat a = HNPMBgAlpha();
+        if (a < 0.99) {
+            CGFloat cur = HNPMCardPlatterBgAlphaRead();
+            if (cur >= 0) {
+                if (sHNPMAlphaBurstLastObs >= 0 && fabs(cur - sHNPMAlphaBurstLastObs) < 0.005) {
+                    sHNPMAlphaBurstStable++;
+                } else {
+                    sHNPMAlphaBurstStable = 0;
+                }
+                sHNPMAlphaBurstLastObs = cur;
+                if (fabs(cur - a) > 0.01 && sHNPMAlphaBurstStable >= 1) {
+                    sHNPMAlphaBurstStable = 0;
+                    int total = 0;
+                    for (UIView *cell in [hnpmCardCells copy]) {
+                        if (![cell isKindOfClass:[UIView class]]) continue;
+                        @try { total += HNPMInstantPlatterAlpha(cell); } @catch (NSException *e) {}
+                    }
+                    if (total > 0) {
+                        if (!sHNPMAlphaBurstLogged) {
+                            sHNPMAlphaBurstLogged = YES;
+                            HNPMAppendLog(@"[透明] 连扫修正(稳定偏差, 帧边界写入)");
+                        }
+                        sHNPMAlphaBurstEnd = CFAbsoluteTimeGetCurrent() + 1.0;   // 又发现重置 → 延长窗口
+                    }
+                }
             }
-            sHNPMAlphaBurstEnd = CFAbsoluteTimeGetCurrent() + 1.0;   // 又发现重置 → 延长窗口
         }
     } @catch (NSException *e) {}
 }
@@ -926,6 +979,8 @@ static void HNPMStartAlphaBurst(void) {
     sHNPMAlphaBurstLogged = NO;
     if (sHNPMAlphaBurst) return;   // 已在跑: 只续窗口
     if (!sHNPMAlphaBurstTarget) return;
+    sHNPMAlphaBurstLastObs = -1;   // v0.0.92: 新窗口重置稳定门观测
+    sHNPMAlphaBurstStable = 0;
     sHNPMAlphaBurst = [CADisplayLink displayLinkWithTarget:sHNPMAlphaBurstTarget selector:@selector(onTick:)];
     [sHNPMAlphaBurst addToRunLoop:[NSRunLoop mainRunLoop] forMode:NSRunLoopCommonModes];
 }
@@ -1915,7 +1970,8 @@ static void HNPMAttachPanIfNeeded(UIView *view) {
             while (p0 && ![p0 isKindOfClass:preCellCls]) p0 = p0.superview;
             if (p0) {
                 [hnpmCardCells addObject:p0];
-                HNPMInstantPlatterAlpha(p0);
+                // v0.0.92: 挂载回调不再同步写 alpha(与材质渲染打架 → 进度条等内容滞后,
+                //          真机对照实锤) — 连扫窗口下一帧帧边界修正, 视觉无差
                 HNPMStartAlphaBurst();   // v0.0.90: 挂载即启动逐帧连扫窗口
             }
         }
@@ -2053,7 +2109,7 @@ static void HNPMAttachPanIfNeeded(UIView *view) {
 #pragma mark - 入口
 
 __attribute__((constructor)) static void HNPMRawCtor(void) {
-    HNPMAppendLog(@"v0.0.91: dylib 构造函数已执行(dyld 加载成功)");
+    HNPMAppendLog(@"v0.0.92: dylib 构造函数已执行(dyld 加载成功)");
 }
 
 // v0.0.50/51: 岛元素抑制策略钩子 — 隐藏期让系统把 NowPlaying 元素当作"应被抑制",
@@ -2116,7 +2172,7 @@ __attribute__((constructor)) static void HNPMRawCtor(void) {
 
 %ctor {
     @autoreleasepool {
-        HNPMAppendLog(@"v0.0.91: logos %ctor 进入");
+        HNPMAppendLog(@"v0.0.92: logos %ctor 进入");
 
         if ([[NSFileManager defaultManager] fileExistsAtPath:@"/var/mobile/Documents/HideNowPlaying.off"]) {
             HNPMAppendLog(@"检测到开关文件 HideNowPlaying.off, 不注册任何 hook");
@@ -2203,7 +2259,7 @@ __attribute__((constructor)) static void HNPMRawCtor(void) {
         CFNotificationCenterAddObserver(CFNotificationCenterGetDarwinNotifyCenter(), NULL,
                                         HNPMPrefsChangedCB, CFSTR("com.aha.hidenowplaying/prefschanged"),
                                         NULL, CFNotificationSuspensionBehaviorDeliverImmediately);
-        HNPMAppendLog(@"v0.0.91: 设置面板通知观察者已挂");
-        HNPMAppendLog(@"v0.0.91: %ctor 正常完成");
+        HNPMAppendLog(@"v0.0.92: 设置面板通知观察者已挂");
+        HNPMAppendLog(@"v0.0.92: %ctor 正常完成");
     }
 }
