@@ -958,6 +958,67 @@ static void HNPMClampSceneHostFade(UIView *cell) {
     } @catch (NSException *e) {}
 }
 
+// v0.0.97: 场景宿主反渐显 v2 — v0.0.96 零命中但时序 dump 拍到 a=0.00/p=0.91/h=0 渐显中,
+//          说明旧条件(model alpha)有盲区。改为 presentation 层触发(动画中值可见):
+//          在窗 + 未隐藏 + (model<1 或 presentation<1) → 钳 model=1.0 + removeAllAnimations;
+//          并在连扫窗口内每秒输出一次宿主巡检心跳(无论是否命中), 供下次排障定位条件盲区。
+static CFAbsoluteTime sHNPMFadeClampLastLog = 0;
+static BOOL HNPMClampSceneHostFade(UIView *cell) {
+    if (![NSThread isMainThread]) return NO;
+    BOOL clamped = NO;
+    @try {
+        NSMutableArray *stack = [NSMutableArray arrayWithObject:cell];
+        int guard = 0;
+        while (stack.count > 0 && guard++ < 60) {
+            UIView *v = stack.firstObject;
+            [stack removeObjectAtIndex:0];
+            if (!v || !v.window) continue;
+            BOOL hasSceneChild = NO;
+            for (UIView *s in v.subviews) {
+                if ([NSStringFromClass([s class]) containsString:@"_UIScene"]) { hasSceneChild = YES; break; }
+            }
+            if (hasSceneChild) {
+                CALayer *pl = (CALayer *)v.layer.presentationLayer;
+                CGFloat pop = pl ? pl.opacity : v.alpha;
+                CGFloat oldA = v.alpha;
+                BOOL need = (!v.hidden && (oldA < 0.99 || pop < 0.99));
+                if (need) {
+                    HNPMSetAlphaNoAnim(v, 1.0);
+                    [v.layer removeAllAnimations];
+                    clamped = YES;
+                }
+                CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
+                if (now - sHNPMFadeClampLastLog > 1.0) {   // 心跳/截断日志限频 1s
+                    sHNPMFadeClampLastLog = now;
+                    if (need) {
+                        HNPMAppendLog([NSString stringWithFormat:@"[透明] 场景宿主渐显截断(a=%.2f p=%.2f→1.0)",
+                                       oldA, pop]);
+                    } else {
+                        HNPMAppendLog([NSString stringWithFormat:@"[透明·宿主巡检] a=%.2f p=%.2f h=%d(未渐显)",
+                                       oldA, pop, v.hidden ? 1 : 0]);
+                    }
+                }
+                return clamped;   // 找到宿主包装即停(无论是否钳制)
+            }
+            [stack addObjectsFromArray:v.subviews];
+        }
+    } @catch (NSException *e) {}
+    return clamped;
+}
+
+static void HNPMClampAllCells(void) {
+    if (![NSThread isMainThread]) {
+        dispatch_async(dispatch_get_main_queue(), ^{ HNPMClampAllCells(); });
+        return;
+    }
+    @try {
+        for (UIView *cell in [hnpmCardCells copy]) {
+            if (![cell isKindOfClass:[UIView class]] || !cell.window) continue;
+            if (HNPMClampSceneHostFade(cell)) break;
+        }
+    } @catch (NSException *e) {}
+}
+
 // ---- v0.0.90: 亮屏逐帧连扫 ----
 // v0.0.89 真机日志实锤: 亮屏瞬间(08:34:00)hook 已秒补, 但 2 秒后(08:34:02)系统又重建卡片
 // 并把 alpha 重置 —— 重置点落在"预登记之后、托盘首次布局之前"的缝隙, 事件驱动堵不死。
@@ -981,11 +1042,8 @@ static int sHNPMAlphaBurstStable = 0;         // v0.0.92: 稳定门 — 连续�
             if (sHNPMAlphaBurst == dl) sHNPMAlphaBurst = nil;
             return;
         }
-        // v0.0.96: 场景宿主反渐显(每帧检查, 仅渐显激活时写入) — 堵歌词变暗
-        for (UIView *cell in [hnpmCardCells copy]) {
-            if (![cell isKindOfClass:[UIView class]] || !cell.window) continue;
-            HNPMClampSceneHostFade(cell);
-        }
+        // v0.0.97: 场景宿主反渐显 v2(每帧检查; presentation 层触发 + 心跳日志)
+        HNPMClampAllCells();
         // v0.0.92: 稳定门 — 连续两帧观测到同一静态偏差才写。系统动画/过渡中的瞬时 alpha
         //          一律不追(逐帧写 alpha 会与材质渲染打架 → 远端内容更新被挤掉, 进度条滞后);
         //          静态重置则第二帧即写(≈8-16ms, 视觉无差)。
@@ -1094,7 +1152,12 @@ static void HNPMDeepDumpAt(NSString *tag) {
 static void HNPMScheduleDeepDumps(void) {
     for (NSString *d in @[@"0.3", @"0.8", @"1.5", @"2.5"]) {
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)([d doubleValue] * NSEC_PER_SEC)),
-                       dispatch_get_main_queue(), ^{ @try { HNPMDeepDumpAt(d); } @catch (NSException *e) {} });
+                       dispatch_get_main_queue(), ^{
+            @try {
+                HNPMClampAllCells();   // v0.0.97: 连扫窗口外的钳制兜底
+                HNPMDeepDumpAt(d);
+            } @catch (NSException *e) {}
+        });
     }
 }
 
@@ -2232,7 +2295,7 @@ static void HNPMAttachPanIfNeeded(UIView *view) {
 #pragma mark - 入口
 
 __attribute__((constructor)) static void HNPMRawCtor(void) {
-    HNPMAppendLog(@"v0.0.96: dylib 构造函数已执行(dyld 加载成功)");
+    HNPMAppendLog(@"v0.0.97: dylib 构造函数已执行(dyld 加载成功)");
 }
 
 // v0.0.50/51: 岛元素抑制策略钩子 — 隐藏期让系统把 NowPlaying 元素当作"应被抑制",
@@ -2295,7 +2358,7 @@ __attribute__((constructor)) static void HNPMRawCtor(void) {
 
 %ctor {
     @autoreleasepool {
-        HNPMAppendLog(@"v0.0.96: logos %ctor 进入");
+        HNPMAppendLog(@"v0.0.97: logos %ctor 进入");
 
         if ([[NSFileManager defaultManager] fileExistsAtPath:@"/var/mobile/Documents/HideNowPlaying.off"]) {
             HNPMAppendLog(@"检测到开关文件 HideNowPlaying.off, 不注册任何 hook");
@@ -2385,7 +2448,7 @@ __attribute__((constructor)) static void HNPMRawCtor(void) {
         HNPMAppendLog(@"v0.0.92: 设置面板通知观察者已挂");
         // v0.0.93: 空闲巡逻(0.5s 只读一次, 无在场卡自动停) — 堵"空闲期静默重置无事件触发"盲区
         HNPMIdleAlphaCheck();
-        HNPMAppendLog(@"v0.0.96: 空闲巡逻已启动");
-        HNPMAppendLog(@"v0.0.96: %ctor 正常完成");
+        HNPMAppendLog(@"v0.0.97: 空闲巡逻已启动");
+        HNPMAppendLog(@"v0.0.97: %ctor 正常完成");
     }
 }
