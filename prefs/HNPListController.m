@@ -22,7 +22,7 @@
 
 @interface PSListController : UIViewController
 - (void)reloadSpecifiers;
-- (void)setSpecifiers:(id)specifiers;   // v0.0.83: 官方 setter — 渲染直接读 _specifiers ivar(18.2 dump 实锤), 只 return 不写 ivar = 空白页
+- (void)setSpecifiers:(id)specifiers;   // v0.0.84: 官方 setter — 渲染直接读 _specifiers ivar(18.2 dump 实锤), 只 return 不写 ivar = 空白页
 @end
 
 // ---- 设备侧日志(与主 tweak 同一文件) ----
@@ -51,7 +51,13 @@ static void HNPPostPrefsChanged(void) {
 }
 
 // ---- 自定义滑条 cell: UISlider + 实时数值标签 ----
-@interface HNPSliderCell : UITableViewCell
+// v0.0.84: 继承 PSTableCell(假接口+dynamic_lookup, 与 PSListController 同模式) —
+// iOS17 AppearanceProvider 渲染 cell 前调 +cellStyle 等类方法协议(13:19 真机崩溃实锤),
+// 纯 UITableViewCell 子类缺协议必崩; PSTableCell 子类全套继承。
+@interface PSTableCell : UITableViewCell
+@end
+
+@interface HNPSliderCell : PSTableCell
 - (id)initWithSpecifier:(PSSpecifier *)specifier;
 @end
 
@@ -101,6 +107,11 @@ static void HNPPostPrefsChanged(void) {
     return [super initWithStyle:style reuseIdentifier:rid];
 }
 
+// v0.0.84: PSTableCell 协议 — 显式给出(与父类一致, 防 17.0 差异)
++ (NSInteger)cellStyle {
+    return 1;
+}
+
 - (void)updateLabel:(CGFloat)v {
     _label.text = [NSString stringWithFormat:@"%.2f", v];
 }
@@ -134,16 +145,16 @@ static Class HNPValCellClass(void) { return [HNPSliderCell class]; }
 
 - (NSArray *)specifiers {
     if (_specs) return _specs;
-    _specs = @[];   // v0.0.83: 先占位, 防 setSpecifiers: 内部重入
+    _specs = @[];   // v0.0.84: 先占位, 防 setSpecifiers: 内部重入
     [self setTitle:@"HideNowPlaying"];
     NSMutableArray *m = [NSMutableArray array];
-    HNPPrefsLog(@"v0.0.83 specifiers 构建: 开始");
+    HNPPrefsLog(@"v0.0.84 specifiers 构建: 开始");
 
     Class PSS = [PSSpecifier class];
     // v0.0.81: 类方法全部运行时存在性检查 — 不存在即降级(不再可能 unrecognized selector 闪退)
     BOOL hasGroup = [PSS respondsToSelector:@selector(groupSpecifierWithName:)];
     BOOL hasPref = [PSS respondsToSelector:@selector(preferenceSpecifierNamed:target:set:get:detail:cell:edit:)];
-    HNPPrefsLog([NSString stringWithFormat:@"v0.0.83 方法检查: groupSpecifierWithName=%d preferenceSpecifierNamed=%d", hasGroup, hasPref]);
+    HNPPrefsLog([NSString stringWithFormat:@"v0.0.84 方法检查: groupSpecifierWithName=%d preferenceSpecifierNamed=%d", hasGroup, hasPref]);
     if (!hasPref) {
         HNPPrefsLog(@"preferenceSpecifierNamed 不存在 → 返回空页(防崩)");
         [self setSpecifiers:m];
@@ -161,7 +172,7 @@ static Class HNPValCellClass(void) { return [HNPSliderCell class]; }
                  forKey:@"footerText"];
         [m addObject:g1];
     }
-    HNPPrefsLog(@"v0.0.83 specifiers 构建: group1 完成");
+    HNPPrefsLog(@"v0.0.84 specifiers 构建: group1 完成");
 
     PSSpecifier *sw = [PSS preferenceSpecifierNamed:@"锁屏左滑隐藏"
             target:nil set:nil get:nil detail:nil cell:1 edit:nil];
@@ -170,7 +181,7 @@ static Class HNPValCellClass(void) { return [HNPSliderCell class]; }
     [sw setProperty:@YES forKey:@"default"];
     [sw setProperty:HNPNotifName forKey:@"PostNotification"];
     [m addObject:sw];
-    HNPPrefsLog(@"v0.0.83 specifiers 构建: 开关完成");
+    HNPPrefsLog(@"v0.0.84 specifiers 构建: 开关完成");
 
     if (hasGroup) {
         PSSpecifier *g2 = [PSS groupSpecifierWithName:nil];
@@ -194,11 +205,11 @@ static Class HNPValCellClass(void) { return [HNPSliderCell class]; }
     [sl setProperty:HNPValCellClass() forKey:@"cellClass"];
     [m addObject:sl];
 
-    // v0.0.83 核心: 通过官方 setter 写入 _specifiers ivar — 渲染管线读的是这个 ivar,
+    // v0.0.84 核心: 通过官方 setter 写入 _specifiers ivar — 渲染管线读的是这个 ivar,
     // 只 return 不写入 = 上游拿到数组但表格按 nil 渲染 → 空白页
     [self setSpecifiers:m];
     _specs = m;
-    HNPPrefsLog(@"v0.0.83 specifiers 构建完成(已 setSpecifiers)");
+    HNPPrefsLog(@"v0.0.84 specifiers 构建完成(已 setSpecifiers)");
     return m;
 }
 
@@ -207,6 +218,6 @@ static Class HNPValCellClass(void) { return [HNPSliderCell class]; }
 __attribute__((constructor))
 static void HNPPrefsBundleCtor(void) {
     @autoreleasepool {
-        HNPPrefsLog(@"v0.0.83 bundle ctor 进入(编译期子类+防御版)");
+        HNPPrefsLog(@"v0.0.84 bundle ctor 进入(编译期子类+防御版)");
     }
 }
