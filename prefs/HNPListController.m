@@ -58,7 +58,6 @@ static void HNPPostPrefsChanged(void) {
 @end
 
 @interface HNPSliderCell : PSTableCell
-- (id)initWithSpecifier:(PSSpecifier *)specifier;
 @end
 
 @implementation HNPSliderCell {
