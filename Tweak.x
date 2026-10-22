@@ -923,43 +923,11 @@ static CGFloat HNPMCardPlatterBgAlphaRead(void) {
     return -1;
 }
 
-// v0.0.96: 场景宿主反渐显 — 时序 dump 实锤(v0.0.95): 远端场景宿主包装视图(plain UIView,
+// v0.0.97: 场景宿主反渐显 v2 — 时序 dump 实锤(v0.0.95/96): 远端场景宿主包装视图(plain UIView,
 //          直接子视图含 _UIScenePresentationView)在每次激活/重挂时以 alpha 0→1 渐显约 1s
-//          (21:33:41.768 实拍 model a=0.00 / presentation p=0.54 / h=0), 渐显期间整个远端
-//          内容(歌词行)被压暗 = 用户所见"歌词变暗"。处理: 连扫窗口内每帧检查, 渐显中的
-//          包装视图(在窗/未隐藏/alpha<1)直接钳到 1.0 并移除 opacity 动画 → 内容立即全亮。
-static CFAbsoluteTime sHNPMFadeClampLastLog = 0;
-static void HNPMClampSceneHostFade(UIView *cell) {
-    if (![NSThread isMainThread]) return;
-    @try {
-        NSMutableArray *stack = [NSMutableArray arrayWithObject:cell];
-        int guard = 0;
-        while (stack.count > 0 && guard++ < 60) {
-            UIView *v = stack.firstObject;
-            [stack removeObjectAtIndex:0];
-            if (!v || !v.window) continue;
-            BOOL hasSceneChild = NO;
-            for (UIView *s in v.subviews) {
-                if ([NSStringFromClass([s class]) containsString:@"_UIScene"]) { hasSceneChild = YES; break; }
-            }
-            if (hasSceneChild && !v.hidden && v.alpha < 0.99) {
-                CGFloat old = v.alpha;
-                HNPMSetAlphaNoAnim(v, 1.0);
-                [v.layer removeAnimationForKey:@"opacity"];
-                CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
-                if (now - sHNPMFadeClampLastLog > 1.0) {   // 渐显中逐帧钳制, 日志限频 1s
-                    sHNPMFadeClampLastLog = now;
-                    HNPMAppendLog([NSString stringWithFormat:@"[透明] 场景宿主渐显截断(a=%.2f→1.0)", old]);
-                }
-                return;
-            }
-            [stack addObjectsFromArray:v.subviews];
-        }
-    } @catch (NSException *e) {}
-}
-
-// v0.0.97: 场景宿主反渐显 v2 — v0.0.96 零命中但时序 dump 拍到 a=0.00/p=0.91/h=0 渐显中,
-//          说明旧条件(model alpha)有盲区。改为 presentation 层触发(动画中值可见):
+//          (实拍 model a=0.00 / presentation p=0.54/0.91 / h=0), 渐显期间整个远端
+//          内容(歌词行)被压暗 = 用户所见"歌词变暗"。v0.0.96 零命中但 dump 拍到渐显中,
+//          说明旧条件(model alpha)有盲区 → 改为 presentation 层触发(动画中值可见):
 //          在窗 + 未隐藏 + (model<1 或 presentation<1) → 钳 model=1.0 + removeAllAnimations;
 //          并在连扫窗口内每秒输出一次宿主巡检心跳(无论是否命中), 供下次排障定位条件盲区。
 static CFAbsoluteTime sHNPMFadeClampLastLog = 0;
