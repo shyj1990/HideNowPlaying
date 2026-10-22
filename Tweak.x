@@ -96,7 +96,15 @@ static void HNPMAppendLog(NSString *text) {
         NSFileManager *fm = [NSFileManager defaultManager];
         NSDictionary *attrs = [fm attributesOfItemAtPath:path error:nil];
         if (attrs && [attrs fileSize] > 256 * 1024) [fm removeItemAtPath:path error:nil];
-        NSString *line = [NSString stringWithFormat:@"[%@] %@\n", [NSDate date], text];
+        // v0.0.90: 时间戳带毫秒(亮屏时序排障需要亚秒精度)
+        static NSDateFormatter *fmt = nil;
+        static dispatch_once_t onceTok;
+        dispatch_once(&onceTok, ^{
+            fmt = [[NSDateFormatter alloc] init];
+            fmt.dateFormat = @"yyyy-MM-dd HH:mm:ss.SSS Z";
+            fmt.locale = [[NSLocale alloc] initWithLocaleIdentifier:@"en_US_POSIX"];
+        });
+        NSString *line = [NSString stringWithFormat:@"[%@] %@\n", [fmt stringFromDate:[NSDate date]], text];
         if (![fm fileExistsAtPath:path]) {
             [line writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:nil];
         } else {
@@ -832,6 +840,7 @@ static void HNPMPlatterReapplyOnLayout(UIView *platter) {
             HNPMAlphaRetrySet(cell, 0);
             if (fabs(cell.alpha - 1.0) > 0.01) cell.alpha = 1.0;   // 撤销整卡淡化兜底
             HNPMAppendLog(@"[透明] 托盘重申(系统重置后即时补)");
+            HNPMStartAlphaBurst();   // v0.0.90: 重置事件 → 开连扫窗口(堵后续缝隙期重置)
         }
     } @catch (NSException *e) {}
 }
@@ -841,14 +850,15 @@ static void HNPMPlatterReapplyOnLayout(UIView *platter) {
 //          这里做两件事: ①挂载瞬间预登记合格单元格(尺寸门槛当场可判, 登记幂等) —
 //          让托盘 hook 在首次布局就命中; ②托盘已存在时立即压 alpha(无兜底无重试,
 //          托盘未建好则等 hook/登记路径, 不做整卡淡化避免文字闪烁)。
-static void HNPMInstantPlatterAlpha(UIView *cell) {
-    if (![NSThread isMainThread]) return;
+static int HNPMInstantPlatterAlpha(UIView *cell) {
+    if (![NSThread isMainThread]) return 0;
     @try {
         CGFloat a = HNPMBgAlpha();
-        if (a >= 0.99) return;
-        if (cell.hidden || HNPMCardHiddenGet(cell)) return;
+        if (a >= 0.99) return 0;
+        if (cell.hidden || HNPMCardHiddenGet(cell)) return 0;
         Class platterCls = NSClassFromString(@"PLPlatterView");
-        if (!platterCls) return;
+        if (!platterCls) return 0;
+        int total = 0;
         NSMutableArray *stack = [NSMutableArray arrayWithObject:cell];
         int guard = 0;
         while (stack.count > 0 && guard++ < 120) {
@@ -857,12 +867,66 @@ static void HNPMInstantPlatterAlpha(UIView *cell) {
             if (!v) continue;
             if ([NSStringFromClass([v class]) containsString:@"Remote"]) continue;
             if ([v isKindOfClass:platterCls]) {
-                int hits = HNPMPlatterApplyBg(v, a);
-                if (hits > 0 && fabs(cell.alpha - 1.0) > 0.01) cell.alpha = 1.0;
+                total += HNPMPlatterApplyBg(v, a);
+                if (total > 0 && fabs(cell.alpha - 1.0) > 0.01) cell.alpha = 1.0;
             }
             [stack addObjectsFromArray:v.subviews];
         }
+        return total;
     } @catch (NSException *e) {}
+    return 0;
+}
+
+// ---- v0.0.90: 亮屏逐帧连扫 ----
+// v0.0.89 真机日志实锤: 亮屏瞬间(08:34:00)hook 已秒补, 但 2 秒后(08:34:02)系统又重建卡片
+// 并把 alpha 重置 —— 重置点落在"预登记之后、托盘首次布局之前"的缝隙, 事件驱动堵不死。
+// 终解: 每次卡片挂载/托盘重置触发一个 CADisplayLink 连扫窗口(3s), 逐帧检查已登记卡的
+// 托盘 alpha, 偏差当帧修正(60-120Hz) —— 任何时机的重置最多存活一帧(≈8-16ms), 视觉不可感知。
+// 屏幕熄灭时 DisplayLink 自动暂停(零功耗), 亮屏自动恢复。
+static CADisplayLink *sHNPMAlphaBurst = nil;
+static CFAbsoluteTime sHNPMAlphaBurstEnd = 0;
+static BOOL sHNPMAlphaBurstLogged = NO;
+
+@interface HNPMBurstTarget : NSObject
+@end
+@implementation HNPMBurstTarget
+- (void)onTick:(CADisplayLink *)dl {
+    @try {
+        CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
+        if (now > sHNPMAlphaBurstEnd) {
+            [dl invalidate];
+            if (sHNPMAlphaBurst == dl) sHNPMAlphaBurst = nil;
+            return;
+        }
+        int total = 0;
+        for (UIView *cell in [hnpmCardCells copy]) {
+            if (![cell isKindOfClass:[UIView class]]) continue;
+            @try { total += HNPMInstantPlatterAlpha(cell); } @catch (NSException *e) {}
+        }
+        if (total > 0) {
+            if (!sHNPMAlphaBurstLogged) {
+                sHNPMAlphaBurstLogged = YES;
+                HNPMAppendLog(@"[透明] 亮屏连扫补上(逐帧)");
+            }
+            sHNPMAlphaBurstEnd = CFAbsoluteTimeGetCurrent() + 1.0;   // 又发现重置 → 延长窗口
+        }
+    } @catch (NSException *e) {}
+}
+@end
+
+static HNPMBurstTarget *sHNPMAlphaBurstTarget = nil;
+
+static void HNPMStartAlphaBurst(void) {
+    if (![NSThread isMainThread]) {
+        dispatch_async(dispatch_get_main_queue(), ^{ HNPMStartAlphaBurst(); });
+        return;
+    }
+    sHNPMAlphaBurstEnd = CFAbsoluteTimeGetCurrent() + 3.0;
+    sHNPMAlphaBurstLogged = NO;
+    if (sHNPMAlphaBurst) return;   // 已在跑: 只续窗口
+    if (!sHNPMAlphaBurstTarget) return;
+    sHNPMAlphaBurst = [CADisplayLink displayLinkWithTarget:sHNPMAlphaBurstTarget selector:@selector(onTick:)];
+    [sHNPMAlphaBurst addToRunLoop:[NSRunLoop mainRunLoop] forMode:NSRunLoopCommonModes];
 }
 
 // 把登记卡的背景压到目标 alpha。
@@ -1838,6 +1902,7 @@ static void HNPMAttachPanIfNeeded(UIView *view) {
             if (p0) {
                 [hnpmCardCells addObject:p0];
                 HNPMInstantPlatterAlpha(p0);
+                HNPMStartAlphaBurst();   // v0.0.90: 挂载即启动逐帧连扫窗口
             }
         }
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.3 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
@@ -1895,6 +1960,7 @@ static void HNPMAttachPanIfNeeded(UIView *view) {
                 }
                 HNPMApplyCardLayout(YES);   // 登记/重建后重算补位
                 HNPMApplyCardBackgroundAlpha(cell, kind);   // v0.0.71: 背景材质层压透明(每次登记重申)
+                HNPMStartAlphaBurst();   // v0.0.90: 延迟登记应用后也开连扫窗口(覆盖重建缝隙期)
                 // v0.0.69: 在场卡的登记若与被抑制的实时活动身份匹配 → 解除岛抑制(活动重新呈现了)
                 if (!HNPMCardHiddenGet(cell) && !cell.hidden) {
                     HNPMClearActivitySuppressionIfMatch(cell, kind);
@@ -1973,7 +2039,7 @@ static void HNPMAttachPanIfNeeded(UIView *view) {
 #pragma mark - 入口
 
 __attribute__((constructor)) static void HNPMRawCtor(void) {
-    HNPMAppendLog(@"v0.0.89: dylib 构造函数已执行(dyld 加载成功)");
+    HNPMAppendLog(@"v0.0.90: dylib 构造函数已执行(dyld 加载成功)");
 }
 
 // v0.0.50/51: 岛元素抑制策略钩子 — 隐藏期让系统把 NowPlaying 元素当作"应被抑制",
@@ -2036,7 +2102,7 @@ __attribute__((constructor)) static void HNPMRawCtor(void) {
 
 %ctor {
     @autoreleasepool {
-        HNPMAppendLog(@"v0.0.89: logos %ctor 进入");
+        HNPMAppendLog(@"v0.0.90: logos %ctor 进入");
 
         if ([[NSFileManager defaultManager] fileExistsAtPath:@"/var/mobile/Documents/HideNowPlaying.off"]) {
             HNPMAppendLog(@"检测到开关文件 HideNowPlaying.off, 不注册任何 hook");
@@ -2049,6 +2115,7 @@ __attribute__((constructor)) static void HNPMRawCtor(void) {
         hnpmElementTable = [NSHashTable weakObjectsHashTable];
         hnpmActivityTable = [NSHashTable weakObjectsHashTable];   // v0.0.69: activity: 实时活动元素跟踪
         hnpmPanTarget = [[HNPMPanTarget alloc] init];
+        sHNPMAlphaBurstTarget = [[HNPMBurstTarget alloc] init];   // v0.0.90: 亮屏逐帧连扫
 
         // v0.0.66: 宽限期时间基准 — 15 秒内岛侧模式动态评估(防 tweak 加载顺序竞态:
         // HideNowPlaying 按文件名先于 NativeIsland 注入, %ctor 时其 dylib 尚未加载)
@@ -2114,7 +2181,7 @@ __attribute__((constructor)) static void HNPMRawCtor(void) {
         CFNotificationCenterAddObserver(CFNotificationCenterGetDarwinNotifyCenter(), NULL,
                                         HNPMPrefsChangedCB, CFSTR("com.aha.hidenowplaying/prefschanged"),
                                         NULL, CFNotificationSuspensionBehaviorDeliverImmediately);
-        HNPMAppendLog(@"v0.0.89: 设置面板通知观察者已挂");
-        HNPMAppendLog(@"v0.0.89: %ctor 正常完成");
+        HNPMAppendLog(@"v0.0.90: 设置面板通知观察者已挂");
+        HNPMAppendLog(@"v0.0.90: %ctor 正常完成");
     }
 }
