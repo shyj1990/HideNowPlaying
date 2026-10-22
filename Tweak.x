@@ -87,7 +87,7 @@ static void HNPMSetHidden(BOOL hide, NSString *reason, BOOL linkIsland);
 static BOOL HNPMPrefSwipeHide(void);   // v0.0.87: 前置声明(设置面板"锁屏左滑隐藏"总闸, 定义在后)
 static void HNPMStartRestorePolling(void);
 static void HNPMStartAlphaBurst(void);   // v0.0.90: 前置声明(亮屏逐帧连扫窗口, 定义在透明区)
-static void HNPMDeepDumpOnce(UIView *cell);   // v0.0.94: 前置声明(深诊断 dump, 定义在屏幕状态CB之后)
+static void HNPMScheduleDeepDumps(void);   // v0.0.95: 前置声明(时序化深诊断, 定义在屏幕状态CB之后)
 
 #pragma mark - 日志
 
@@ -806,15 +806,26 @@ static UIView *HNPMPlatterBgView(UIView *platter, NSString **viaOut) {
 
 // v0.0.88: 对单个托盘重申目标 alpha(bg 子层优先, 无 bg 退回整托盘)。
 // 返回实际发生的改动数(0 = 已是目标值, 零成本空转)。
+// v0.0.95: alpha 写入统一禁用隐式动画(CATransaction) — off 对照 + 0.7 滑条实验表明:
+//          歌词变暗与 alpha 数值无关(0.25/0.7 都暗、原生 1.0 不暗) → 诱因是"写入"本身:
+//          对材质的带动画属性写入可能促使系统重配置托盘/重挂远端场景宿主
+//          (v0.0.94 深诊断实锤 dump 瞬间材质容器 h=1、场景宿主 a=0.00 h=1 = 重挂中间态)。
+static void HNPMSetAlphaNoAnim(UIView *v, CGFloat a) {
+    [CATransaction begin];
+    [CATransaction setDisableActions:YES];
+    v.layer.opacity = a;
+    [CATransaction commit];
+}
+
 static int HNPMPlatterApplyBg(UIView *platter, CGFloat a) {
     int hits = 0;
     NSString *via = @"";
     UIView *bg = HNPMPlatterBgView(platter, &via);
     if (bg) {
-        if (fabs(bg.alpha - a) > 0.01) { bg.alpha = a; hits++; }
+        if (fabs(bg.alpha - a) > 0.01) { HNPMSetAlphaNoAnim(bg, a); hits++; }
     } else {
         // 托盘无背景子层(罕见) → 整托盘淡化(旧路兜底, 内容会连带)
-        if (fabs(platter.alpha - a) > 0.01) { platter.alpha = a; hits++; }
+        if (fabs(platter.alpha - a) > 0.01) { HNPMSetAlphaNoAnim(platter, a); hits++; }
     }
     return hits;
 }
@@ -951,20 +962,15 @@ static int sHNPMAlphaBurstStable = 0;         // v0.0.92: 稳定门 — 连续�
                 if (fabs(cur - a) > 0.01 && sHNPMAlphaBurstStable >= 1) {
                     sHNPMAlphaBurstStable = 0;
                     int total = 0;
-                    UIView *dumpCell = nil;   // v0.0.94: 首个实际修正的卡 → 深诊断对象
                     for (UIView *cell in [hnpmCardCells copy]) {
                         if (![cell isKindOfClass:[UIView class]]) continue;
-                        int c = 0;
-                        @try { c = HNPMInstantPlatterAlpha(cell); } @catch (NSException *e) {}
-                        if (c > 0 && !dumpCell) dumpCell = cell;
-                        total += c;
+                        @try { total += HNPMInstantPlatterAlpha(cell); } @catch (NSException *e) {}
                     }
                     if (total > 0) {
                         if (!sHNPMAlphaBurstLogged) {
                             sHNPMAlphaBurstLogged = YES;
                             HNPMAppendLog(@"[透明] 连扫修正(稳定偏差, 帧边界写入)");
                         }
-                        HNPMDeepDumpOnce(dumpCell);   // v0.0.94: 每次亮/灭屏后仅一次
                         sHNPMAlphaBurstEnd = CFAbsoluteTimeGetCurrent() + 1.0;   // 又发现重置 → 延长窗口
                     }
                 }
@@ -997,28 +1003,32 @@ static void HNPMStartAlphaBurst(void) {
 //          "亮屏第一眼有时透明有时不透明"。
 //          补法: 订阅系统亮屏/锁屏 darwin 通知(hasBlankedScreen + lockstate),
 //          亮屏瞬间立即开连扫窗口, 与首帧渲染几乎同帧, 视觉无缝。
-static BOOL sHNPMDeepDumpArmed = NO;   // v0.0.94: 深诊断待触发(屏幕状态切换后武装, 首次修正时消耗)
-
 static void HNPMScreenStateCB(CFNotificationCenterRef center, void *observer,
                               CFStringRef name, const void *object, CFDictionaryRef userInfo) {
     HNPMAppendLog([NSString stringWithFormat:@"[透明] 屏幕状态通知(%@) → 连扫窗口开启",
                    (__bridge NSString *)name]);
     HNPMStartAlphaBurst();
-    sHNPMDeepDumpArmed = YES;   // v0.0.94: 本次亮/灭屏后的首次修正时做一次全树深诊断
+    HNPMScheduleDeepDumps();   // v0.0.95: 每次亮/灭屏排程时序化深诊断
 }
 
-// v0.0.94: 深诊断 — off 对照实锤「歌词行亮屏暗 ~1s 后亮」由插件引发, 但内容层我们从未写入过。
-//          历次诊断均未看过 Remote 子树内部, 且特征扫描只认时间格式文本 — 歌词 UILabel 若为
-//          本地视图(如 vibrancy 效果挂在材质上)此前完全不可见。此处一次性全树 dump(含 Remote):
-//          类名/alpha/hidden/UILabel 文本(截断)/特效视图标记 — 定位歌词视图归属。
-static void HNPMDeepDumpOnce(UIView *cell) {
-    if (!sHNPMDeepDumpArmed || !cell) return;
-    sHNPMDeepDumpArmed = NO;
+// v0.0.95: 时序化深诊断 — v0.0.94 一次性 dump 实锤 dump 瞬间材质容器 h=1、场景宿主 a=0.00 h=1,
+//          但单帧无法判断可见化时序。改为亮/灭屏后 0.3/0.8/1.5/2.5s 各 dump 一次(只读),
+//          并加 presentation 层 opacity(p=)捕捉动画中的值 — 对齐歌词变暗窗口与重挂时序。
+static void HNPMDeepDumpAt(NSString *tag) {
+    if (![NSThread isMainThread]) return;
     @try {
+        UIView *cell = nil;
+        for (UIView *c in [hnpmCardCells copy]) {
+            if ([c isKindOfClass:[UIView class]] && c.window) { cell = c; break; }
+        }
+        if (!cell) {
+            HNPMAppendLog([NSString stringWithFormat:@"[透明·深诊断@%@] 无在场登记卡", tag]);
+            return;
+        }
         NSMutableArray *rows = [NSMutableArray array];
         NSMutableArray *stack = [NSMutableArray arrayWithObject:cell];
         int guard = 0;
-        while (stack.count > 0 && guard++ < 200 && rows.count < 70) {
+        while (stack.count > 0 && guard++ < 200 && rows.count < 40) {
             UIView *v = stack.firstObject;
             [stack removeObjectAtIndex:0];
             if (!v) continue;
@@ -1030,13 +1040,22 @@ static void HNPMDeepDumpOnce(UIView *cell) {
                 extra = [NSString stringWithFormat:@" text=%@", t];
             }
             if ([v isKindOfClass:[UIVisualEffectView class]]) extra = [extra stringByAppendingString:@" <EFX>"];
-            [rows addObject:[NSString stringWithFormat:@"%@ a=%.2f h=%d%@",
-                             cls, v.alpha, v.hidden ? 1 : 0, extra]];
+            CALayer *pl = (CALayer *)v.layer.presentationLayer;
+            CGFloat pop = pl ? pl.opacity : -1.0;
+            [rows addObject:[NSString stringWithFormat:@"%@ a=%.2f p=%.2f h=%d%@",
+                             cls, v.alpha, pop, v.hidden ? 1 : 0, extra]];
             [stack addObjectsFromArray:v.subviews];
         }
-        HNPMAppendLog([NSString stringWithFormat:@"[透明·深诊断] %lu视图: %@",
-                       (unsigned long)rows.count, [rows componentsJoinedByString:@" || "]]);
+        HNPMAppendLog([NSString stringWithFormat:@"[透明·深诊断@%@] %lu视图: %@",
+                       tag, (unsigned long)rows.count, [rows componentsJoinedByString:@" || "]]);
     } @catch (NSException *e) {}
+}
+
+static void HNPMScheduleDeepDumps(void) {
+    for (NSString *d in @[@"0.3", @"0.8", @"1.5", @"2.5"]) {
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)([d doubleValue] * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{ @try { HNPMDeepDumpAt(d); } @catch (NSException *e) {} });
+    }
 }
 
 // v0.0.93: 空闲巡逻 — 连扫窗口只覆盖事件后 3s; 若系统在"无任何布局/挂载事件"的空闲期
@@ -2173,7 +2192,7 @@ static void HNPMAttachPanIfNeeded(UIView *view) {
 #pragma mark - 入口
 
 __attribute__((constructor)) static void HNPMRawCtor(void) {
-    HNPMAppendLog(@"v0.0.94: dylib 构造函数已执行(dyld 加载成功)");
+    HNPMAppendLog(@"v0.0.95: dylib 构造函数已执行(dyld 加载成功)");
 }
 
 // v0.0.50/51: 岛元素抑制策略钩子 — 隐藏期让系统把 NowPlaying 元素当作"应被抑制",
@@ -2236,7 +2255,7 @@ __attribute__((constructor)) static void HNPMRawCtor(void) {
 
 %ctor {
     @autoreleasepool {
-        HNPMAppendLog(@"v0.0.94: logos %ctor 进入");
+        HNPMAppendLog(@"v0.0.95: logos %ctor 进入");
 
         if ([[NSFileManager defaultManager] fileExistsAtPath:@"/var/mobile/Documents/HideNowPlaying.off"]) {
             HNPMAppendLog(@"检测到开关文件 HideNowPlaying.off, 不注册任何 hook");
@@ -2326,7 +2345,7 @@ __attribute__((constructor)) static void HNPMRawCtor(void) {
         HNPMAppendLog(@"v0.0.92: 设置面板通知观察者已挂");
         // v0.0.93: 空闲巡逻(0.5s 只读一次, 无在场卡自动停) — 堵"空闲期静默重置无事件触发"盲区
         HNPMIdleAlphaCheck();
-        HNPMAppendLog(@"v0.0.94: 空闲巡逻已启动");
-        HNPMAppendLog(@"v0.0.94: %ctor 正常完成");
+        HNPMAppendLog(@"v0.0.95: 空闲巡逻已启动");
+        HNPMAppendLog(@"v0.0.95: %ctor 正常完成");
     }
 }
