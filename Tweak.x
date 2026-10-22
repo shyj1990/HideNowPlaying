@@ -776,6 +776,66 @@ static void HNPMPlatterDiagDump(UIView *platter, UIView *bg, NSString *via) {
     } @catch (NSException *e) {}
 }
 
+// v0.0.88: 取托盘的背景子层(KVC backgroundView → backgroundMaterialView), 登记路径与亮屏重申共用
+static UIView *HNPMPlatterBgView(UIView *platter, NSString **viaOut) {
+    NSString *via = @"";
+    UIView *bg = nil;
+    @try {
+        id x = [platter valueForKey:@"backgroundView"];
+        if ([x isKindOfClass:[UIView class]]) { bg = x; via = @"backgroundView"; }
+    } @catch (NSException *e) {}
+    if (!bg) {
+        @try {
+            id x = [platter valueForKey:@"backgroundMaterialView"];
+            if ([x isKindOfClass:[UIView class]]) { bg = x; via = @"backgroundMaterialView"; }
+        } @catch (NSException *e) {}
+    }
+    if (viaOut) *viaOut = via;
+    return bg;
+}
+
+// v0.0.88: 对单个托盘重申目标 alpha(bg 子层优先, 无 bg 退回整托盘)。
+// 返回实际发生的改动数(0 = 已是目标值, 零成本空转)。
+static int HNPMPlatterApplyBg(UIView *platter, CGFloat a) {
+    int hits = 0;
+    NSString *via = @"";
+    UIView *bg = HNPMPlatterBgView(platter, &via);
+    if (bg) {
+        if (fabs(bg.alpha - a) > 0.01) { bg.alpha = a; hits++; }
+    } else {
+        // 托盘无背景子层(罕见) → 整托盘淡化(旧路兜底, 内容会连带)
+        if (fabs(platter.alpha - a) > 0.01) { platter.alpha = a; hits++; }
+    }
+    return hits;
+}
+
+// v0.0.88: 亮屏重申 — 真机实锤: 锁屏亮屏后系统会重建/重置锁屏托盘(PLPlatterView),
+//          背景透明度被冲回 1.0, 而旧逻辑只在登记/恢复/1s重试路径重申 → 亮屏后约 1s 才变透。
+//          修复: hook 托盘的 didMoveToWindow/layoutSubviews, 已登记卡的托盘一旦 alpha 异
+//          立即补上(布局回调高频, 但 fabs 差值判断保证已是目标值时零成本)。
+static void HNPMPlatterReapplyOnLayout(UIView *platter) {
+    if (![NSThread isMainThread]) return;
+    @try {
+        CGFloat a = HNPMBgAlpha();
+        if (a >= 0.99) return;   // 1.0 = 功能关闭
+        // 只处理已登记卡的托盘: 沿祖先链找登记表命中(≤12 级足够)
+        UIView *p = platter;
+        UIView *cell = nil;
+        int guard = 0;
+        while (p && guard++ < 12) {
+            if ([hnpmCardCells containsObject:p]) { cell = p; break; }
+            p = p.superview;
+        }
+        if (!cell || cell.hidden || HNPMCardHiddenGet(cell) || !cell.window) return;
+        int hits = HNPMPlatterApplyBg(platter, a);
+        if (hits > 0) {
+            HNPMAlphaRetrySet(cell, 0);
+            if (fabs(cell.alpha - 1.0) > 0.01) cell.alpha = 1.0;   // 撤销整卡淡化兜底
+            HNPMAppendLog(@"[透明] 托盘重申(系统重置后即时补)");
+        }
+    } @catch (NSException *e) {}
+}
+
 // 把登记卡的背景压到目标 alpha。
 // v0.0.72: 真机实锤卡内子树没有 UIVisualEffectView(白底不在卡里)。
 // v0.0.74: 头文件实锤(iOS17 运行时头, CoverSheet/UserNotificationsUIKit/PlatterKit) —
@@ -808,24 +868,15 @@ static void HNPMApplyCardBackgroundAlpha(UIView *cell, int kind) {
                         // v0.0.75: 只压托盘的"背景子层" — 真机实测(v0.0.74)压整个托盘时内容
                         //          (customContentView 里的 hostedView)被连带淡化 = 幽灵卡复现。
                         //          头文件分层: backgroundView(白底材质) / customContentView(内容)。
-                        UIView *bg = nil; NSString *via = @"";
-                        @try {
-                            id x = [v valueForKey:@"backgroundView"];
-                            if ([x isKindOfClass:[UIView class]]) { bg = x; via = @"backgroundView"; }
-                        } @catch (NSException *e) {}
-                        if (!bg) {
-                            @try {
-                                id x = [v valueForKey:@"backgroundMaterialView"];
-                                if ([x isKindOfClass:[UIView class]]) { bg = x; via = @"backgroundMaterialView"; }
-                            } @catch (NSException *e) {}
-                        }
+                        // v0.0.88: 背景子层提取/重申下沉为共用函数(亮屏 hook 同源, 保证行为一致)
+                        NSString *via = @"";
+                        UIView *bg = HNPMPlatterBgView(v, &via);
                         if (bg) {
                             if (fabs(bg.alpha - a) > 0.01) bg.alpha = a;
                             [touched addObject:bg];
                             pHits++; pVia = via;
                             HNPMPlatterDiagDump(v, bg, via);
                         } else {
-                            // 托盘无背景子层(罕见) → 整托盘淡化(旧路兜底, 内容会连带)
                             if (fabs(v.alpha - a) > 0.01) v.alpha = a;
                             [touched addObject:v];
                             pHits++; pVia = @"整托盘";
@@ -1817,6 +1868,23 @@ static void HNPMAttachPanIfNeeded(UIView *view) {
 
 // 灵动岛: 元素内容视图(锁图标+媒体图标)
 
+// v0.0.88: 亮屏后系统重建/重置锁屏托盘冲掉透明度 → 托盘挂载/布局时即时重申
+//         (真实触发点以真机日志为准; didMoveToWindow 覆盖重建, layoutSubviews 覆盖复用与重排)
+@interface PLPlatterView : UIView @end
+
+%group HNPMPlatterReset
+%hook PLPlatterView
+- (void)didMoveToWindow {
+    %orig;
+    @try { HNPMPlatterReapplyOnLayout(self); } @catch (NSException *e) {}
+}
+- (void)layoutSubviews {
+    %orig;
+    @try { HNPMPlatterReapplyOnLayout(self); } @catch (NSException *e) {}
+}
+%end
+%end
+
 %group HNPMIslandElement
 %hook _SAUIElementViewContentView
 - (void)didMoveToWindow {
@@ -1865,7 +1933,7 @@ static void HNPMAttachPanIfNeeded(UIView *view) {
 #pragma mark - 入口
 
 __attribute__((constructor)) static void HNPMRawCtor(void) {
-    HNPMAppendLog(@"v0.0.87: dylib 构造函数已执行(dyld 加载成功)");
+    HNPMAppendLog(@"v0.0.88: dylib 构造函数已执行(dyld 加载成功)");
 }
 
 // v0.0.50/51: 岛元素抑制策略钩子 — 隐藏期让系统把 NowPlaying 元素当作"应被抑制",
@@ -1928,7 +1996,7 @@ __attribute__((constructor)) static void HNPMRawCtor(void) {
 
 %ctor {
     @autoreleasepool {
-        HNPMAppendLog(@"v0.0.87: logos %ctor 进入");
+        HNPMAppendLog(@"v0.0.88: logos %ctor 进入");
 
         if ([[NSFileManager defaultManager] fileExistsAtPath:@"/var/mobile/Documents/HideNowPlaying.off"]) {
             HNPMAppendLog(@"检测到开关文件 HideNowPlaying.off, 不注册任何 hook");
@@ -1986,6 +2054,8 @@ __attribute__((constructor)) static void HNPMRawCtor(void) {
         HNPMPassiveListenB();
 
         if (objc_getClass("CSActivityItemContentView"))      { %init(HNPMActivityCard); HNPMAppendLog(@"hook 已注册: 媒体卡片(高度>=150 过滤)"); }
+        // v0.0.88: 托盘透明重申 hook(PLPlatterView 不一定在所有注入进程都存在, 存在才注册)
+        if (objc_getClass("PLPlatterView"))                  { %init(HNPMPlatterReset); HNPMAppendLog(@"hook 已注册: 托盘透明重申(PLPlatterView 亮屏防冲掉)"); }
         // v0.0.66: 岛相关 hook 全部无条件注册, 行为由调用层闸门按岛侧模式动态拦截
         // (注册时机≠行为时机 — NativeIsland 无论先后加载, 宽限期终判后闸门即正确)
         if (objc_getClass("_SAUIElementViewContentView"))    { %init(HNPMIslandElement); }
@@ -2004,7 +2074,7 @@ __attribute__((constructor)) static void HNPMRawCtor(void) {
         CFNotificationCenterAddObserver(CFNotificationCenterGetDarwinNotifyCenter(), NULL,
                                         HNPMPrefsChangedCB, CFSTR("com.aha.hidenowplaying/prefschanged"),
                                         NULL, CFNotificationSuspensionBehaviorDeliverImmediately);
-        HNPMAppendLog(@"v0.0.87: 设置面板通知观察者已挂");
-        HNPMAppendLog(@"v0.0.87: %ctor 正常完成");
+        HNPMAppendLog(@"v0.0.88: 设置面板通知观察者已挂");
+        HNPMAppendLog(@"v0.0.88: %ctor 正常完成");
     }
 }

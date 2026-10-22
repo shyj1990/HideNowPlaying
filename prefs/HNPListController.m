@@ -181,14 +181,14 @@ static Ivar HNPSpecIvar(void) {
         id cur = iv ? object_getIvar(self, iv) : nil;
         if (cur != _specs) {
             [self setSpecifiers:_specs];
-            HNPPrefsLog(@"v0.0.87 缓存命中 → setSpecifiers 补写回(后台恢复)");
+            HNPPrefsLog(@"v0.0.88 缓存命中 → setSpecifiers 补写回(后台恢复)");
         }
         return _specs;
     }
     _specs = @[];   // v0.0.87: 先占位, 防 setSpecifiers: 内部重入
     [self setTitle:@"HideNowPlaying"];
     NSMutableArray *m = [NSMutableArray array];
-    HNPPrefsLog(@"v0.0.87 specifiers 构建: 开始");
+    HNPPrefsLog(@"v0.0.88 specifiers 构建: 开始");
 
     Class PSS = [PSSpecifier class];
     // v0.0.81: 类方法全部运行时存在性检查 — 不存在即降级(不再可能 unrecognized selector 闪退)
@@ -212,14 +212,14 @@ static Ivar HNPSpecIvar(void) {
                  forKey:@"footerText"];
         [m addObject:g1];
     }
-    HNPPrefsLog(@"v0.0.87 specifiers 构建: group1 完成");
+    HNPPrefsLog(@"v0.0.88 specifiers 构建: group1 完成");
 
     // v0.0.87: 开关必须 target+自定义读写 — iOS17 PSSwitchCell 在无 get/set 时呈禁用灰态(真机实锤)
     PSSpecifier *sw = [PSS preferenceSpecifierNamed:@"锁屏左滑隐藏"
             target:self set:@selector(setSwipeHide:forSpecifier:) get:@selector(swipeHideForSpecifier:)
             detail:nil cell:6 edit:nil];
     [m addObject:sw];
-    HNPPrefsLog(@"v0.0.87 specifiers 构建: 开关完成(target+自定义读写)");
+    HNPPrefsLog(@"v0.0.88 specifiers 构建: 开关完成(target+自定义读写)");
 
     if (hasGroup) {
         PSSpecifier *g2 = [PSS groupSpecifierWithName:nil];
@@ -247,7 +247,7 @@ static Ivar HNPSpecIvar(void) {
     // 只 return 不写入 = 上游拿到数组但表格按 nil 渲染 → 空白页
     [self setSpecifiers:m];
     _specs = m;
-    HNPPrefsLog(@"v0.0.87 specifiers 构建完成(已 setSpecifiers)");
+    HNPPrefsLog(@"v0.0.88 specifiers 构建完成(已 setSpecifiers)");
     return m;
 }
 
@@ -256,6 +256,6 @@ static Ivar HNPSpecIvar(void) {
 __attribute__((constructor))
 static void HNPPrefsBundleCtor(void) {
     @autoreleasepool {
-        HNPPrefsLog(@"v0.0.87 bundle ctor 进入(编译期子类+防御版)");
+        HNPPrefsLog(@"v0.0.88 bundle ctor 进入(编译期子类+防御版)");
     }
 }
