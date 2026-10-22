@@ -998,6 +998,29 @@ static void HNPMScreenStateCB(CFNotificationCenterRef center, void *observer,
     HNPMStartAlphaBurst();
 }
 
+// v0.0.93: 空闲巡逻 — 连扫窗口只覆盖事件后 3s; 若系统在"无任何布局/挂载事件"的空闲期
+//          静默重置 alpha(锁屏静置时布局 pass 极少), 侦测 hook 不会触发 → 卡片不透明
+//          直到下一个事件(可能数秒)。补法: 0.5s 一次**只读**巡逻(有在场登记卡才继续),
+//          发现漂移只开连扫窗口(修正仍走稳定门+帧边界, 零对抗); 无卡自动停(解锁/停播)。
+static void HNPMIdleAlphaCheck(void) {
+    if (![NSThread isMainThread]) {
+        dispatch_async(dispatch_get_main_queue(), ^{ HNPMIdleAlphaCheck(); });
+        return;
+    }
+    @try {
+        CGFloat cur = HNPMCardPlatterBgAlphaRead();
+        if (cur >= 0) {   // 有在场登记卡才巡逻
+            CGFloat a = HNPMBgAlpha();
+            if (a < 0.99 && fabs(cur - a) > 0.01) {
+                HNPMStartAlphaBurst();   // 只开窗不写: 修正走连扫稳定门
+            }
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)),
+                           dispatch_get_main_queue(), ^{ @try { HNPMIdleAlphaCheck(); } @catch (NSException *e) {} });
+        }
+        // 无卡 → 不再排下一次(解锁/停播自动停)
+    } @catch (NSException *e) {}
+}
+
 // 把登记卡的背景压到目标 alpha。
 // v0.0.72: 真机实锤卡内子树没有 UIVisualEffectView(白底不在卡里)。
 // v0.0.74: 头文件实锤(iOS17 运行时头, CoverSheet/UserNotificationsUIKit/PlatterKit) —
@@ -2109,7 +2132,7 @@ static void HNPMAttachPanIfNeeded(UIView *view) {
 #pragma mark - 入口
 
 __attribute__((constructor)) static void HNPMRawCtor(void) {
-    HNPMAppendLog(@"v0.0.92: dylib 构造函数已执行(dyld 加载成功)");
+    HNPMAppendLog(@"v0.0.93: dylib 构造函数已执行(dyld 加载成功)");
 }
 
 // v0.0.50/51: 岛元素抑制策略钩子 — 隐藏期让系统把 NowPlaying 元素当作"应被抑制",
@@ -2172,7 +2195,7 @@ __attribute__((constructor)) static void HNPMRawCtor(void) {
 
 %ctor {
     @autoreleasepool {
-        HNPMAppendLog(@"v0.0.92: logos %ctor 进入");
+        HNPMAppendLog(@"v0.0.93: logos %ctor 进入");
 
         if ([[NSFileManager defaultManager] fileExistsAtPath:@"/var/mobile/Documents/HideNowPlaying.off"]) {
             HNPMAppendLog(@"检测到开关文件 HideNowPlaying.off, 不注册任何 hook");
@@ -2260,6 +2283,9 @@ __attribute__((constructor)) static void HNPMRawCtor(void) {
                                         HNPMPrefsChangedCB, CFSTR("com.aha.hidenowplaying/prefschanged"),
                                         NULL, CFNotificationSuspensionBehaviorDeliverImmediately);
         HNPMAppendLog(@"v0.0.92: 设置面板通知观察者已挂");
-        HNPMAppendLog(@"v0.0.92: %ctor 正常完成");
+        // v0.0.93: 空闲巡逻(0.5s 只读一次, 无在场卡自动停) — 堵"空闲期静默重置无事件触发"盲区
+        HNPMIdleAlphaCheck();
+        HNPMAppendLog(@"v0.0.93: 空闲巡逻已启动");
+        HNPMAppendLog(@"v0.0.93: %ctor 正常完成");
     }
 }
