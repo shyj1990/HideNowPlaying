@@ -87,6 +87,7 @@ static void HNPMSetHidden(BOOL hide, NSString *reason, BOOL linkIsland);
 static BOOL HNPMPrefSwipeHide(void);   // v0.0.87: 前置声明(设置面板"锁屏左滑隐藏"总闸, 定义在后)
 static void HNPMStartRestorePolling(void);
 static void HNPMStartAlphaBurst(void);   // v0.0.90: 前置声明(亮屏逐帧连扫窗口, 定义在透明区)
+static void HNPMDeepDumpOnce(UIView *cell);   // v0.0.94: 前置声明(深诊断 dump, 定义在屏幕状态CB之后)
 
 #pragma mark - 日志
 
