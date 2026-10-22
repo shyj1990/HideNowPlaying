@@ -11,8 +11,10 @@
 // (UISlider + 实时数值标签, 拖动即写 CFPreferences 并 post darwin 通知)。
 
 // ---- 私有框架最小声明(仅编译期用, 不链接) ----
+// v0.0.80: groupSpecifierWithNamed:footerText: 是越狱生态 category, 原生不存在(iOS17 真机
+// 实锤 unrecognized selector 闪退) → 用原生 groupSpecifierWithName: + footerText 属性。
 @interface PSSpecifier : NSObject
-+ (id)groupSpecifierWithNamed:(NSString *)name footerText:(NSString *)footer;
++ (id)groupSpecifierWithName:(NSString *)name;
 + (id)preferenceSpecifierNamed:(NSString *)name target:(id)target set:(SEL)set get:(SEL)get detail:(id)detail cell:(NSInteger)cellType edit:(id)edit;
 - (void)setProperty:(id)property forKey:(NSString *)key;
 - (id)propertyForKey:(NSString *)key;
@@ -133,22 +135,54 @@ static Class HNPValCellClass(void) { return [HNPSliderCell class]; }
     if (_specs) return _specs;
     [self setTitle:@"HideNowPlaying"];
     NSMutableArray *m = [NSMutableArray array];
+    HNPPrefsLog(@"v0.0.82 specifiers 构建: 开始");
 
-    [m addObject:[PSSpecifier groupSpecifierWithNamed:@""
-            footerText:@"开启后，锁屏音乐卡/实时活动卡支持左滑隐藏并同步隐藏灵动岛；暂停后继续播放会自动恢复显示。关闭后左滑手势不再生效，若已隐藏会立即恢复。"]];
+    Class PSS = [PSSpecifier class];
+    // v0.0.82: 类方法全部运行时存在性检查 — 不存在即降级(不再可能 unrecognized selector 闪退)
+    BOOL hasGroup = [PSS respondsToSelector:@selector(groupSpecifierWithName:)];
+    BOOL hasPref = [PSS respondsToSelector:@selector(preferenceSpecifierNamed:target:set:get:detail:cell:edit:)];
+    HNPPrefsLog([NSString stringWithFormat:@"v0.0.82 方法检查: groupSpecifierWithName=%d preferenceSpecifierNamed=%d", hasGroup, hasPref]);
+    if (!hasPref) {
+        HNPPrefsLog(@"preferenceSpecifierNamed 不存在 → 返回空页(防崩)");
+        _specs = m;
+        return _specs;
+    }
 
-    PSSpecifier *sw = [PSSpecifier preferenceSpecifierNamed:@"锁屏左滑隐藏"
+    if (hasGroup) {
+        PSSpecifier *g1 = [PSS groupSpecifierWithName:nil];
+        [g1 setProperty:@"开启后，锁屏音乐卡/实时活动卡支持左滑隐藏并同步隐藏灵动岛；暂停后继续播放会自动恢复显示。关闭后左滑手势不再生效，若已隐藏会立即恢复。"
+                 forKey:@"footerText"];
+        [m addObject:g1];
+    } else {
+        PSSpecifier *g1 = [PSS preferenceSpecifierNamed:nil target:nil set:nil get:nil detail:nil cell:0 edit:nil];
+        [g1 setProperty:@"开启后，锁屏音乐卡/实时活动卡支持左滑隐藏并同步隐藏灵动岛；暂停后继续播放会自动恢复显示。关闭后左滑手势不再生效，若已隐藏会立即恢复。"
+                 forKey:@"footerText"];
+        [m addObject:g1];
+    }
+    HNPPrefsLog(@"v0.0.82 specifiers 构建: group1 完成");
+
+    PSSpecifier *sw = [PSS preferenceSpecifierNamed:@"锁屏左滑隐藏"
             target:nil set:nil get:nil detail:nil cell:1 edit:nil];
     [sw setProperty:HNPDomain forKey:@"defaults"];
     [sw setProperty:@"swipeHide" forKey:@"key"];
     [sw setProperty:@YES forKey:@"default"];
     [sw setProperty:HNPNotifName forKey:@"PostNotification"];
     [m addObject:sw];
+    HNPPrefsLog(@"v0.0.82 specifiers 构建: 开关完成");
 
-    [m addObject:[PSSpecifier groupSpecifierWithNamed:@""
-            footerText:@"卡片背景透明度：只淡化白色背景板，文字/封面不受影响。1.0 = 不透明(功能关闭)，0.05 = 接近全透。拖动即时生效。"]];
+    if (hasGroup) {
+        PSSpecifier *g2 = [PSS groupSpecifierWithName:nil];
+        [g2 setProperty:@"卡片背景透明度：只淡化白色背景板，文字/封面不受影响。1.0 = 不透明(功能关闭)，0.05 = 接近全透。拖动即时生效。"
+                 forKey:@"footerText"];
+        [m addObject:g2];
+    } else {
+        PSSpecifier *g2 = [PSS preferenceSpecifierNamed:nil target:nil set:nil get:nil detail:nil cell:0 edit:nil];
+        [g2 setProperty:@"卡片背景透明度：只淡化白色背景板，文字/封面不受影响。1.0 = 不透明(功能关闭)，0.05 = 接近全透。拖动即时生效。"
+                 forKey:@"footerText"];
+        [m addObject:g2];
+    }
 
-    PSSpecifier *sl = [PSSpecifier preferenceSpecifierNamed:@"背景透明度"
+    PSSpecifier *sl = [PSS preferenceSpecifierNamed:@"背景透明度"
             target:nil set:nil get:nil detail:nil cell:4 edit:nil];
     [sl setProperty:@0.05 forKey:@"min"];
     [sl setProperty:@1.0 forKey:@"max"];
@@ -159,7 +193,7 @@ static Class HNPValCellClass(void) { return [HNPSliderCell class]; }
     [m addObject:sl];
 
     _specs = m;
-    HNPPrefsLog(@"specifiers 构建完成(代码构建)");
+    HNPPrefsLog(@"v0.0.82 specifiers 构建完成");
     return _specs;
 }
 
@@ -168,6 +202,6 @@ static Class HNPValCellClass(void) { return [HNPSliderCell class]; }
 __attribute__((constructor))
 static void HNPPrefsBundleCtor(void) {
     @autoreleasepool {
-        HNPPrefsLog(@"bundle ctor 进入(编译期子类版)");
+        HNPPrefsLog(@"v0.0.82 bundle ctor 进入(编译期子类+防御版)");
     }
 }
