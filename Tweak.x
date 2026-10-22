@@ -930,6 +930,19 @@ static void HNPMStartAlphaBurst(void) {
     [sHNPMAlphaBurst addToRunLoop:[NSRunLoop mainRunLoop] forMode:NSRunLoopCommonModes];
 }
 
+// v0.0.91: 亮屏盲区补漏 — v0.0.90 真机毫秒日志实锤: 系统每隔几秒随机重置一次 bg alpha
+//          (连扫均当帧修掉), 但若重置恰好发生在"亮屏瞬间、任何触发点出现之前"
+//          (旧卡未重建/无布局/无挂载), 连扫窗口不在跑 → 首帧不透明, 等 ~1s 重建才修 →
+//          "亮屏第一眼有时透明有时不透明"。
+//          补法: 订阅系统亮屏/锁屏 darwin 通知(hasBlankedScreen + lockstate),
+//          亮屏瞬间立即开连扫窗口, 与首帧渲染几乎同帧, 视觉无缝。
+static void HNPMScreenStateCB(CFNotificationCenterRef center, void *observer,
+                              CFStringRef name, const void *object, CFDictionaryRef userInfo) {
+    HNPMAppendLog([NSString stringWithFormat:@"[透明] 屏幕状态通知(%@) → 连扫窗口开启",
+                   (__bridge NSString *)name]);
+    HNPMStartAlphaBurst();
+}
+
 // 把登记卡的背景压到目标 alpha。
 // v0.0.72: 真机实锤卡内子树没有 UIVisualEffectView(白底不在卡里)。
 // v0.0.74: 头文件实锤(iOS17 运行时头, CoverSheet/UserNotificationsUIKit/PlatterKit) —
@@ -2040,7 +2053,7 @@ static void HNPMAttachPanIfNeeded(UIView *view) {
 #pragma mark - 入口
 
 __attribute__((constructor)) static void HNPMRawCtor(void) {
-    HNPMAppendLog(@"v0.0.90: dylib 构造函数已执行(dyld 加载成功)");
+    HNPMAppendLog(@"v0.0.91: dylib 构造函数已执行(dyld 加载成功)");
 }
 
 // v0.0.50/51: 岛元素抑制策略钩子 — 隐藏期让系统把 NowPlaying 元素当作"应被抑制",
@@ -2103,7 +2116,7 @@ __attribute__((constructor)) static void HNPMRawCtor(void) {
 
 %ctor {
     @autoreleasepool {
-        HNPMAppendLog(@"v0.0.90: logos %ctor 进入");
+        HNPMAppendLog(@"v0.0.91: logos %ctor 进入");
 
         if ([[NSFileManager defaultManager] fileExistsAtPath:@"/var/mobile/Documents/HideNowPlaying.off"]) {
             HNPMAppendLog(@"检测到开关文件 HideNowPlaying.off, 不注册任何 hook");
@@ -2178,11 +2191,19 @@ __attribute__((constructor)) static void HNPMRawCtor(void) {
                            HNPMIslandModeName(m),
                            (m == 2) ? @"未检出" : @"已检出/强制"]);
         });
+        // v0.0.91: 亮屏/锁屏通知 → 亮屏瞬间开连扫窗口(覆盖"重置先于一切触发点"的盲区)
+        CFNotificationCenterAddObserver(CFNotificationCenterGetDarwinNotifyCenter(), NULL,
+                                        HNPMScreenStateCB, CFSTR("com.apple.springboard.hasBlankedScreen"),
+                                        NULL, CFNotificationSuspensionBehaviorDeliverImmediately);
+        CFNotificationCenterAddObserver(CFNotificationCenterGetDarwinNotifyCenter(), NULL,
+                                        HNPMScreenStateCB, CFSTR("com.apple.springboard.lockstate"),
+                                        NULL, CFNotificationSuspensionBehaviorDeliverImmediately);
+        HNPMAppendLog(@"v0.0.91: 屏幕状态通知观察者已挂");
         // v0.0.87: 设置面板(设置 → HideNowPlaying) — 改动即时生效(darwin 通知 → 清缓存/应用开关)
         CFNotificationCenterAddObserver(CFNotificationCenterGetDarwinNotifyCenter(), NULL,
                                         HNPMPrefsChangedCB, CFSTR("com.aha.hidenowplaying/prefschanged"),
                                         NULL, CFNotificationSuspensionBehaviorDeliverImmediately);
-        HNPMAppendLog(@"v0.0.90: 设置面板通知观察者已挂");
-        HNPMAppendLog(@"v0.0.90: %ctor 正常完成");
+        HNPMAppendLog(@"v0.0.91: 设置面板通知观察者已挂");
+        HNPMAppendLog(@"v0.0.91: %ctor 正常完成");
     }
 }
