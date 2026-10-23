@@ -1202,6 +1202,32 @@ static int HNPMCoverApplyOnMaterial(UIView *mat, CGFloat a, BOOL hideMat) {
                     } @catch (NSException *e) {}
                 }
             }
+            // v0.1.18: 清托盘 layer 背景色 — 视频+dump 联合裁决: 白底窗口期视图树完全健康
+            //          (MTM 已隐藏/无存活 backdrop), 白底来自视图 dump 不可见的层属性。
+            //          经典模式实证卡可全透明 → 托盘 layer 背景本应为透明, 罩层模式下
+            //          亮屏期若被系统设了白色背景, 就在每次应用时清掉(幂等)。
+            {
+                Class p2Cls = NSClassFromString(@"PLPlatterView");
+                UIView *p2 = mat;
+                int g2i = 0;
+                while (p2 && g2i++ < 6) {
+                    if (p2Cls && [p2 isKindOfClass:p2Cls]) break;
+                    p2 = p2.superview;
+                }
+                if (p2 && p2Cls && [p2 isKindOfClass:p2Cls] && p2.layer.backgroundColor) {
+                    CGColorRef oldBg = p2.layer.backgroundColor;
+                    BOOL isClear = (CGColorGetAlpha(oldBg) < 0.01);
+                    if (!isClear) {
+                        const CGFloat *ocp = CGColorGetComponents(oldBg);
+                        size_t onc = CGColorGetNumberOfComponents(oldBg);
+                        NSMutableString *bs = [NSMutableString string];
+                        for (size_t i = 0; i < onc && i < 4; i++) [bs appendFormat:@"%.2f,", ocp[i]];
+                        p2.layer.backgroundColor = [UIColor clearColor].CGColor;
+                        HNPMAppendLog([NSString stringWithFormat:@"[透明·罩层] 已清托盘 layer 背景色(bg=%@)", bs]);
+                        hits++;
+                    }
+                }
+            }
         }
     } @catch (NSException *e) {}
     return hits;
@@ -1311,7 +1337,7 @@ static void HNPMCoversWakeSweep(void) {
         CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
         if (now - sHNPMCoversSweepDiag > 0.5) {
             sHNPMCoversSweepDiag = now;
-            HNPMAppendLog([NSString stringWithFormat:@"[透明·亮屏扫 v0.1.16] 窗口%lu 托盘%d 单元%d[%@] 过门%d 改动%d",
+            HNPMAppendLog([NSString stringWithFormat:@"[透明·亮屏扫 v0.1.18] 窗口%lu 托盘%d 单元%d[%@] 过门%d 改动%d",
                            (unsigned long)windows.count, nPlatter, nCell,
                            [cellSizes componentsJoinedByString:@","], nGated, hits]);
         }
@@ -1808,6 +1834,18 @@ static void HNPMDeepDumpAt(NSString *tag) {
                 extra = [NSString stringWithFormat:@" text=%@", t];
             }
             if ([v isKindOfClass:[UIVisualEffectView class]]) extra = [extra stringByAppendingString:@" <EFX>"];
+            // v0.1.18: 层属性采集 — 视频裁决: 白底窗口期(亮屏后0~0.55s)视图树完全健康
+            //          (0.3s dump: MTM 已隐藏/无存活 backdrop/罩层在场) → 白底来自视图
+            //          dump 不可见的层属性。逐视图采集 layer.backgroundColor 与 contents。
+            CGColorRef bgc = v.layer.backgroundColor;
+            if (bgc) {
+                size_t nc = CGColorGetNumberOfComponents(bgc);
+                const CGFloat *cp = CGColorGetComponents(bgc);
+                NSMutableString *bs = [NSMutableString string];
+                for (size_t i = 0; i < nc && i < 4; i++) [bs appendFormat:@"%.2f,", cp[i]];
+                extra = [extra stringByAppendingFormat:@" bg=%@", bs];
+            }
+            if (v.layer.contents) extra = [extra stringByAppendingString:@" img"];
             CALayer *pl = (CALayer *)v.layer.presentationLayer;
             CGFloat pop = pl ? pl.opacity : -1.0;
             [rows addObject:[NSString stringWithFormat:@"%@ a=%.2f p=%.2f h=%d%@",
@@ -3112,7 +3150,7 @@ static void HNPMAttachPanIfNeeded(UIView *view) {
 #pragma mark - 入口
 
 __attribute__((constructor)) static void HNPMRawCtor(void) {
-    HNPMAppendLog(@"v0.1.17: dylib 构造函数已执行(dyld 加载成功)");
+    HNPMAppendLog(@"v0.1.18: dylib 构造函数已执行(dyld 加载成功)");
 }
 
 // v0.0.50/51: 岛元素抑制策略钩子 — 隐藏期让系统把 NowPlaying 元素当作"应被抑制",
@@ -3175,7 +3213,7 @@ __attribute__((constructor)) static void HNPMRawCtor(void) {
 
 %ctor {
     @autoreleasepool {
-        HNPMAppendLog(@"v0.1.17: logos %ctor 进入");
+        HNPMAppendLog(@"v0.1.18: logos %ctor 进入");
     HNPMAppendLog(HNPMCoverMode()
         ? @"[透明] 罩层模式 ON(HideNowPlaying.cover 存在 → 系统材质不动, 用自有 blur 罩层)"
         : @"[透明] 罩层模式 OFF(经典 alpha 模式; 建 /var/mobile/Documents/HideNowPlaying.cover 可切换)");
@@ -3273,7 +3311,7 @@ __attribute__((constructor)) static void HNPMRawCtor(void) {
         // v0.0.93: 空闲巡逻(0.5s 只读一次, 无在场卡自动停) — 堵"空闲期静默重置无事件触发"盲区
         HNPMIdleAlphaCheck();
         HNPMHookBackdrop();
-        HNPMAppendLog(@"v0.1.17: 空闲巡逻已启动");
-        HNPMAppendLog(@"v0.1.17: %ctor 正常完成");
+        HNPMAppendLog(@"v0.1.18: 空闲巡逻已启动");
+        HNPMAppendLog(@"v0.1.18: %ctor 正常完成");
     }
 }
