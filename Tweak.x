@@ -997,6 +997,8 @@ static UIView *HNPMPlatterBackdropOfMat(UIView *mat) {
         if (!platter || ![platter isKindOfClass:platterCls]) return nil;
         // v0.1.12: 直接子级迭代改为全子树 DFS + 先 copy — 托盘高频重建期对 subviews
         //          做 for-in 会因并发变异抛 NSException(被 @try 吞掉 → v0.1.11 全场 miss 零日志)。
+        // v0.1.15: 不下钻 CSActivityItemContentView(歌词/控件的 vibrancy 子树) — 误杀=整卡消失。
+        Class activityCls = NSClassFromString(@"CSActivityItemContentView");
         NSMutableArray *stack = [NSMutableArray arrayWithObject:platter];
         int guard = 0;
         while (stack.count > 0 && guard++ < 200) {
@@ -1007,6 +1009,7 @@ static UIView *HNPMPlatterBackdropOfMat(UIView *mat) {
             //          既误杀罩层 blur, 也让系统 backdrop 逃过中和(v0.1.12 实际如此)。
             if (v.tag == HNPM_COVER_TAG) continue;
             if ([v isKindOfClass:backdropCls]) return v;
+            if (activityCls && [v isKindOfClass:activityCls]) continue;
             [stack addObjectsFromArray:[v.subviews copy]];
         }
     } @catch (NSException *e) {}
@@ -1017,10 +1020,12 @@ static UIView *HNPMPlatterBackdropOfMat(UIView *mat) {
 //          创建(中和miss: 托盘子1=[CustomContent]), 系统 ~1s 后惰性补建 backdrop(a=1.0
 //          原生材质) → 到下一轮巡检中和之间留下原生渲染窗口 = 用户看到的"歌词闪一下"。
 //          解法: hook _UIVisualEffectBackdropView didMoveToWindow, 挂载瞬间归零(赶在渲染前)。
-// v0.1.14 收窄: 只中和"直接父级 = PLPlatterCustomContentView"的 backdrop(= v0.1.12 实证
-//          无害的材质白底那一个)。v0.1.13 用"祖先命中 PLPlatterView"判定过宽, 把卡内容里
-//          渲染歌词/控件的 vibrancy backdrop 也全部归零 → 用户实测整张音乐卡消失。
-//          (对照教训: 卡内容文本/控件也靠 effect backdrop 渲染, 一个都不能多杀。)
+// v0.1.15 两条中和规则(其余一律不碰):
+//   规则1: 直接父级 = PLPlatterCustomContentView(材质白底, v0.1.14 实证无害: 卡内容可见);
+//   规则2: 宿主 UIVisualEffectView 是 PLPlatterView 直接子级(= 系统占位白底 EFX,
+//          v0.1.1 实锤的占位视图, v0.1.14 日志裁决它是首帧白底真身: 挂载 ~1s 后才被
+//          apply 路径中和)。内容 vibrancy 的 EFX 埋在 CSActivityItemContentView 更深处,
+//          宿主 EFX 的父级不是托盘 → 走到深 EFX 直接 return, v0.1.13 误杀不会重犯。
 static void (*sHNPMOrigBackdropDidMove)(id, SEL);
 static void hnpmBackdropDidMove(id self, SEL _cmd) {
     sHNPMOrigBackdropDidMove(self, _cmd);
@@ -1031,13 +1036,29 @@ static void hnpmBackdropDidMove(id self, SEL _cmd) {
         if (!HNPMCoverMode()) return;
         CGFloat a = HNPMBgAlpha();
         if (a >= 0.99) return;
+        Class platterCls = NSClassFromString(@"PLPlatterView");
         Class customCls = NSClassFromString(@"PLPlatterCustomContentView");
-        if (!customCls) return;
+        if (!platterCls || !customCls) return;
         UIView *p = v.superview;
-        if (!p || p.tag == HNPM_COVER_TAG) return;         // 自家罩层的 backdrop, 不碰
-        if (![p isKindOfClass:customCls]) return;          // 只中和材质白底(直接子级)
-        HNPMSetAlphaNoAnim(v, 0.0);
-        HNPMAppendLog(@"[透明·罩层] backdrop 挂载即中和(挂载钩子)");
+        if (!p) return;
+        if ([p isKindOfClass:customCls]) {                   // 规则1: 材质白底
+            HNPMSetAlphaNoAnim(v, 0.0);
+            HNPMAppendLog(@"[透明·罩层] backdrop 挂载即中和(规则1·材质白底)");
+            return;
+        }
+        int g = 0;
+        while (p && g++ < 4) {
+            if (p.tag == HNPM_COVER_TAG) return;             // 自家罩层, 不碰
+            if ([p isKindOfClass:[UIVisualEffectView class]]) {
+                UIView *gp = p.superview;                    // 规则2: 占位 EFX(托盘直接子级)
+                if (gp && [gp isKindOfClass:platterCls]) {
+                    HNPMSetAlphaNoAnim(v, 0.0);
+                    HNPMAppendLog(@"[透明·罩层] backdrop 挂载即中和(规则2·占位EFX)");
+                }
+                return;                                      // 更深的 EFX = 内容 vibrancy, 不碰
+            }
+            p = p.superview;
+        }
     } @catch (NSException *e) {}
 }
 static void HNPMHookBackdrop(void) {
@@ -3019,7 +3040,7 @@ static void HNPMAttachPanIfNeeded(UIView *view) {
 #pragma mark - 入口
 
 __attribute__((constructor)) static void HNPMRawCtor(void) {
-    HNPMAppendLog(@"v0.1.14: dylib 构造函数已执行(dyld 加载成功)");
+    HNPMAppendLog(@"v0.1.15: dylib 构造函数已执行(dyld 加载成功)");
 }
 
 // v0.0.50/51: 岛元素抑制策略钩子 — 隐藏期让系统把 NowPlaying 元素当作"应被抑制",
@@ -3082,7 +3103,7 @@ __attribute__((constructor)) static void HNPMRawCtor(void) {
 
 %ctor {
     @autoreleasepool {
-        HNPMAppendLog(@"v0.1.14: logos %ctor 进入");
+        HNPMAppendLog(@"v0.1.15: logos %ctor 进入");
     HNPMAppendLog(HNPMCoverMode()
         ? @"[透明] 罩层模式 ON(HideNowPlaying.cover 存在 → 系统材质不动, 用自有 blur 罩层)"
         : @"[透明] 罩层模式 OFF(经典 alpha 模式; 建 /var/mobile/Documents/HideNowPlaying.cover 可切换)");
@@ -3180,7 +3201,7 @@ __attribute__((constructor)) static void HNPMRawCtor(void) {
         // v0.0.93: 空闲巡逻(0.5s 只读一次, 无在场卡自动停) — 堵"空闲期静默重置无事件触发"盲区
         HNPMIdleAlphaCheck();
         HNPMHookBackdrop();
-        HNPMAppendLog(@"v0.1.14: 空闲巡逻已启动");
-        HNPMAppendLog(@"v0.1.14: %ctor 正常完成");
+        HNPMAppendLog(@"v0.1.15: 空闲巡逻已启动");
+        HNPMAppendLog(@"v0.1.15: %ctor 正常完成");
     }
 }
