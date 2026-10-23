@@ -453,6 +453,25 @@ static BOOL HNPMIsMediaSized(CGSize size) {
     return size.width >= 300 && size.height >= 150;
 }
 
+// v0.1.5: 判定托盘是否属于锁屏"正在播放"音乐卡 — 沿祖先链找 NCNotificationListCell
+//         且尺寸符合媒体卡(不要求已挂窗: 配方写入发生在托盘挂窗**之前**, 实测
+//         11:01:43.986 配方写入 → 45.264 才建罩层, v0.1.4 的 self.window 检查把
+//         直接应用拦掉了)。用于 setMaterialRecipe: 时刻的罩层就地应用目标过滤。
+static BOOL HNPMPlatterIsMusicCard(UIView *platter) {
+    @try {
+        if (!platter) return NO;
+        Class cellCls = NSClassFromString(@"NCNotificationListCell");
+        if (!cellCls) return NO;
+        UIView *p = platter;
+        int guard = 0;
+        while (p && guard++ < 12) {
+            if ([p isKindOfClass:cellCls]) return HNPMIsMediaSized(p.frame.size);
+            p = p.superview;
+        }
+    } @catch (NSException *e) {}
+    return NO;
+}
+
 static BOOL HNPMCellHasLiveMedia(UIView *cell) {
     @try {
         if (!cell) return NO;
@@ -2627,8 +2646,11 @@ static void HNPMAttachPanIfNeeded(UIView *view) {
     } @catch (NSException *e) {}
     %orig;
     @try {
+        // v0.1.5: 配方写入时刻托盘往往尚未挂窗(self.window=nil), v0.1.4 的窗口检查使
+        //         直接应用被跳过(实测 43.986 配方写入 → 45.264 才建罩层, 仍隔 1.3s)。
+        //         改按"音乐卡单元格祖先"判定目标(不要求已挂窗), 盖罩随托盘一起进窗口。
         CGFloat a = HNPMBgAlpha();
-        if (HNPMCoverMode() && a < 0.99 && self.window) {
+        if (HNPMCoverMode() && a < 0.99 && HNPMPlatterIsMusicCard(self)) {
             if (HNPMPlatterApplyCover(self, a) > 0) HNPMStartAlphaBurst();
         }
     } @catch (NSException *e) {}
@@ -2708,7 +2730,7 @@ static void HNPMAttachPanIfNeeded(UIView *view) {
 #pragma mark - 入口
 
 __attribute__((constructor)) static void HNPMRawCtor(void) {
-    HNPMAppendLog(@"v0.1.4: dylib 构造函数已执行(dyld 加载成功)");
+    HNPMAppendLog(@"v0.1.5: dylib 构造函数已执行(dyld 加载成功)");
 }
 
 // v0.0.50/51: 岛元素抑制策略钩子 — 隐藏期让系统把 NowPlaying 元素当作"应被抑制",
@@ -2771,7 +2793,7 @@ __attribute__((constructor)) static void HNPMRawCtor(void) {
 
 %ctor {
     @autoreleasepool {
-        HNPMAppendLog(@"v0.1.4: logos %ctor 进入");
+        HNPMAppendLog(@"v0.1.5: logos %ctor 进入");
     HNPMAppendLog(HNPMCoverMode()
         ? @"[透明] 罩层模式 ON(HideNowPlaying.cover 存在 → 系统材质不动, 用自有 blur 罩层)"
         : @"[透明] 罩层模式 OFF(经典 alpha 模式; 建 /var/mobile/Documents/HideNowPlaying.cover 可切换)");
@@ -2868,7 +2890,7 @@ __attribute__((constructor)) static void HNPMRawCtor(void) {
         HNPMAppendLog(@"v0.0.92: 设置面板通知观察者已挂");
         // v0.0.93: 空闲巡逻(0.5s 只读一次, 无在场卡自动停) — 堵"空闲期静默重置无事件触发"盲区
         HNPMIdleAlphaCheck();
-        HNPMAppendLog(@"v0.1.4: 空闲巡逻已启动");
-        HNPMAppendLog(@"v0.1.4: %ctor 正常完成");
+        HNPMAppendLog(@"v0.1.5: 空闲巡逻已启动");
+        HNPMAppendLog(@"v0.1.5: %ctor 正常完成");
     }
 }
