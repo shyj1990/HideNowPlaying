@@ -471,6 +471,26 @@ static BOOL HNPMCellHasLiveMedia(UIView *cell) {
     return NO;
 }
 
+// v0.1.10: 卡体探测 — 单元格内含宽>=300 高>=minH 的媒体内容视图(音乐卡/实时活动通用)。
+//          v0.1.9 日志实测: 正在播放内容视图可能只有 365x143(旧侦察 167, 150 分界线误杀)
+static UIView *HNPMCellMediaContent(UIView *cell, CGFloat minH) {
+    @try {
+        Class contentClass = objc_getClass("CSActivityItemContentView");
+        if (!contentClass || !cell) return nil;
+        NSMutableArray *stack = [NSMutableArray arrayWithObject:cell];
+        int guard = 0;
+        while (stack.count > 0 && guard++ < 200) {
+            UIView *v = stack.firstObject;
+            [stack removeObjectAtIndex:0];
+            if (!v) continue;
+            if ([v isKindOfClass:contentClass] &&
+                v.frame.size.width >= 300 && v.frame.size.height >= minH) return v;
+            [stack addObjectsFromArray:[v subviews]];
+        }
+    } @catch (NSException *e) {}
+    return nil;
+}
+
 // v0.0.45: 内容级隐藏 —— 只藏岛内的"媒体内容视图", 窗口保持存活
 // 信号/WiFi/电池(尾部元素)与媒体同窗, 整窗隐藏会陪葬 → 内容级隐藏让系统自动回到待机布局
 // (隐藏期 = 原生待机观感: 短胶囊 + 信号图标 + 其他活动图标; 恢复后 = 原生播放观感)
@@ -1039,6 +1059,7 @@ static void HNPMCoversWakeSweep(void) {
         NSArray *windows = [UIApplication sharedApplication].windows;
         int hits = 0, nPlatter = 0, nCell = 0, nGated = 0;
         UIView *dumpCell = nil;
+        NSMutableArray *cellSizes = [NSMutableArray array];
         for (UIWindow *w in windows) {
             if (!w) continue;
             NSMutableArray *stack = [NSMutableArray arrayWithObject:w];
@@ -1052,11 +1073,21 @@ static void HNPMCoversWakeSweep(void) {
                 if (v.tag == HNPM_COVER_TAG) continue;
                 if (cellCls && [v isKindOfClass:cellCls]) {
                     nCell++;
+                    if (cellSizes.count < 3) {
+                        [cellSizes addObject:[NSString stringWithFormat:@"%.0fx%.0f%@",
+                            v.frame.size.width, v.frame.size.height, v.hidden ? @"隐" : @""]];
+                    }
+                    if (!dumpCell && ![hnpmCardCells containsObject:v] &&
+                        HNPMCellMediaContent(v, 120)) dumpCell = v;
+                    // v0.1.10: 门槛放宽 — 除 150 尺寸外, 含 365x130+ 媒体内容视图的单元也算卡
+                    //          (v0.1.9 实测正在播放内容视图可能只有 143 高, 150 分界线误杀)
                     BOOL ok = !v.hidden &&
-                              (HNPMIsMediaSized(v.frame.size) || !v.window || CGRectIsEmpty(v.frame));
+                              (HNPMIsMediaSized(v.frame.size) ||
+                               HNPMCellMediaContent(v, 130) != nil ||
+                               !v.window || CGRectIsEmpty(v.frame));
                     if (ok) {
                         nGated++;
-                        if (!dumpCell && ![hnpmCardCells containsObject:v]) dumpCell = v;
+                        if (![hnpmCardCells containsObject:v]) [hnpmCardCells addObject:v];
                         // 登记路径同款目标收集: 托盘/bg/占位 EFX 一网打尽
                         NSMutableArray *targets = [NSMutableArray array];
                         HNPMCoverCollectTargets(v, targets);
@@ -1096,14 +1127,15 @@ static void HNPMCoversWakeSweep(void) {
         CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
         if (now - sHNPMCoversSweepDiag > 0.5) {
             sHNPMCoversSweepDiag = now;
-            HNPMAppendLog([NSString stringWithFormat:@"[透明·亮屏扫] 窗口%lu 托盘%d 单元%d 过门%d 改动%d",
-                           (unsigned long)windows.count, nPlatter, nCell, nGated, hits]);
+            HNPMAppendLog([NSString stringWithFormat:@"[透明·亮屏扫] 窗口%lu 托盘%d 单元%d[%@] 过门%d 改动%d",
+                           (unsigned long)windows.count, nPlatter, nCell,
+                           [cellSizes componentsJoinedByString:@","], nGated, hits]);
         }
         if (hits > 0) {
             HNPMAppendLog([NSString stringWithFormat:@"[透明·亮屏扫] 免登记直接应用 %d 处罩层", hits]);
             HNPMStartAlphaBurst();
         }
-        // 一次性诊断: 过关但未登记的单元格(= 亮屏重建的新卡) → dump 子树看占位白底
+        // 一次性诊断(v0.1.10): 含媒体内容(>=120 高)的未登记单元格 → dump 卡体看白底来源
         static CFAbsoluteTime sHNPMNewCellDumpAt = 0;
         if (dumpCell && now - sHNPMNewCellDumpAt > 5.0) {
             sHNPMNewCellDumpAt = now;
@@ -1114,16 +1146,15 @@ static void HNPMCoversWakeSweep(void) {
                 UIView *v = st.firstObject;
                 [st removeObjectAtIndex:0];
                 if (!v) continue;
-                if ([v isKindOfClass:[UIVisualEffectView class]]) {
-                    [rows addObject:[NSString stringWithFormat:@"%@ a=%.2f h=%d <EFX>",
-                                     NSStringFromClass([v class]), v.alpha, v.hidden ? 1 : 0]];
-                } else {
-                    [rows addObject:[NSString stringWithFormat:@"%@ a=%.2f h=%d",
-                                     NSStringFromClass([v class]), v.alpha, v.hidden ? 1 : 0]];
-                }
+                NSString *bgMark = (v.layer.backgroundColor != nil) ? @" bg" : @"";
+                NSString *efxMark = [v isKindOfClass:[UIVisualEffectView class]] ? @" <EFX>" : @"";
+                [rows addObject:[NSString stringWithFormat:@"%@ a=%.2f h=%d%@@%.0fx%.0f",
+                                 NSStringFromClass([v class]), v.alpha, v.hidden ? 1 : 0,
+                                 bgMark, efxMark, v.frame.size.width, v.frame.size.height]];
                 [st addObjectsFromArray:v.subviews];
             }
-            HNPMAppendLog([NSString stringWithFormat:@"[透明·亮屏扫·新卡] %lu视图: %@",
+            HNPMAppendLog([NSString stringWithFormat:@"[透明·亮屏扫·卡体] 单元%.0fx%.0f %lu视图: %@",
+                           dumpCell.frame.size.width, dumpCell.frame.size.height,
                            (unsigned long)rows.count, [rows componentsJoinedByString:@" || "]]);
         }
     } @catch (NSException *e) {}
@@ -2876,7 +2907,7 @@ static void HNPMAttachPanIfNeeded(UIView *view) {
 #pragma mark - 入口
 
 __attribute__((constructor)) static void HNPMRawCtor(void) {
-    HNPMAppendLog(@"v0.1.9: dylib 构造函数已执行(dyld 加载成功)");
+    HNPMAppendLog(@"v0.1.10: dylib 构造函数已执行(dyld 加载成功)");
 }
 
 // v0.0.50/51: 岛元素抑制策略钩子 — 隐藏期让系统把 NowPlaying 元素当作"应被抑制",
@@ -2939,7 +2970,7 @@ __attribute__((constructor)) static void HNPMRawCtor(void) {
 
 %ctor {
     @autoreleasepool {
-        HNPMAppendLog(@"v0.1.9: logos %ctor 进入");
+        HNPMAppendLog(@"v0.1.10: logos %ctor 进入");
     HNPMAppendLog(HNPMCoverMode()
         ? @"[透明] 罩层模式 ON(HideNowPlaying.cover 存在 → 系统材质不动, 用自有 blur 罩层)"
         : @"[透明] 罩层模式 OFF(经典 alpha 模式; 建 /var/mobile/Documents/HideNowPlaying.cover 可切换)");
@@ -3036,7 +3067,7 @@ __attribute__((constructor)) static void HNPMRawCtor(void) {
         HNPMAppendLog(@"v0.0.92: 设置面板通知观察者已挂");
         // v0.0.93: 空闲巡逻(0.5s 只读一次, 无在场卡自动停) — 堵"空闲期静默重置无事件触发"盲区
         HNPMIdleAlphaCheck();
-        HNPMAppendLog(@"v0.1.9: 空闲巡逻已启动");
-        HNPMAppendLog(@"v0.1.9: %ctor 正常完成");
+        HNPMAppendLog(@"v0.1.10: 空闲巡逻已启动");
+        HNPMAppendLog(@"v0.1.10: %ctor 正常完成");
     }
 }
