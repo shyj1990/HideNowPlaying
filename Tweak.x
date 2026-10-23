@@ -1003,7 +1003,7 @@ static UIView *HNPMPlatterBackdropOfMat(UIView *mat) {
             UIView *v = stack.firstObject;
             [stack removeObjectAtIndex:0];
             if (!v) continue;
-            // v0.1.32: 不下钻自家罩层(tag) — 否则 DFS 先命中罩层内部自己的 backdrop,
+            // v0.1.33: 不下钻自家罩层(tag) — 否则 DFS 先命中罩层内部自己的 backdrop,
             //          既误杀罩层 blur, 也让系统 backdrop 逃过中和(v0.1.12 实际如此)。
             if (v.tag == HNPM_COVER_TAG) continue;
             if ([v isKindOfClass:backdropCls]) return v;
@@ -1017,7 +1017,7 @@ static UIView *HNPMPlatterBackdropOfMat(UIView *mat) {
 //          创建(中和miss: 托盘子1=[CustomContent]), 系统 ~1s 后惰性补建 backdrop(a=1.0
 //          原生材质) → 到下一轮巡检中和之间留下原生渲染窗口 = 用户看到的"歌词闪一下"。
 //          解法: hook _UIVisualEffectBackdropView didMoveToWindow, 挂载瞬间归零(赶在渲染前)。
-// v0.1.32 收窄: 只中和"直接父级 = PLPlatterCustomContentView"的 backdrop(= v0.1.12 实证
+// v0.1.33 收窄: 只中和"直接父级 = PLPlatterCustomContentView"的 backdrop(= v0.1.12 实证
 //          无害的材质白底那一个)。v0.1.13 用"祖先命中 PLPlatterView"判定过宽, 把卡内容里
 //          渲染歌词/控件的 vibrancy backdrop 也全部归零 → 用户实测整张音乐卡消失。
 //          (对照教训: 卡内容文本/控件也靠 effect backdrop 渲染, 一个都不能多杀。)
@@ -1143,6 +1143,63 @@ static int HNPMPlatterApplyCover(UIView *platter, CGFloat a) {
 }
 
 // v0.1.7 前置声明(v0.1.8 定义): 连扫帧内节流调用, 兜住登记缝隙期外的重建
+// v0.1.33: 小步路线第一步 — 白底来自锁屏材质的跨进程捕获快照(v0.1.30 实锤:
+//          NCMaterialDisplayingCaptureOnlyViewControllerView 下挂 BSUIVibrancyBackdropView
+//          h=251≈卡区高度 a=1.00)。宿主被锁屏时钟复用(v0.1.31 教训: 整体隐藏连时钟消失),
+//          故本步只隐藏〔与媒体卡区域 frame 相交〕的 BSUIVibrancyBackdrop/Portal 实例,
+//          0.65s 后恢复。卡区域取最近一次登记媒体卡 cell 的窗口坐标(亮屏白底盘次 cell
+//          常未创建, 用静态记忆值; 全屏 h=852 的 ShadowView 不碰——无法隔离卡区)。
+static CFAbsoluteTime sHNPMWakeAt33 = 0;      // 最近一次屏幕状态通知时刻
+static BOOL sHNPMCaptureHidden33 = NO;        // 本轮亮屏是否已成功隐藏(每轮一次)
+static CGRect sHNPMCardRegion33 = CGRectZero; // 最近一次登记媒体卡的区域(窗口坐标)
+
+static void HNPMHideCaptureCardRegion(void) {
+    if (!HNPMCoverMode()) return;
+    if (CGRectIsEmpty(sHNPMCardRegion33)) return;   // 尚无卡区记忆(如 respring 后首次亮屏)则跳过
+    if (sHNPMCaptureHidden33) return;
+    CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
+    if (sHNPMWakeAt33 <= 0 || now - sHNPMWakeAt33 > 1.15) return;   // 白窗外不碰
+    int n = 0;
+    NSArray *windows = [UIApplication sharedApplication].windows;
+    for (UIWindow *w in windows) {
+        if (!w) continue;
+        NSMutableArray *stack = [NSMutableArray arrayWithObject:w];
+        int guard = 0;
+        while (stack.count > 0 && guard++ < 600) {
+            UIView *v = stack.firstObject;
+            [stack removeObjectAtIndex:0];
+            if (!v || v.tag == HNPM_COVER_TAG) continue;
+            NSString *cls = NSStringFromClass([v class]);
+            if ([cls containsString:@"CaptureOnly"]) {
+                [stack addObjectsFromArray:v.subviews];   // 只下钻宿主, 绝不隐藏宿主本身
+                continue;
+            }
+            if (![cls hasPrefix:@"BSUIVibrancyBackdrop"] && ![cls hasPrefix:@"BSUIVibrancyAnimatingPortal"]) {
+                [stack addObjectsFromArray:v.subviews];
+                continue;
+            }
+            // 命中 vibrancy backdrop/portal: 与卡区相交才隐藏(时钟在屏幕上方, frame 不相交)
+            CGRect vf = [v convertRect:v.bounds toView:nil];
+            CGRect inter = CGRectIntersection(vf, sHNPMCardRegion33);
+            if (CGRectIsNull(inter) || CGRectIsEmpty(inter) || v.hidden || v.alpha < 0.01) continue;
+            v.hidden = YES;
+            n++;
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.65 * NSEC_PER_SEC)),
+                           dispatch_get_main_queue(), ^{
+                @try {
+                    v.hidden = NO;
+                    HNPMAppendLog(@"[透明·罩层] 已恢复卡区捕获快照(0.65s 到)");
+                } @catch (NSException *e) {}
+            });
+        }
+    }
+    if (n > 0) {
+        sHNPMCaptureHidden33 = YES;   // 只在真正藏到东西时置位 — 首轮没找到时后续扫场可重试
+        HNPMAppendLog([NSString stringWithFormat:
+            @"[透明·罩层] 已隐卡区捕获快照 %d 处(白窗避让, 不碰时钟)", n]);
+    }
+}
+
 static void HNPMCoversWakeSweep(void);
 
 // v0.1.9 前置声明(定义在罩层收集区): 直扫按单元格整体收集目标要用
@@ -1168,6 +1225,7 @@ static void HNPMCoversWakeSweep(void) {
         Class hostCls = NSClassFromString(@"NCNotificationListSupplementaryHostingView");
         Class cellCls = NSClassFromString(@"NCNotificationListCell");
         if (!platterCls) return;
+        HNPMHideCaptureCardRegion();   // v0.1.33: 白窗内避让卡区捕获快照(幂等, 每轮一次)
         NSArray *windows = [UIApplication sharedApplication].windows;
         int hits = 0, nPlatter = 0, nCell = 0, nGated = 0;
         UIView *dumpCell = nil;
@@ -1200,6 +1258,10 @@ static void HNPMCoversWakeSweep(void) {
                     if (ok) {
                         nGated++;
                         if (![hnpmCardCells containsObject:v]) [hnpmCardCells addObject:v];
+                        {   // v0.1.33: 记录卡区(窗口坐标) — 白底盘次 cell 未创建时的避让依据
+                            CGRect cf = [v convertRect:v.bounds toView:nil];
+                            if (!CGRectIsEmpty(cf)) sHNPMCardRegion33 = cf;
+                        }
                         // 登记路径同款目标收集: 托盘/bg/占位 EFX 一网打尽
                         NSMutableArray *targets = [NSMutableArray array];
                         HNPMCoverCollectTargets(v, targets);
@@ -1683,6 +1745,8 @@ static void HNPMScreenStateCB(CFNotificationCenterRef center, void *observer,
                               CFStringRef name, const void *object, CFDictionaryRef userInfo) {
     HNPMAppendLog([NSString stringWithFormat:@"[透明] 屏幕状态通知(%@) → 连扫窗口开启",
                    (__bridge NSString *)name]);
+    sHNPMWakeAt33 = CFAbsoluteTimeGetCurrent();   // v0.1.33: 白窗避让时间基准
+    sHNPMCaptureHidden33 = NO;                    // v0.1.33: 新一轮, 允许避让一次
     HNPMStartAlphaBurst();
     HNPMScheduleDeepDumps();   // v0.0.95: 每次亮/灭屏排程时序化深诊断
     // v0.1.8: 免登记亮屏直扫 — 立即一次 + 时序化九次, 不等登记/配方(见 HNPMCoversWakeSweep 注释)
@@ -3019,7 +3083,7 @@ static void HNPMAttachPanIfNeeded(UIView *view) {
 #pragma mark - 入口
 
 __attribute__((constructor)) static void HNPMRawCtor(void) {
-    HNPMAppendLog(@"v0.1.32: dylib 构造函数已执行(dyld 加载成功)");
+    HNPMAppendLog(@"v0.1.33: dylib 构造函数已执行(dyld 加载成功)");
 }
 
 // v0.0.50/51: 岛元素抑制策略钩子 — 隐藏期让系统把 NowPlaying 元素当作"应被抑制",
@@ -3082,7 +3146,7 @@ __attribute__((constructor)) static void HNPMRawCtor(void) {
 
 %ctor {
     @autoreleasepool {
-        HNPMAppendLog(@"v0.1.32: logos %ctor 进入");
+        HNPMAppendLog(@"v0.1.33: logos %ctor 进入");
     HNPMAppendLog(HNPMCoverMode()
         ? @"[透明] 罩层模式 ON(HideNowPlaying.cover 存在 → 系统材质不动, 用自有 blur 罩层)"
         : @"[透明] 罩层模式 OFF(经典 alpha 模式; 建 /var/mobile/Documents/HideNowPlaying.cover 可切换)");
@@ -3180,7 +3244,7 @@ __attribute__((constructor)) static void HNPMRawCtor(void) {
         // v0.0.93: 空闲巡逻(0.5s 只读一次, 无在场卡自动停) — 堵"空闲期静默重置无事件触发"盲区
         HNPMIdleAlphaCheck();
         HNPMHookBackdrop();
-        HNPMAppendLog(@"v0.1.32: 空闲巡逻已启动");
-        HNPMAppendLog(@"v0.1.32: %ctor 正常完成");
+        HNPMAppendLog(@"v0.1.33: 空闲巡逻已启动");
+        HNPMAppendLog(@"v0.1.33: %ctor 正常完成");
     }
 }
