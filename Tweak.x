@@ -1013,6 +1013,9 @@ static int HNPMPlatterApplyCover(UIView *platter, CGFloat a) {
 // v0.1.7 前置声明(v0.1.8 定义): 连扫帧内节流调用, 兜住登记缝隙期外的重建
 static void HNPMCoversWakeSweep(void);
 
+// v0.1.9 前置声明(定义在罩层收集区): 直扫按单元格整体收集目标要用
+static void HNPMCoverCollectTargets(UIView *root, NSMutableArray *outTargets);
+
 // v0.1.9: 免登记亮屏扫 — v0.1.8 日志裁决: 直扫"免登记直接应用"零次出现, 每次亮屏新罩层
 //          都在 +0.9s 才由布局钩子创建 → 亮屏后 0~0.9s 的白底来自**托盘创建之前的占位
 //          效果视图**(v0.1.1 已实锤: 系统先给卡内放一个 UIVisualEffectView 白底, 托盘
