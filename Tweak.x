@@ -1136,6 +1136,9 @@ static void HNPMPlatterReapplyOnLayout(UIView *platter) {
         BOOL drift = HNPMCoverMode() ? HNPMPlatterCoverDrift(platter, a)
                                      : HNPMPlatterBgDrift(platter, a);
         if (drift) {
+            // v0.1.4: 罩层模式下就地应用(罩层是我们自己的视图, 应用它不触碰系统材质,
+            //         不违反 v0.0.92 的"布局钩子只侦测"原则 — 该原则针对系统材质写入)
+            if (HNPMCoverMode()) HNPMPlatterApplyCover(platter, a);
             HNPMStartAlphaBurst();
         }
     } @catch (NSException *e) {}
@@ -2610,6 +2613,10 @@ static void HNPMAttachPanIfNeeded(UIView *view) {
     } @catch (NSException *e) {}
 }
 // v0.0.99: 配方写入探测 — 看系统亮屏重置是否会动 materialRecipe(若动, 配方路线可被动防御)
+// v0.1.4: v0.1.3 日志实测 — 配方写入(=系统亮屏重置开始)比卡片登记早 ~1.5s
+//         (10:49:24.877 配方写入 vs 26.591 登记), 且"盖托盘层"因卡片未登记从未触发。
+//         此 hook 是我们拥有的最早可靠信号: %orig 后直接对托盘应用罩层(无 bg 期盖托盘层,
+//         bg 已在则盖 bg), 并开连扫窗口 — 首帧白底窗口从"等登记 ~1.5s"压到重置序列起点。
 - (void)setMaterialRecipe:(long long)r {
     @try {
         CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
@@ -2619,6 +2626,12 @@ static void HNPMAttachPanIfNeeded(UIView *view) {
         }
     } @catch (NSException *e) {}
     %orig;
+    @try {
+        CGFloat a = HNPMBgAlpha();
+        if (HNPMCoverMode() && a < 0.99 && self.window) {
+            if (HNPMPlatterApplyCover(self, a) > 0) HNPMStartAlphaBurst();
+        }
+    } @catch (NSException *e) {}
 }
 %end
 %end
@@ -2695,7 +2708,7 @@ static void HNPMAttachPanIfNeeded(UIView *view) {
 #pragma mark - 入口
 
 __attribute__((constructor)) static void HNPMRawCtor(void) {
-    HNPMAppendLog(@"v0.1.3: dylib 构造函数已执行(dyld 加载成功)");
+    HNPMAppendLog(@"v0.1.4: dylib 构造函数已执行(dyld 加载成功)");
 }
 
 // v0.0.50/51: 岛元素抑制策略钩子 — 隐藏期让系统把 NowPlaying 元素当作"应被抑制",
@@ -2758,7 +2771,7 @@ __attribute__((constructor)) static void HNPMRawCtor(void) {
 
 %ctor {
     @autoreleasepool {
-        HNPMAppendLog(@"v0.1.3: logos %ctor 进入");
+        HNPMAppendLog(@"v0.1.4: logos %ctor 进入");
     HNPMAppendLog(HNPMCoverMode()
         ? @"[透明] 罩层模式 ON(HideNowPlaying.cover 存在 → 系统材质不动, 用自有 blur 罩层)"
         : @"[透明] 罩层模式 OFF(经典 alpha 模式; 建 /var/mobile/Documents/HideNowPlaying.cover 可切换)");
@@ -2855,7 +2868,7 @@ __attribute__((constructor)) static void HNPMRawCtor(void) {
         HNPMAppendLog(@"v0.0.92: 设置面板通知观察者已挂");
         // v0.0.93: 空闲巡逻(0.5s 只读一次, 无在场卡自动停) — 堵"空闲期静默重置无事件触发"盲区
         HNPMIdleAlphaCheck();
-        HNPMAppendLog(@"v0.1.3: 空闲巡逻已启动");
-        HNPMAppendLog(@"v0.1.3: %ctor 正常完成");
+        HNPMAppendLog(@"v0.1.4: 空闲巡逻已启动");
+        HNPMAppendLog(@"v0.1.4: %ctor 正常完成");
     }
 }
