@@ -997,44 +997,17 @@ static UIView *HNPMPlatterBackdropOfMat(UIView *mat) {
         if (!platter || ![platter isKindOfClass:platterCls]) return nil;
         // v0.1.12: 直接子级迭代改为全子树 DFS + 先 copy — 托盘高频重建期对 subviews
         //          做 for-in 会因并发变异抛 NSException(被 @try 吞掉 → v0.1.11 全场 miss 零日志)。
-        // v0.1.15: 不下钻 CSActivityItemContentView(歌词/控件的 vibrancy 子树) — 误杀=整卡消失。
-        Class activityCls = NSClassFromString(@"CSActivityItemContentView");
         NSMutableArray *stack = [NSMutableArray arrayWithObject:platter];
         int guard = 0;
         while (stack.count > 0 && guard++ < 200) {
             UIView *v = stack.firstObject;
             [stack removeObjectAtIndex:0];
             if (!v) continue;
-            // v0.1.14: 不下钻自家罩层(tag) — 否则 DFS 先命中罩层内部自己的 backdrop,
+            // v0.1.32: 不下钻自家罩层(tag) — 否则 DFS 先命中罩层内部自己的 backdrop,
             //          既误杀罩层 blur, 也让系统 backdrop 逃过中和(v0.1.12 实际如此)。
             if (v.tag == HNPM_COVER_TAG) continue;
             if ([v isKindOfClass:backdropCls]) return v;
-            if (activityCls && [v isKindOfClass:activityCls]) continue;
             [stack addObjectsFromArray:[v.subviews copy]];
-        }
-        // v0.1.17: 扩展搜索 — v0.1.16 日志矛盾: apply 路径 55 次 miss(说全树无 backdrop),
-        //          同秒深诊断 dump 却显示登记卡托盘的 CustomContent 下 backdrop a=1.00 在场。
-        //          假说: apply 拿到的 mat 属于旧/孤儿托盘, 真正可见卡在登记卡的新托盘里。
-        //          → 找不到时遍历登记卡, 对每张在场卡的托盘跑同款 DFS。
-        for (UIView *c in [hnpmCardCells copy]) {
-            if (![c isKindOfClass:[UIView class]] || !c.window) continue;
-            NSMutableArray *st2 = [NSMutableArray arrayWithObject:c];
-            int g2 = 0;
-            while (st2.count > 0 && g2++ < 200) {
-                UIView *v2 = st2.firstObject;
-                [st2 removeObjectAtIndex:0];
-                if (!v2) continue;
-                if (v2.tag == HNPM_COVER_TAG) continue;
-                if ([v2 isKindOfClass:backdropCls]) {
-                    if (v2.alpha > 0.01) {
-                        HNPMAppendLog(@"[透明·罩层] backdrop 在登记卡托盘中找到且存活(mat托盘没有→两托盘实锤)");
-                        return v2;
-                    }
-                    continue;   // 已中和的 backdrop, 继续找活的
-                }
-                if (activityCls && [v2 isKindOfClass:activityCls]) continue;
-                [st2 addObjectsFromArray:[v2.subviews copy]];
-            }
         }
     } @catch (NSException *e) {}
     return nil;
@@ -1044,78 +1017,27 @@ static UIView *HNPMPlatterBackdropOfMat(UIView *mat) {
 //          创建(中和miss: 托盘子1=[CustomContent]), 系统 ~1s 后惰性补建 backdrop(a=1.0
 //          原生材质) → 到下一轮巡检中和之间留下原生渲染窗口 = 用户看到的"歌词闪一下"。
 //          解法: hook _UIVisualEffectBackdropView didMoveToWindow, 挂载瞬间归零(赶在渲染前)。
-// v0.1.15 两条中和规则(其余一律不碰):
-//   规则1: 直接父级 = PLPlatterCustomContentView(材质白底, v0.1.14 实证无害: 卡内容可见);
-//   规则2: 宿主 UIVisualEffectView 是 PLPlatterView 直接子级(= 系统占位白底 EFX,
-//          v0.1.1 实锤的占位视图, v0.1.14 日志裁决它是首帧白底真身: 挂载 ~1s 后才被
-//          apply 路径中和)。内容 vibrancy 的 EFX 埋在 CSActivityItemContentView 更深处,
-//          宿主 EFX 的父级不是托盘 → 走到深 EFX 直接 return, v0.1.13 误杀不会重犯。
+// v0.1.32 收窄: 只中和"直接父级 = PLPlatterCustomContentView"的 backdrop(= v0.1.12 实证
+//          无害的材质白底那一个)。v0.1.13 用"祖先命中 PLPlatterView"判定过宽, 把卡内容里
+//          渲染歌词/控件的 vibrancy backdrop 也全部归零 → 用户实测整张音乐卡消失。
+//          (对照教训: 卡内容文本/控件也靠 effect backdrop 渲染, 一个都不能多杀。)
 static void (*sHNPMOrigBackdropDidMove)(id, SEL);
 static void hnpmBackdropDidMove(id self, SEL _cmd) {
     sHNPMOrigBackdropDidMove(self, _cmd);
     @try {
         if (![NSThread isMainThread]) return;
         UIView *v = (UIView *)self;
-        if (!v) return;
-        // v0.1.17: 钩子现场诊断(限频 1s) — v0.1.16 日志裁决: 钩子已挂但整场零触发,
-        //          而 dump 显示 backdrop a=1.00 在场。先留下"钩子确实被调用过"的痕迹,
-        //          否则无法区分"没触发"与"触发但规则不匹配"。
-        static CFAbsoluteTime sHNPMHookDiagAt = 0;
-        CFAbsoluteTime nowDiag = CFAbsoluteTimeGetCurrent();
-        if (nowDiag - sHNPMHookDiagAt > 1.0) {
-            sHNPMHookDiagAt = nowDiag;
-            UIView *pp = v.superview;
-            HNPMAppendLog([NSString stringWithFormat:@"[透明·罩层·钩子现场] backdrop挂载 父=%@ a=%.2f coverMode=%d",
-                           pp ? NSStringFromClass([pp class]) : @"(nil)", v.alpha,
-                           HNPMCoverMode() ? 1 : 0]);
-        }
-        if (v.alpha < 0.01) return;
+        if (!v || v.alpha < 0.01) return;
         if (!HNPMCoverMode()) return;
         CGFloat a = HNPMBgAlpha();
         if (a >= 0.99) return;
-        Class platterCls = NSClassFromString(@"PLPlatterView");
         Class customCls = NSClassFromString(@"PLPlatterCustomContentView");
-        if (!platterCls || !customCls) return;
+        if (!customCls) return;
         UIView *p = v.superview;
-        if (!p) return;
-        if ([p isKindOfClass:customCls]) {                   // 规则1: 材质白底
-            HNPMSetAlphaNoAnim(v, 0.0);
-            HNPMAppendLog(@"[透明·罩层] backdrop 挂载即中和(规则1·材质白底)");
-            return;
-        }
-        int g = 0;
-        while (p && g++ < 4) {
-            if (p.tag == HNPM_COVER_TAG) return;             // 自家罩层, 不碰
-            if ([p isKindOfClass:[UIVisualEffectView class]]) {
-                UIView *gp = p.superview;                    // 规则2: 占位 EFX(托盘直接子级)
-                if (gp && [gp isKindOfClass:platterCls]) {
-                    HNPMSetAlphaNoAnim(v, 0.0);
-                    HNPMAppendLog(@"[透明·罩层] backdrop 挂载即中和(规则2·占位EFX)");
-                } else {
-                    // v0.1.27 规则3: 列表占位 EFX — v0.1.26 白底盘次扫场裁决: 过门0(媒体卡
-                    //          cell 未创建, 列表里只有小通知单元)时白底照显 → 白块是列表预留
-                    //          区的占位材质, 不在托盘体系内, 扫场/避让无对象可藏。占位 EFX 的
-                    //          backdrop 挂载瞬间走本钩子 → 在列表子树内且宿主 EFX 高≥80pt
-                    //          (媒体卡占位尺寸)即压掉。避开 CSActivityItem 子树(通知卡内容
-                    //          vibrancy, v0.1.13 误杀教训)。
-                    UIView *anc = gp ? gp : p;
-                    BOOL inList = NO, inItem = NO;
-                    int g3 = 0;
-                    while (anc && g3++ < 8) {
-                        NSString *cn = NSStringFromClass([anc class]);
-                        if ([cn hasPrefix:@"CSActivityItem"]) { inItem = YES; break; }
-                        if ([cn hasPrefix:@"NCNotificationList"]) { inList = YES; break; }
-                        anc = anc.superview;
-                    }
-                    if (inList && !inItem && p.frame.size.height >= 80.0) {
-                        HNPMSetAlphaNoAnim(v, 0.0);
-                        HNPMAppendLog(@"[透明·罩层] backdrop 挂载即中和(规则3·列表占位EFX)");
-                    }
-                }
-                return;                                      // 更深的 EFX = 内容 vibrancy, 不碰
-            }
-            p = p.superview;
-        }
+        if (!p || p.tag == HNPM_COVER_TAG) return;         // 自家罩层的 backdrop, 不碰
+        if (![p isKindOfClass:customCls]) return;          // 只中和材质白底(直接子级)
+        HNPMSetAlphaNoAnim(v, 0.0);
+        HNPMAppendLog(@"[透明·罩层] backdrop 挂载即中和(挂载钩子)");
     } @catch (NSException *e) {}
 }
 static void HNPMHookBackdrop(void) {
@@ -1150,10 +1072,9 @@ static int HNPMCoverApplyOnMaterial(UIView *mat, CGFloat a, BOOL hideMat) {
             cover.tag = HNPM_COVER_TAG;
             objc_setAssociatedObject(mat, &kHNPMCoverSelfKey, cover, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
             [parent insertSubview:cover aboveSubview:mat];
-            HNPMAppendLog([NSString stringWithFormat:@"[透明·罩层] 已创建 blur 罩层 a=%.2f(材质%@%@ 父=%p)",
+            HNPMAppendLog([NSString stringWithFormat:@"[透明·罩层] 已创建 blur 罩层 a=%.2f(材质%@%@)",
                            a, NSStringFromClass([mat class]),
-                           hideMat ? @"已隐藏" : @", 盖托盘层(无bg期, 内容不受影响)",
-                           (__bridge void *)parent]);
+                           hideMat ? @"已隐藏" : @", 盖托盘层(无bg期, 内容不受影响)"]);
             hits++;
         } else if (cover.superview != parent) {
             [parent insertSubview:cover aboveSubview:mat];   // 移入当前父视图(bg 出现后从托盘上层移入)
@@ -1200,52 +1121,13 @@ static int HNPMCoverApplyOnMaterial(UIView *mat, CGFloat a, BOOL hideMat) {
                         NSMutableString *info = [NSMutableString stringWithFormat:@"mat=%@ 托盘=%d",
                                                  NSStringFromClass([mat class]), fp ? 1 : 0];
                         if (fp) {
-                            [info appendFormat:@" 托盘指针=%p", (__bridge void *)p];   // v0.1.17: 与深诊断 dump 的 托盘=%p 对账
                             NSArray *kids = [p.subviews copy];
                             [info appendFormat:@" 子%d:[", (int)kids.count];
                             for (UIView *c in kids) [info appendFormat:@"%@,", NSStringFromClass([c class])];
                             [info appendString:@"]"];
-                            // v0.1.17: 第二层 — 裁决 DFS 眼中的 CustomContent 内部与 dump 是否一致
-                            for (UIView *c in kids) {
-                                NSArray *gk = [c.subviews copy];
-                                if (gk.count == 0) continue;
-                                [info appendFormat:@" %@子%d:[", NSStringFromClass([c class]), (int)gk.count];
-                                int gi = 0;
-                                for (UIView *g in gk) {
-                                    if (gi++ >= 5) { [info appendString:@"…"]; break; }
-                                    [info appendFormat:@"%@(a=%.2f),", NSStringFromClass([g class]), g.alpha];
-                                }
-                                [info appendString:@"]"];
-                            }
                         }
                         HNPMAppendLog([NSString stringWithFormat:@"[透明·罩层·中和miss] %@", info]);
                     } @catch (NSException *e) {}
-                }
-            }
-            // v0.1.18: 清托盘 layer 背景色 — 视频+dump 联合裁决: 白底窗口期视图树完全健康
-            //          (MTM 已隐藏/无存活 backdrop), 白底来自视图 dump 不可见的层属性。
-            //          经典模式实证卡可全透明 → 托盘 layer 背景本应为透明, 罩层模式下
-            //          亮屏期若被系统设了白色背景, 就在每次应用时清掉(幂等)。
-            {
-                Class p2Cls = NSClassFromString(@"PLPlatterView");
-                UIView *p2 = mat;
-                int g2i = 0;
-                while (p2 && g2i++ < 6) {
-                    if (p2Cls && [p2 isKindOfClass:p2Cls]) break;
-                    p2 = p2.superview;
-                }
-                if (p2 && p2Cls && [p2 isKindOfClass:p2Cls] && p2.layer.backgroundColor) {
-                    CGColorRef oldBg = p2.layer.backgroundColor;
-                    BOOL isClear = (CGColorGetAlpha(oldBg) < 0.01);
-                    if (!isClear) {
-                        const CGFloat *ocp = CGColorGetComponents(oldBg);
-                        size_t onc = CGColorGetNumberOfComponents(oldBg);
-                        NSMutableString *bs = [NSMutableString string];
-                        for (size_t i = 0; i < onc && i < 4; i++) [bs appendFormat:@"%.2f,", ocp[i]];
-                        p2.layer.backgroundColor = [UIColor clearColor].CGColor;
-                        HNPMAppendLog([NSString stringWithFormat:@"[透明·罩层] 已清托盘 layer 背景色(bg=%@)", bs]);
-                        hits++;
-                    }
                 }
             }
         }
@@ -1265,173 +1147,6 @@ static void HNPMCoversWakeSweep(void);
 
 // v0.1.9 前置声明(定义在罩层收集区): 直扫按单元格整体收集目标要用
 static void HNPMCoverCollectTargets(UIView *root, NSMutableArray *outTargets);
-
-// v0.1.25: 白窗避让助手 — v0.1.24 裁决: 白底与卡片消失互斥(用户观察) → 白底确证来自卡内
-//          (远程场景重绘首帧), 避让有效但有竞态: 固定时点(0.05/0.1/0.3)可能抢在 cell 创建前
-//          落空, 落空的亮屏就整窗白底。改为: 亮屏后 1.15s 内任何时刻发现媒体卡可见即藏
-//          (扫场命中/深诊断共用), 0.65s 后恢复 — 双保险消灭竞态。
-static CFAbsoluteTime sHNPMWakeAt = 0;   // 最近一次屏幕状态通知时刻(亮屏/锁屏均刷新)
-static BOOL sHNPMAvoidedThisWake = NO;   // v0.1.26: 每轮亮屏只避让一次(修复恢复后再藏的闪烁)
-static void HNPMWakeAvoidCell(UIView *cell) {
-    if (!cell || cell.hidden || !cell.window || !HNPMCoverMode()) return;
-    CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
-    if (sHNPMWakeAt <= 0 || now - sHNPMWakeAt > 1.15) return;
-    if (sHNPMAvoidedThisWake) return;   // v0.1.26: 本轮已避让过 — v0.1.25 日志实测恢复后
-    // 60~80ms 扫场再见可见又藏, 每轮藏两次 = 用户所见"消失又出现闪几下"
-    sHNPMAvoidedThisWake = YES;
-    cell.hidden = YES;
-    HNPMAppendLog(@"[透明·罩层] 已隐媒体卡(白窗避让)");
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.65 * NSEC_PER_SEC)),
-                   dispatch_get_main_queue(), ^{
-        @try {
-            cell.hidden = NO;
-            // v0.1.28: 恢复加 0.25s 淡入 — 用户报告卡"消失一下再恢复"突兀
-            cell.alpha = 0.0;
-            [UIView animateWithDuration:0.25 animations:^{ cell.alpha = 1.0; }];
-            HNPMAppendLog(@"[透明·罩层] 已恢复媒体卡(白窗结束, 淡入)");
-        } @catch (NSException *e) {}
-    });
-}
-
-// v0.1.28: 列表占位主动中和 — v0.1.27 裁决: 白底盘次"过门0"(媒体卡 cell 未创建)白底照显,
-//          且挂载钩子规则3零触发 → 占位白块在锁屏会话开始时就已存在(非新建), 亮屏时不会
-//          重新走 didMoveToWindow, 钩子抓不到; 亮屏瞬间它的 backdrop recipe 重解析发白
-//          (同自家罩层机理)。白窗内扫场直接 DFS NCNotificationList 子树:
-//          高≥60pt 的 EFX 压 backdrop alpha + 清 contentView 非透明 bg(卡内同款配方),
-//          MTMaterial/PLPlatter 非透明 layer bg 清除; 幂等, 重建的 backdrop 由规则3兜底。
-static void HNPMNeutralizeListPlaceholder(void) {
-    CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
-    if (sHNPMWakeAt <= 0 || now - sHNPMWakeAt > 1.15) return;   // 仅白窗内
-    static CFAbsoluteTime sHNPMPlcDiagAt = 0;
-    BOOL diag = (now - sHNPMPlcDiagAt > 0.6);   // 诊断限频: 每轮亮屏 ~1 行
-    if (diag) sHNPMPlcDiagAt = now;
-    @try {
-        Class efxCls = [UIVisualEffectView class];
-        NSArray *windows = [UIApplication sharedApplication].windows;
-        for (UIWindow *w in windows) {
-            if (!w) continue;
-            NSMutableArray *stack = [NSMutableArray arrayWithObject:w];
-            int guard = 0;
-            while (stack.count > 0 && guard++ < 900) {
-                UIView *v = stack.firstObject;
-                [stack removeObjectAtIndex:0];
-                if (!v || v.tag == HNPM_COVER_TAG) continue;
-                NSString *cls = NSStringFromClass([v class]);
-                if ([cls containsString:@"Remote"]) continue;
-                if (![cls hasPrefix:@"NCNotificationList"] &&
-                    ![cls hasPrefix:@"CSCoverSheetView"]) {
-                    [stack addObjectsFromArray:v.subviews];
-                    continue;
-                }
-                // 进入 NCNotificationList / CSCoverSheetView 子树: 逐视图检查占位材质
-                NSMutableArray *st2 = [NSMutableArray arrayWithObject:v];
-                int g2 = 0;
-                int nEnum = 0;   // v0.1.30: 锚点上移到 CSCoverSheetView — v0.1.29 白底盘次
-                                 // 枚举只有列表骨架, 白块可能在列表之外(CSScrollView/
-                                 // CSMainPageView 层); 且深诊断旁支以登记 cell 为锚, cell
-                                 // 不在场时全盲。大块视图(w≥200 或 h≥80)无差别枚举。
-                while (st2.count > 0 && g2++ < 250) {
-                    UIView *s = st2.firstObject;
-                    [st2 removeObjectAtIndex:0];
-                    if (!s || s.tag == HNPM_COVER_TAG || s.hidden || s.alpha < 0.01) continue;
-                    NSString *sc = NSStringFromClass([s class]);
-                    CGFloat h = s.frame.size.height;
-                    CGFloat w = s.frame.size.width;
-                    BOOL inItem = [sc hasPrefix:@"CSActivityItem"];
-                    BOOL bigBlock = (w >= 200.0 && h >= 80.0);
-                    if (diag && (bigBlock || (h >= 50.0 && nEnum < 8)) && nEnum < 12) {
-                        nEnum++;
-                        NSMutableString *bgDesc = [NSMutableString string];
-                        CGColorRef dbg = s.layer.backgroundColor;
-                        if (dbg) {
-                            size_t dnc = CGColorGetNumberOfComponents(dbg);
-                            const CGFloat *dcp = CGColorGetComponents(dbg);
-                            if (dnc > 0 && dcp[dnc - 1] > 0.01) {
-                                for (size_t i = 0; i < dnc && i < 4; i++) [bgDesc appendFormat:@"%.2f,", dcp[i]];
-                                [bgDesc insertString:@" bg=" atIndex:0];
-                            }
-                        }
-                        HNPMAppendLog([NSString stringWithFormat:
-                            @"[透明·罩层·占位枚举] %@%@ %.0fx%.0f@%.0f,%.0f a=%.2f sub=%lu%@",
-                            inItem ? @"(item内)" : @"", sc, w, h,
-                            s.frame.origin.x, s.frame.origin.y, s.alpha,
-                            (unsigned long)s.subviews.count, bgDesc]);
-                    }
-                    if (inItem) continue;   // 内容 vibrancy 子树不中和不下钻(防误杀)
-                    if (h >= 60.0) {
-                        if ([s isKindOfClass:efxCls]) {
-                            UIView *bd = nil;
-                            UIView *content = nil;
-                            for (UIView *k in s.subviews) {
-                                if ([NSStringFromClass([k class]) containsString:@"Backdrop"]) bd = k;
-                                else if (!content) content = k;
-                            }
-                            if (bd) {
-                                if (bd.alpha > 0.01) {
-                                    HNPMSetAlphaNoAnim(bd, 0.0);
-                                    if (diag) HNPMAppendLog([NSString stringWithFormat:
-                                        @"[透明·罩层] 已中和列表占位EFX(白窗主动) h=%.0f", h]);
-                                }
-                                if (content && content.layer.backgroundColor) {
-                                    CGColorRef cbg = content.layer.backgroundColor;
-                                    size_t nc = CGColorGetNumberOfComponents(cbg);
-                                    const CGFloat *cp = CGColorGetComponents(cbg);
-                                    if (nc > 0 && cp[nc - 1] > 0.01) {
-                                        NSMutableString *cs = [NSMutableString string];
-                                        for (size_t i = 0; i < nc && i < 4; i++) [cs appendFormat:@"%.2f,", cp[i]];
-                                        content.layer.backgroundColor = [UIColor clearColor].CGColor;
-                                        if (diag) HNPMAppendLog([NSString stringWithFormat:
-                                            @"[透明·罩层] 已清占位 contentView 背景(bg=%@)", cs]);
-                                    }
-                                }
-                            } else if (diag) {
-                                // 空壳 EFX(无 backdrop, 画不出白) — 只记录
-                                HNPMAppendLog([NSString stringWithFormat:
-                                    @"[透明·罩层·占位枚举] EFX h=%.0f 空壳(无backdrop)", h]);
-                            }
-                        } else if ([sc hasPrefix:@"MTMaterial"] || [sc hasPrefix:@"PLPlatter"] ||
-                                   [sc hasPrefix:@"_UIVisualEffectBackdropView"]) {
-                            CGColorRef lbg = s.layer.backgroundColor;
-                            if (lbg) {
-                                size_t nc = CGColorGetNumberOfComponents(lbg);
-                                const CGFloat *cp = CGColorGetComponents(lbg);
-                                if (nc > 0 && cp[nc - 1] > 0.01) {
-                                    NSMutableString *ls = [NSMutableString string];
-                                    for (size_t i = 0; i < nc && i < 4; i++) [ls appendFormat:@"%.2f,", cp[i]];
-                                    s.layer.backgroundColor = [UIColor clearColor].CGColor;
-                                    if (diag) HNPMAppendLog([NSString stringWithFormat:
-                                        @"[透明·罩层] 已清占位材质 %@ layer 背景(bg=%@)", sc, ls]);
-                                }
-                            }
-                        } else if ([sc containsString:@"CaptureOnly"] || [sc hasPrefix:@"BSUIVibrancy"]) {
-                            // v0.1.31: 通知中心材质跨进程捕获快照(v0.1.30 白底盘次实锤:
-                            //          cell 不在场时 NCMaterialDisplayingCaptureOnlyViewControllerView
-                            //          + BSUIVibrancyBackdropView h=251(卡区高度) 显示过期/白底快照)。
-                            //          白窗内隐藏, 0.65s 后恢复 — 与卡避让同节奏。
-                            if (!s.hidden && s.alpha > 0.01) {
-                                s.hidden = YES;
-                                HNPMAppendLog([NSString stringWithFormat:
-                                    @"[透明·罩层] 已隐捕获快照 %@ h=%.0f", sc, h]);
-                                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.65 * NSEC_PER_SEC)),
-                                               dispatch_get_main_queue(), ^{
-                                    @try {
-                                        s.hidden = NO;
-                                        HNPMAppendLog(@"[透明·罩层] 已恢复捕获快照");
-                                    } @catch (NSException *e) {}
-                                });
-                            }
-                        } else if (diag && s.subviews.count == 0 && h >= 80.0) {
-                            // 陌生叶子视图 — 仅记录, 不动(防误杀)
-                            HNPMAppendLog([NSString stringWithFormat:
-                                @"[透明·罩层·占位枚举] %@ h=%.0f a=%.2f (未处理)", sc, h, s.alpha]);
-                        }
-                    }
-                    [st2 addObjectsFromArray:s.subviews];
-                }
-            }
-        }
-    } @catch (NSException *e) {}
-}
 
 // v0.1.9: 免登记亮屏扫 — v0.1.8 日志裁决: 直扫"免登记直接应用"零次出现, 每次亮屏新罩层
 //          都在 +0.9s 才由布局钩子创建 → 亮屏后 0~0.9s 的白底来自**托盘创建之前的占位
@@ -1492,8 +1207,6 @@ static void HNPMCoversWakeSweep(void) {
                             hits += HNPMCoverApplyOnMaterial(mat, a,
                                     !(platterCls && [mat isKindOfClass:platterCls]));
                         }
-                        // v0.1.25: 白窗避让 — 应用完透明后, 亮屏窗口内发现卡可见即整卡藏(竞态兜底)
-                        HNPMWakeAvoidCell(v);
                     }
                     continue;   // cell 子树已由 collect 遍历(或判定不过关不碰), 不再下钻
                 }
@@ -1521,14 +1234,12 @@ static void HNPMCoversWakeSweep(void) {
                 [stack addObjectsFromArray:v.subviews];
             }
         }
-        // v0.1.28: 白窗内主动中和列表占位(挂载钩子抓不到已存在的占位 EFX)
-        HNPMNeutralizeListPlaceholder();
         // 诊断: 限频 0.5s — 每次亮屏窗口输出 ~5 行, 记录直扫看到了什么
         static CFAbsoluteTime sHNPMCoversSweepDiag = 0;
         CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
         if (now - sHNPMCoversSweepDiag > 0.5) {
             sHNPMCoversSweepDiag = now;
-            HNPMAppendLog([NSString stringWithFormat:@"[透明·亮屏扫 v0.1.31] 窗口%lu 托盘%d 单元%d[%@] 过门%d 改动%d",
+            HNPMAppendLog([NSString stringWithFormat:@"[透明·亮屏扫] 窗口%lu 托盘%d 单元%d[%@] 过门%d 改动%d",
                            (unsigned long)windows.count, nPlatter, nCell,
                            [cellSizes componentsJoinedByString:@","], nGated, hits]);
         }
@@ -1972,16 +1683,6 @@ static void HNPMScreenStateCB(CFNotificationCenterRef center, void *observer,
                               CFStringRef name, const void *object, CFDictionaryRef userInfo) {
     HNPMAppendLog([NSString stringWithFormat:@"[透明] 屏幕状态通知(%@) → 连扫窗口开启",
                    (__bridge NSString *)name]);
-    // v0.1.27: 只有亮屏(hasBlankedScreen)刷新避让基准 — v0.1.26 日志裁决: lockstate(锁定/
-    //          解锁)也触发避让 → AOD 上音乐卡消失又恢复(用户报告"锁屏后卡消失几秒")。
-    //          锁定动作无白窗, 无需避让。0.8s 去抖保留(连发只算一轮)。
-    NSString *nn = (__bridge NSString *)name;
-    BOOL isBlanked = [nn containsString:@"hasBlankedScreen"];
-    CFAbsoluteTime now2 = CFAbsoluteTimeGetCurrent();
-    if (isBlanked && (sHNPMWakeAt <= 0 || now2 - sHNPMWakeAt > 0.8)) {
-        sHNPMWakeAt = now2;             // v0.1.25: 白窗避让时间基准
-        sHNPMAvoidedThisWake = NO;      // v0.1.26: 新一轮亮屏, 允许避让一次
-    }
     HNPMStartAlphaBurst();
     HNPMScheduleDeepDumps();   // v0.0.95: 每次亮/灭屏排程时序化深诊断
     // v0.1.8: 免登记亮屏直扫 — 立即一次 + 时序化九次, 不等登记/配方(见 HNPMCoversWakeSweep 注释)
@@ -2003,233 +1704,14 @@ static void HNPMDeepDumpAt(NSString *tag) {
             HNPMAppendLog([NSString stringWithFormat:@"[透明·深诊断@%@] 无在场登记卡", tag]);
             return;
         }
-        // v0.1.20: 旁支诊断 — v0.1.19 裁决: 祖先链(NCNotificationListView→...→SBCoverSheetWindow)
-        //          全程零非透明 layer 背景色(已清祖先 0 次), 纵向(子树+祖先)全部排除 →
-        //          白的画手只剩横向: cell 的兄弟视图(如列表容器垫底的背景材质)。
-        //          首轮: 收集祖先(链日志@0.3 + 非透明 layer bg 清除 + 祖先 img 标记);
-        //          次轮: 逐祖先枚举"非 cell 分支"的兄弟视图, 材质类/非透明 bg/有 contents/存活
-        //          backdrop 才上报; 存活 backdrop 定向中和(已验证配方), 材质 layer bg 清除。
-        {
-            NSMutableArray *ancs = [NSMutableArray array];
-            NSMutableString *chain = [NSMutableString string];
-            UIView *anc = cell.superview;
-            int ag = 0;
-            while (anc && ag++ < 24) {
-                [ancs addObject:anc];
-                NSString *ac = NSStringFromClass([anc class]);
-                if ([tag isEqualToString:@"0.3"]) [chain appendFormat:@"%@ >", ac];
-                CGColorRef abg = anc.layer.backgroundColor;
-                if (abg) {
-                    size_t nc2 = CGColorGetNumberOfComponents(abg);
-                    const CGFloat *acp = CGColorGetComponents(abg);
-                    if (nc2 > 0 && acp[nc2 - 1] > 0.01) {
-                        NSMutableString *abs2 = [NSMutableString string];
-                        for (size_t i = 0; i < nc2 && i < 4; i++) [abs2 appendFormat:@"%.2f,", acp[i]];
-                        anc.layer.backgroundColor = [UIColor clearColor].CGColor;
-                        HNPMAppendLog([NSString stringWithFormat:@"[透明·罩层] 已清祖先 layer 背景色 %@(bg=%@)",
-                                       ac, abs2]);
-                    }
-                }
-                if ([tag isEqualToString:@"0.3"] && anc.layer.contents) {
-                    HNPMAppendLog([NSString stringWithFormat:@"[透明·深诊断@%@] 祖先有contents: %@", tag, ac]);
-                }
-                anc = anc.superview;
-            }
-            if ([tag isEqualToString:@"0.3"] && chain.length > 0) {
-                HNPMAppendLog([NSString stringWithFormat:@"[透明·深诊断@%@] 祖先链: %@", tag, chain]);
-            }
-            // 次轮: 旁支枚举(@0.1 + @0.3 — v0.1.21 提前到 0.1s, 进入白底窗口内生效)
-            if ([tag isEqualToString:@"0.3"] || [tag isEqualToString:@"0.1"]) {
-                CGRect cellWin = [cell convertRect:cell.bounds toView:cell.window];
-                int sibLog = 0;
-                for (NSUInteger ai = 0; ai < ancs.count && sibLog < 12; ai++) {
-                    UIView *A = ancs[ai];
-                    UIView *childBranch = (ai > 0) ? ancs[ai - 1] : cell;   // cell 所在分支
-                    NSArray *kids = [A.subviews copy];
-                    for (UIView *s in kids) {
-                        if (s == childBranch || s.tag == HNPM_COVER_TAG) continue;
-                        if (sibLog >= 12) break;
-                        NSString *sc = NSStringFromClass([s class]);
-                        BOOL materialLike = ([sc hasPrefix:@"MTMaterial"] || [sc hasPrefix:@"PLPlatter"] ||
-                                             [sc hasPrefix:@"_UIVisualEffect"] || [s isKindOfClass:[UIVisualEffectView class]]);
-                        CGColorRef sbg = s.layer.backgroundColor;
-                        CGFloat sbga = 0.0;
-                        NSMutableString *sbs = [NSMutableString string];
-                        if (sbg) {
-                            size_t nc3 = CGColorGetNumberOfComponents(sbg);
-                            const CGFloat *scp = CGColorGetComponents(sbg);
-                            if (nc3 > 0) sbga = scp[nc3 - 1];
-                            for (size_t i = 0; i < nc3 && i < 4; i++) [sbs appendFormat:@"%.2f,", scp[i]];
-                        }
-                        BOOL hasImg = (s.layer.contents != NULL);
-                        BOOL liveBD = NO;
-                        Class bdCls = NSClassFromString(@"_UIVisualEffectBackdropView");
-                        if (bdCls && [s isKindOfClass:bdCls] && s.alpha > 0.01) liveBD = YES;
-                        if (!materialLike && sbga <= 0.01 && !hasImg && !liveBD) continue;
-                        CGRect sWin = [s convertRect:s.bounds toView:s.window];
-                        BOOL overlap = CGRectIntersectsRect(cellWin, sWin);
-                        CGRect f = s.frame;
-                        HNPMAppendLog([NSString stringWithFormat:
-                                       @"[透明·深诊断@%@] 旁支[%@下] %@ a=%.2f h=%d bg=%@%@ frame=%.0fx%.0f@%.0f,%.0f %@%@",
-                                       tag, NSStringFromClass([A class]), sc, s.alpha, s.hidden ? 1 : 0,
-                                       sbs, hasImg ? @" img" : @"", f.size.width, f.size.height,
-                                       f.origin.x, f.origin.y,
-                                       overlap ? @"∩卡" : @"", liveBD ? @" <存活BD>" : @""]);
-                        sibLog++;
-                        // 定向中和: 存活 backdrop → 压 alpha; 材质类非透明 layer bg → 清除
-                        if (liveBD && HNPMCoverMode()) {
-                            HNPMSetAlphaNoAnim(s, 0.0);
-                            HNPMAppendLog([NSString stringWithFormat:@"[透明·罩层] 已中和旁支 backdrop(父=%@)", sc]);
-                        } else if (materialLike && sbga > 0.01) {
-                            s.layer.backgroundColor = [UIColor clearColor].CGColor;
-                            HNPMAppendLog([NSString stringWithFormat:@"[透明·罩层] 已清旁支 %@ layer 背景色(bg=%@)", sc, sbs]);
-                        }
-                        // v0.1.21: 全屏 EFX 旁支 — v0.1.20 裁决: 旁支仅两种, TouchPassThrough(a=0,h=1)无害,
-                        //          SBFTouchPassThroughView 下全屏 UIVisualEffectView a=1.00 h=0 ∩卡 = 树上
-                        //          最后一个存活材质。亮屏瞬间材质 recipe 未就绪 → backdrop 平铺白 ≈ 首帧白底
-                        //          (~0.5s 后 recipe 加载转模糊, 与视频白窗吻合)。处理: 枚举其子层留证据,
-                        //          backdrop 存活即压 alpha(与卡内配方一致, 幂等)。
-                        if ([s isKindOfClass:[UIVisualEffectView class]] && HNPMCoverMode() && overlap) {
-                            NSArray *efxKids = [s.subviews copy];
-                            for (UIView *ek in efxKids) {
-                                if (ek.tag == HNPM_COVER_TAG) continue;
-                                Class bdc2 = NSClassFromString(@"_UIVisualEffectBackdropView");
-                                if (bdc2 && [ek isKindOfClass:bdc2]) {
-                                    HNPMAppendLog([NSString stringWithFormat:
-                                                   @"[透明·深诊断@%@] 全屏EFX子层 backdrop a=%.2f h=%d",
-                                                   tag, ek.alpha, ek.hidden ? 1 : 0]);
-                                    if (ek.alpha > 0.01) {
-                                        HNPMSetAlphaNoAnim(ek, 0.0);
-                                        HNPMAppendLog(@"[透明·罩层] 已中和全屏EFX backdrop");
-                                    }
-                                } else {
-                                    HNPMAppendLog([NSString stringWithFormat:
-                                                   @"[透明·深诊断@%@] 全屏EFX子层 %@ a=%.2f h=%d",
-                                                   tag, NSStringFromClass([ek class]), ek.alpha, ek.hidden ? 1 : 0]);
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            // v0.1.22: 窗口表 + CA 层树 — v0.1.21 裁决: 全屏 EFX 在 0.1/0.3s 时点 subviews 为空
-            //          (无 backdrop 无 contentView, 空壳画不出白) → UIKit 视图路线(子树/祖先/旁支)
-            //          全部穷尽。白底只能来自非 UIView 来源: ①别的窗口(亮屏过渡快照窗) ②CA 层
-            //          replica(v0.1.17 曾见 PBUIPosterFloatingLayerReplica)。@0.1 各打一条:
-            //          全部窗口一览(类/a/h/frame/背景) + cell.window 顶层 CA 子树(深度≤3)。
-            if ([tag isEqualToString:@"0.1"]) {
-                @try {
-                    NSArray *ws = [[UIApplication sharedApplication] windows];
-                    NSMutableString *wt = [NSMutableString string];
-                    for (NSUInteger i = 0; i < ws.count && i < 26; i++) {
-                        UIWindow *w = ws[i];
-                        NSString *wc = NSStringFromClass([w class]);
-                        CGColorRef wbg = w.layer.backgroundColor;
-                        BOOL wbgO = NO;
-                        if (wbg) {
-                            size_t wnc = CGColorGetNumberOfComponents(wbg);
-                            const CGFloat *wcp = CGColorGetComponents(wbg);
-                            wbgO = (wnc > 0 && wcp[wnc - 1] > 0.01);
-                        }
-                        CGRect wf = w.frame;
-                        [wt appendFormat:@"[%lu]%@(%.0f,%.0fx%.0f,%.0f%s%s)",
-                         (unsigned long)i, wc, wf.origin.x, wf.origin.y, wf.size.width, wf.size.height,
-                         w.hidden ? ",隐" : "", wbgO ? ",bg!" : ""];
-                        if (w == cell.window) [wt appendString:@"←卡"];
-                        if (i + 1 < ws.count && i < 25) [wt appendString:@" "];
-                    }
-                    HNPMAppendLog([NSString stringWithFormat:@"[透明·深诊断@%@] 窗口表(%lu): %@",
-                                   tag, (unsigned long)ws.count, wt]);
-                    // CA 层树: 广度优先, 深度≤3, 最多 40 个; 只报类名+子层数(层无 alpha 语义则跳过细项)
-                    NSMutableString *lt = [NSMutableString string];
-                    NSMutableArray *lq = [NSMutableArray arrayWithObject:cell.window.layer];
-                    NSMutableArray *lqd = [NSMutableArray arrayWithObject:@0];
-                    int lg = 0;
-                    while (lq.count > 0 && lg++ < 40) {
-                        CALayer *L = lq.firstObject;
-                        [lq removeObjectAtIndex:0];
-                        NSInteger d = [(lqd.firstObject ?: @0) integerValue];
-                        [lqd removeObjectAtIndex:0];
-                        if (!L) continue;
-                        [lt appendFormat:@"%@(%lu) ", NSStringFromClass([L class]), (unsigned long)L.sublayers.count];
-                        if (d < 3) {
-                            for (CALayer *sl in [L.sublayers copy]) {
-                                [lq addObject:sl];
-                                [lqd addObject:@(d + 1)];
-                            }
-                        }
-                    }
-                    HNPMAppendLog([NSString stringWithFormat:@"[透明·深诊断@%@] 层树: %@", tag, lt]);
-                } @catch (NSException *e) {}
-            }
-            // v0.1.24: 整卡避让 — v0.1.23 裁决: 自家罩层已隐(含 a=1.00 backdrop)整个白窗期,
-            //          白底依旧 ~1s → 自家罩层洗清, 本地视图树 100% 排除。结合 cell 子树仅
-            //          15 视图却挂 _UIScenePresentationView→_UISceneLayerHostContainerView
-            //          场景宿主链 → 卡片视觉内容是跨进程远程渲染, 亮屏时远程进程重绘首帧
-            //          即白底, 本地无法阻止其渲染, 只能整卡避让: @0.05/@0.1/@0.3 隐 cell,
-            //          0.65s 后恢复。白窗期卡区直接显示壁纸, 卡片随后出现。
-            //          同时是终极诊断: 若整卡已隐仍白, 白必在卡外(转查窗口级来源)。
-            if ([tag isEqualToString:@"0.05"] || [tag isEqualToString:@"0.1"] ||
-                [tag isEqualToString:@"0.3"]) {
-                @try {
-                    // v0.1.25: 统一走白窗避让助手(扫场/深诊断同一逻辑, 消灭时点竞态)
-                    HNPMWakeAvoidCell(cell);
-                    // v0.1.23: 自家罩层避让(整卡已隐时为冗余保险, 保留)
-                    UIView *cover = nil;
-                    NSMutableArray *cs = [NSMutableArray arrayWithObject:cell];
-                    int cg = 0;
-                    while (cs.count > 0 && cg++ < 200 && !cover) {
-                        UIView *v = cs.firstObject;
-                        [cs removeObjectAtIndex:0];
-                        if (!v) continue;
-                        if (v.tag == HNPM_COVER_TAG && [v isKindOfClass:[UIVisualEffectView class]]) { cover = v; break; }
-                        [cs addObjectsFromArray:[v.subviews copy]];
-                    }
-                    if (cover && HNPMCoverMode() && !cover.hidden) {
-                        NSMutableString *kds = [NSMutableString string];
-                        for (UIView *ek in [cover.subviews copy]) {
-                            [kds appendFormat:@"%@(a=%.2f,h=%d) ", NSStringFromClass([ek class]),
-                             ek.alpha, ek.hidden ? 1 : 0];
-                        }
-                        cover.hidden = YES;
-                        HNPMAppendLog([NSString stringWithFormat:
-                                       @"[透明·罩层] 已隐自家罩层(首帧白窗, 子层: %@)", kds]);
-                        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.75 * NSEC_PER_SEC)),
-                                       dispatch_get_main_queue(), ^{
-                            @try {
-                                cover.hidden = NO;
-                                HNPMAppendLog(@"[透明·罩层] 已恢复自家罩层(白窗结束)");
-                            } @catch (NSException *e) {}
-                        });
-                    }
-                } @catch (NSException *e) {}
-            }
-        }
         NSMutableArray *rows = [NSMutableArray array];
         NSMutableArray *stack = [NSMutableArray arrayWithObject:cell];
-        NSMutableArray *inPlat = [NSMutableArray arrayWithObject:@NO];   // v0.1.17: 与 stack 平行的"在托盘子树内"标记
-        void *platterPtr = NULL;                                         // v0.1.17: 托盘指针, 与 apply 日志对账
         int guard = 0;
         while (stack.count > 0 && guard++ < 200 && rows.count < 40) {
             UIView *v = stack.firstObject;
             [stack removeObjectAtIndex:0];
-            BOOL underPlatter = [(inPlat.firstObject ?: @NO) boolValue];
-            [inPlat removeObjectAtIndex:0];
             if (!v) continue;
-            if (v.tag == HNPM_COVER_TAG) continue;   // v0.1.17: 不下钻自家罩层(内部 backdrop 是我们的 blur)
             NSString *cls = NSStringFromClass([v class]);
-            // v0.1.17: dump 兜底中和 — v0.1.16 裁决: apply 路径 55 次 miss + 挂载钩子零触发,
-            //          同秒 dump 却能看到托盘内 backdrop a=1.00 → dump 是唯一看得见的路径,
-            //          反正在跑, 顺手中和(仅限托盘子树内的 backdrop, 内容 vibrancy 不受影响)。
-            if (underPlatter && HNPMCoverMode()) {
-                CGFloat aa = HNPMBgAlpha();
-                Class bdCls = NSClassFromString(@"_UIVisualEffectBackdropView");
-                if (aa < 0.99 && bdCls && [v isKindOfClass:bdCls] && v.alpha > 0.01) {
-                    HNPMSetAlphaNoAnim(v, 0.0);
-                    HNPMAppendLog([NSString stringWithFormat:@"[透明·罩层] 已中和 backdrop(深诊断兜底, 父=%@)",
-                                   v.superview ? NSStringFromClass([v.superview class]) : @"?"]);
-                }
-            }
             NSString *extra = @"";
             if ([v isKindOfClass:[UILabel class]]) {
                 NSString *t = [(UILabel *)v text] ?: @"";
@@ -2237,35 +1719,19 @@ static void HNPMDeepDumpAt(NSString *tag) {
                 extra = [NSString stringWithFormat:@" text=%@", t];
             }
             if ([v isKindOfClass:[UIVisualEffectView class]]) extra = [extra stringByAppendingString:@" <EFX>"];
-            // v0.1.18: 层属性采集 — 视频裁决: 白底窗口期(亮屏后0~0.55s)视图树完全健康
-            //          (0.3s dump: MTM 已隐藏/无存活 backdrop/罩层在场) → 白底来自视图
-            //          dump 不可见的层属性。逐视图采集 layer.backgroundColor 与 contents。
-            CGColorRef bgc = v.layer.backgroundColor;
-            if (bgc) {
-                size_t nc = CGColorGetNumberOfComponents(bgc);
-                const CGFloat *cp = CGColorGetComponents(bgc);
-                NSMutableString *bs = [NSMutableString string];
-                for (size_t i = 0; i < nc && i < 4; i++) [bs appendFormat:@"%.2f,", cp[i]];
-                extra = [extra stringByAppendingFormat:@" bg=%@", bs];
-            }
-            if (v.layer.contents) extra = [extra stringByAppendingString:@" img"];
             CALayer *pl = (CALayer *)v.layer.presentationLayer;
             CGFloat pop = pl ? pl.opacity : -1.0;
             [rows addObject:[NSString stringWithFormat:@"%@ a=%.2f p=%.2f h=%d%@",
                              cls, v.alpha, pop, v.hidden ? 1 : 0, extra]];
-            BOOL nextIn = underPlatter || [cls isEqualToString:@"PLPlatterView"];
-            if ([cls isEqualToString:@"PLPlatterView"] && !platterPtr) platterPtr = (__bridge void *)v;
-            NSArray *kidsDump = [v.subviews copy];   // v0.1.17: copy 一次, 防两次取值之间树变异导致平行数组错位
-            [stack addObjectsFromArray:kidsDump];
-            for (NSUInteger i = 0; i < kidsDump.count; i++) [inPlat addObject:@(nextIn)];
+            [stack addObjectsFromArray:v.subviews];
         }
-        HNPMAppendLog([NSString stringWithFormat:@"[透明·深诊断@%@] 托盘=%p %lu视图: %@",
-                       tag, platterPtr, (unsigned long)rows.count, [rows componentsJoinedByString:@" || "]]);
+        HNPMAppendLog([NSString stringWithFormat:@"[透明·深诊断@%@] %lu视图: %@",
+                       tag, (unsigned long)rows.count, [rows componentsJoinedByString:@" || "]]);
     } @catch (NSException *e) {}
 }
 
 static void HNPMScheduleDeepDumps(void) {
-    for (NSString *d in @[@"0.05", @"0.1", @"0.3", @"0.8", @"1.5", @"2.5"]) {
+    for (NSString *d in @[@"0.3", @"0.8", @"1.5", @"2.5"]) {
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)([d doubleValue] * NSEC_PER_SEC)),
                        dispatch_get_main_queue(), ^{
             @try {
@@ -3553,7 +3019,7 @@ static void HNPMAttachPanIfNeeded(UIView *view) {
 #pragma mark - 入口
 
 __attribute__((constructor)) static void HNPMRawCtor(void) {
-    HNPMAppendLog(@"v0.1.31: dylib 构造函数已执行(dyld 加载成功)");
+    HNPMAppendLog(@"v0.1.32: dylib 构造函数已执行(dyld 加载成功)");
 }
 
 // v0.0.50/51: 岛元素抑制策略钩子 — 隐藏期让系统把 NowPlaying 元素当作"应被抑制",
@@ -3616,7 +3082,7 @@ __attribute__((constructor)) static void HNPMRawCtor(void) {
 
 %ctor {
     @autoreleasepool {
-        HNPMAppendLog(@"v0.1.31: logos %ctor 进入");
+        HNPMAppendLog(@"v0.1.32: logos %ctor 进入");
     HNPMAppendLog(HNPMCoverMode()
         ? @"[透明] 罩层模式 ON(HideNowPlaying.cover 存在 → 系统材质不动, 用自有 blur 罩层)"
         : @"[透明] 罩层模式 OFF(经典 alpha 模式; 建 /var/mobile/Documents/HideNowPlaying.cover 可切换)");
@@ -3714,7 +3180,7 @@ __attribute__((constructor)) static void HNPMRawCtor(void) {
         // v0.0.93: 空闲巡逻(0.5s 只读一次, 无在场卡自动停) — 堵"空闲期静默重置无事件触发"盲区
         HNPMIdleAlphaCheck();
         HNPMHookBackdrop();
-        HNPMAppendLog(@"v0.1.31: 空闲巡逻已启动");
-        HNPMAppendLog(@"v0.1.31: %ctor 正常完成");
+        HNPMAppendLog(@"v0.1.32: 空闲巡逻已启动");
+        HNPMAppendLog(@"v0.1.32: %ctor 正常完成");
     }
 }
