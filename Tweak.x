@@ -1285,9 +1285,109 @@ static void HNPMWakeAvoidCell(UIView *cell) {
                    dispatch_get_main_queue(), ^{
         @try {
             cell.hidden = NO;
-            HNPMAppendLog(@"[透明·罩层] 已恢复媒体卡(白窗结束)");
+            // v0.1.28: 恢复加 0.25s 淡入 — 用户报告卡"消失一下再恢复"突兀
+            cell.alpha = 0.0;
+            [UIView animateWithDuration:0.25 animations:^{ cell.alpha = 1.0; }];
+            HNPMAppendLog(@"[透明·罩层] 已恢复媒体卡(白窗结束, 淡入)");
         } @catch (NSException *e) {}
     });
+}
+
+// v0.1.28: 列表占位主动中和 — v0.1.27 裁决: 白底盘次"过门0"(媒体卡 cell 未创建)白底照显,
+//          且挂载钩子规则3零触发 → 占位白块在锁屏会话开始时就已存在(非新建), 亮屏时不会
+//          重新走 didMoveToWindow, 钩子抓不到; 亮屏瞬间它的 backdrop recipe 重解析发白
+//          (同自家罩层机理)。白窗内扫场直接 DFS NCNotificationList 子树:
+//          高≥60pt 的 EFX 压 backdrop alpha + 清 contentView 非透明 bg(卡内同款配方),
+//          MTMaterial/PLPlatter 非透明 layer bg 清除; 幂等, 重建的 backdrop 由规则3兜底。
+static void HNPMNeutralizeListPlaceholder(void) {
+    CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
+    if (sHNPMWakeAt <= 0 || now - sHNPMWakeAt > 1.15) return;   // 仅白窗内
+    static CFAbsoluteTime sHNPMPlcDiagAt = 0;
+    BOOL diag = (now - sHNPMPlcDiagAt > 0.6);   // 诊断限频: 每轮亮屏 ~1 行
+    if (diag) sHNPMPlcDiagAt = now;
+    @try {
+        Class efxCls = [UIVisualEffectView class];
+        NSArray *windows = [UIApplication sharedApplication].windows;
+        for (UIWindow *w in windows) {
+            if (!w) continue;
+            NSMutableArray *stack = [NSMutableArray arrayWithObject:w];
+            int guard = 0;
+            while (stack.count > 0 && guard++ < 500) {
+                UIView *v = stack.firstObject;
+                [stack removeObjectAtIndex:0];
+                if (!v || v.tag == HNPM_COVER_TAG) continue;
+                NSString *cls = NSStringFromClass([v class]);
+                if ([cls containsString:@"Remote"]) continue;
+                if (![cls hasPrefix:@"NCNotificationList"]) {
+                    [stack addObjectsFromArray:v.subviews];
+                    continue;
+                }
+                // 进入 NCNotificationList 子树: 逐视图检查占位材质
+                NSMutableArray *st2 = [NSMutableArray arrayWithObject:v];
+                int g2 = 0;
+                while (st2.count > 0 && g2++ < 120) {
+                    UIView *s = st2.firstObject;
+                    [st2 removeObjectAtIndex:0];
+                    if (!s || s.tag == HNPM_COVER_TAG || s.hidden || s.alpha < 0.01) continue;
+                    NSString *sc = NSStringFromClass([s class]);
+                    if ([sc hasPrefix:@"CSActivityItem"]) continue;   // 内容 vibrancy 不碰
+                    CGFloat h = s.frame.size.height;
+                    if (h >= 60.0) {
+                        if ([s isKindOfClass:efxCls]) {
+                            UIView *bd = nil;
+                            UIView *content = nil;
+                            for (UIView *k in s.subviews) {
+                                if ([NSStringFromClass([k class]) containsString:@"Backdrop"]) bd = k;
+                                else if (!content) content = k;
+                            }
+                            if (bd) {
+                                if (bd.alpha > 0.01) {
+                                    HNPMSetAlphaNoAnim(bd, 0.0);
+                                    if (diag) HNPMAppendLog([NSString stringWithFormat:
+                                        @"[透明·罩层] 已中和列表占位EFX(白窗主动) h=%.0f", h]);
+                                }
+                                if (content && content.layer.backgroundColor) {
+                                    CGColorRef cbg = content.layer.backgroundColor;
+                                    size_t nc = CGColorGetNumberOfComponents(cbg);
+                                    const CGFloat *cp = CGColorGetComponents(cbg);
+                                    if (nc > 0 && cp[nc - 1] > 0.01) {
+                                        NSMutableString *cs = [NSMutableString string];
+                                        for (size_t i = 0; i < nc && i < 4; i++) [cs appendFormat:@"%.2f,", cp[i]];
+                                        content.layer.backgroundColor = [UIColor clearColor].CGColor;
+                                        if (diag) HNPMAppendLog([NSString stringWithFormat:
+                                            @"[透明·罩层] 已清占位 contentView 背景(bg=%@)", cs]);
+                                    }
+                                }
+                            } else if (diag) {
+                                // 空壳 EFX(无 backdrop, 画不出白) — 只记录
+                                HNPMAppendLog([NSString stringWithFormat:
+                                    @"[透明·罩层·占位枚举] EFX h=%.0f 空壳(无backdrop)", h]);
+                            }
+                        } else if ([sc hasPrefix:@"MTMaterial"] || [sc hasPrefix:@"PLPlatter"] ||
+                                   [sc hasPrefix:@"_UIVisualEffectBackdropView"]) {
+                            CGColorRef lbg = s.layer.backgroundColor;
+                            if (lbg) {
+                                size_t nc = CGColorGetNumberOfComponents(lbg);
+                                const CGFloat *cp = CGColorGetComponents(lbg);
+                                if (nc > 0 && cp[nc - 1] > 0.01) {
+                                    NSMutableString *ls = [NSMutableString string];
+                                    for (size_t i = 0; i < nc && i < 4; i++) [ls appendFormat:@"%.2f,", cp[i]];
+                                    s.layer.backgroundColor = [UIColor clearColor].CGColor;
+                                    if (diag) HNPMAppendLog([NSString stringWithFormat:
+                                        @"[透明·罩层] 已清占位材质 %@ layer 背景(bg=%@)", sc, ls]);
+                                }
+                            }
+                        } else if (diag && s.subviews.count == 0 && h >= 80.0) {
+                            // 陌生叶子视图 — 仅记录, 不动(防误杀)
+                            HNPMAppendLog([NSString stringWithFormat:
+                                @"[透明·罩层·占位枚举] %@ h=%.0f a=%.2f (未处理)", sc, h, s.alpha]);
+                        }
+                    }
+                    [st2 addObjectsFromArray:s.subviews];
+                }
+            }
+        }
+    } @catch (NSException *e) {}
 }
 
 // v0.1.9: 免登记亮屏扫 — v0.1.8 日志裁决: 直扫"免登记直接应用"零次出现, 每次亮屏新罩层
@@ -1378,12 +1478,14 @@ static void HNPMCoversWakeSweep(void) {
                 [stack addObjectsFromArray:v.subviews];
             }
         }
+        // v0.1.28: 白窗内主动中和列表占位(挂载钩子抓不到已存在的占位 EFX)
+        HNPMNeutralizeListPlaceholder();
         // 诊断: 限频 0.5s — 每次亮屏窗口输出 ~5 行, 记录直扫看到了什么
         static CFAbsoluteTime sHNPMCoversSweepDiag = 0;
         CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
         if (now - sHNPMCoversSweepDiag > 0.5) {
             sHNPMCoversSweepDiag = now;
-            HNPMAppendLog([NSString stringWithFormat:@"[透明·亮屏扫 v0.1.27] 窗口%lu 托盘%d 单元%d[%@] 过门%d 改动%d",
+            HNPMAppendLog([NSString stringWithFormat:@"[透明·亮屏扫 v0.1.28] 窗口%lu 托盘%d 单元%d[%@] 过门%d 改动%d",
                            (unsigned long)windows.count, nPlatter, nCell,
                            [cellSizes componentsJoinedByString:@","], nGated, hits]);
         }
@@ -3408,7 +3510,7 @@ static void HNPMAttachPanIfNeeded(UIView *view) {
 #pragma mark - 入口
 
 __attribute__((constructor)) static void HNPMRawCtor(void) {
-    HNPMAppendLog(@"v0.1.27: dylib 构造函数已执行(dyld 加载成功)");
+    HNPMAppendLog(@"v0.1.28: dylib 构造函数已执行(dyld 加载成功)");
 }
 
 // v0.0.50/51: 岛元素抑制策略钩子 — 隐藏期让系统把 NowPlaying 元素当作"应被抑制",
@@ -3471,7 +3573,7 @@ __attribute__((constructor)) static void HNPMRawCtor(void) {
 
 %ctor {
     @autoreleasepool {
-        HNPMAppendLog(@"v0.1.27: logos %ctor 进入");
+        HNPMAppendLog(@"v0.1.28: logos %ctor 进入");
     HNPMAppendLog(HNPMCoverMode()
         ? @"[透明] 罩层模式 ON(HideNowPlaying.cover 存在 → 系统材质不动, 用自有 blur 罩层)"
         : @"[透明] 罩层模式 OFF(经典 alpha 模式; 建 /var/mobile/Documents/HideNowPlaying.cover 可切换)");
@@ -3569,7 +3671,7 @@ __attribute__((constructor)) static void HNPMRawCtor(void) {
         // v0.0.93: 空闲巡逻(0.5s 只读一次, 无在场卡自动停) — 堵"空闲期静默重置无事件触发"盲区
         HNPMIdleAlphaCheck();
         HNPMHookBackdrop();
-        HNPMAppendLog(@"v0.1.27: 空闲巡逻已启动");
-        HNPMAppendLog(@"v0.1.27: %ctor 正常完成");
+        HNPMAppendLog(@"v0.1.28: 空闲巡逻已启动");
+        HNPMAppendLog(@"v0.1.28: %ctor 正常完成");
     }
 }
