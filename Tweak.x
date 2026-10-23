@@ -1148,7 +1148,7 @@ static void HNPMCoversWakeSweep(void) {
                 if (!v) continue;
                 NSString *bgMark = (v.layer.backgroundColor != nil) ? @" bg" : @"";
                 NSString *efxMark = [v isKindOfClass:[UIVisualEffectView class]] ? @" <EFX>" : @"";
-                [rows addObject:[NSString stringWithFormat:@"%@ a=%.2f h=%d%@@%.0fx%.0f",
+                [rows addObject:[NSString stringWithFormat:@"%@ a=%.2f h=%d%@%@ %.0fx%.0f",
                                  NSStringFromClass([v class]), v.alpha, v.hidden ? 1 : 0,
                                  bgMark, efxMark, v.frame.size.width, v.frame.size.height]];
                 [st addObjectsFromArray:v.subviews];
