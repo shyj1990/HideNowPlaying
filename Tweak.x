@@ -977,7 +977,7 @@ static int HNPMCoverApplyOnMaterial(UIView *mat, CGFloat a, BOOL hideMat) {
             [parent insertSubview:cover aboveSubview:mat];
             HNPMAppendLog([NSString stringWithFormat:@"[透明·罩层] 已创建 blur 罩层 a=%.2f(材质%@%@)",
                            a, NSStringFromClass([mat class]),
-                           hideMat ? @"已隐藏" : @", 盖托盘层(无bg期, 内容不受影响)")]);
+                           hideMat ? @"已隐藏" : @", 盖托盘层(无bg期, 内容不受影响)"));
             hits++;
         } else if (cover.superview != parent) {
             [parent insertSubview:cover aboveSubview:mat];   // 移入当前父视图(bg 出现后从托盘上层移入)
@@ -1162,7 +1162,7 @@ static int HNPMInstantPlatterAlpha(UIView *cell) {
             for (UIView *mat in targets) {
                 // 托盘目标(bg 缺席期)不隐藏; 材质目标隐藏
                 t += HNPMCoverApplyOnMaterial(mat, a,
-                        !(platterClsC && [mat isKindOfClass:platterCls]));
+                        !(platterClsC && [mat isKindOfClass:platterClsC]));
             }
             if (t > 0 && fabs(cell.alpha - 1.0) > 0.01) cell.alpha = 1.0;
             return t;
@@ -1204,6 +1204,7 @@ static CGFloat HNPMCardPlatterBgAlphaRead(void) {
                 //          会漏报"正常", 连扫稳定门永不触发(v0.1.1 实测)。
                 // v0.1.3: 覆盖判定 = 罩层存在 + alpha 达标(隐藏与否不再判 — bg 被系统
                 //          重新露出时仍在罩层之下, 视觉无影响; z 序由每次应用时校正)
+                CGFloat a = HNPMBgAlpha();
                 CGFloat firstAlpha = -1;
                 for (UIView *mat in targets) {
                     UIVisualEffectView *cover = HNPMCoverForView(mat);
@@ -1495,7 +1496,7 @@ static void HNPMApplyCardBackgroundAlpha(UIView *cell, int kind) {
                 Class platterClsC = NSClassFromString(@"PLPlatterView");
                 for (UIView *mat in targets) {
                     HNPMCoverApplyOnMaterial(mat, a,
-                            !(platterClsC && [mat isKindOfClass:platterCls]));
+                            !(platterClsC && [mat isKindOfClass:platterClsC]));
                 }
                 HNPMAlphaRetrySet(cell, 0);
                 if (fabs(cell.alpha - 1.0) > 0.01) cell.alpha = 1.0;
