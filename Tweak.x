@@ -1746,6 +1746,97 @@ static void HNPMStartAlphaBurst(void) {
     [sHNPMAlphaBurst addToRunLoop:[NSRunLoop mainRunLoop] forMode:NSRunLoopCommonModes];
 }
 
+// v0.1.35: 白源探针(只读不改) — v0.1.34 实测裁决: 全程 0 触发, 既有枚举
+//          ([UIApplication windows])从未见过 CaptureOnly 宿主、从未见过与卡区
+//          相交的 BSUIVibrancy*, 而白底依旧、活动卡上 EFX 在 +0.3s 已 a=0.20 →
+//          白底来源不在既有视图树视野内。可能在: 场景外窗口/纯 CALayer/跨进程
+//          快照缓冲。探针在每次亮/灭屏 +0.05/0.15/0.35s 各扫一次: 全窗口清单
+//          (app窗+scene窗) + view 树/layer 树关键词命中(Vibrancy/Capture/
+//          Material/Backdrop/Platter/Blur), 一锤定音白底画在哪一层。
+static void HNPMWhiteSourceProbe(NSString *tag) {
+    if (![NSThread isMainThread]) return;
+    @try {
+        NSMutableArray *roots = [NSMutableArray array];
+        NSMutableArray *wrows = [NSMutableArray array];
+        for (UIWindow *w in [UIApplication sharedApplication].windows) {
+            if (!w) continue;
+            [roots addObject:w];
+            [wrows addObject:[NSString stringWithFormat:
+                @"%lu:%@ %.0fx%.0f@%.0f,%.0f a=%.2f h=%d L=%.0f",
+                (unsigned long)(roots.count - 1), NSStringFromClass([w class]),
+                w.frame.size.width, w.frame.size.height,
+                w.frame.origin.x, w.frame.origin.y,
+                w.alpha, w.hidden ? 1 : 0, w.windowLevel]];
+        }
+        for (UIScene *sc in [UIApplication sharedApplication].connectedScenes) {
+            if (![sc isKindOfClass:[UIWindowScene class]]) continue;
+            for (UIWindow *w in ((UIWindowScene *)sc).windows) {
+                if (!w || [roots containsObject:w]) continue;
+                [roots addObject:w];
+                [wrows addObject:[NSString stringWithFormat:
+                    @"S%lu:%@ %.0fx%.0f a=%.2f h=%d L=%.0f",
+                    (unsigned long)(roots.count - 1), NSStringFromClass([w class]),
+                    w.frame.size.width, w.frame.size.height,
+                    w.alpha, w.hidden ? 1 : 0, w.windowLevel]];
+            }
+        }
+        HNPMAppendLog([NSString stringWithFormat:@"[白源探针@%@] 窗%lu: %@",
+            tag, (unsigned long)roots.count,
+            [wrows componentsJoinedByString:@" | "]]);
+        NSArray *kws = @[@"Vibrancy", @"Capture", @"Material", @"Backdrop", @"Platter", @"Blur"];
+        NSMutableArray *vhits = [NSMutableArray array], *lhits = [NSMutableArray array];
+        NSString *region = CGRectIsEmpty(sHNPMCardRegion33)
+            ? @"空" : [NSString stringWithFormat:@"(%.0f,%.0f,%.0f,%.0f)",
+                sHNPMCardRegion33.origin.x, sHNPMCardRegion33.origin.y,
+                sHNPMCardRegion33.size.width, sHNPMCardRegion33.size.height];
+        for (UIWindow *w in roots) {
+            int guard = 0;
+            NSMutableArray *stack = [NSMutableArray arrayWithObject:w];
+            while (stack.count > 0 && guard++ < 600) {
+                UIView *v = stack.firstObject;
+                [stack removeObjectAtIndex:0];
+                if (!v) continue;
+                NSString *cls = NSStringFromClass([v class]);
+                for (NSString *kw in kws) {
+                    if ([cls containsString:kw] && vhits.count < 12) {
+                        CGRect vf = [v convertRect:v.bounds toView:nil];
+                        [vhits addObject:[NSString stringWithFormat:
+                            @"%@ %.0fx%.0f@%.0f,%.0f a=%.2f h=%d",
+                            cls, vf.size.width, vf.size.height,
+                            vf.origin.x, vf.origin.y, v.alpha, v.hidden ? 1 : 0]];
+                        break;
+                    }
+                }
+                [stack addObjectsFromArray:v.subviews];
+            }
+            guard = 0;   // layer 树: 捕捉无视图承载的材质层
+            NSMutableArray *lstack = [NSMutableArray arrayWithObject:w.layer];
+            while (lstack.count > 0 && guard++ < 900) {
+                CALayer *l = lstack.firstObject;
+                [lstack removeObjectAtIndex:0];
+                if (!l) continue;
+                NSString *lcls = NSStringFromClass([l class]);
+                for (NSString *kw in kws) {
+                    if ([lcls containsString:kw] && lhits.count < 12) {
+                        [lhits addObject:[NSString stringWithFormat:
+                            @"%@ %.0fx%.0f@%.0f,%.0f",
+                            lcls, l.frame.size.width, l.frame.size.height,
+                            l.frame.origin.x, l.frame.origin.y]];
+                        break;
+                    }
+                }
+                [lstack addObjectsFromArray:l.sublayers];
+            }
+        }
+        HNPMAppendLog([NSString stringWithFormat:
+            @"[白源探针@%@] 卡区=%@ 命中V%lu:%@ 命中L%lu:%@",
+            tag, region, (unsigned long)vhits.count,
+            vhits.count ? [vhits componentsJoinedByString:@" || "] : @"无",
+            (unsigned long)lhits.count,
+            lhits.count ? [lhits componentsJoinedByString:@" || "] : @"无"]);
+    } @catch (NSException *e) {}
+}
+
 // v0.0.91: 亮屏盲区补漏 — v0.0.90 真机毫秒日志实锤: 系统每隔几秒随机重置一次 bg alpha
 //          (连扫均当帧修掉), 但若重置恰好发生在"亮屏瞬间、任何触发点出现之前"
 //          (旧卡未重建/无布局/无挂载), 连扫窗口不在跑 → 首帧不透明, 等 ~1s 重建才修 →
@@ -1759,6 +1850,14 @@ static void HNPMScreenStateCB(CFNotificationCenterRef center, void *observer,
     HNPMCapturePersistOnce();   // v0.1.34: 通知即刻压一次(不等 0.5s 节拍)
     HNPMStartAlphaBurst();
     HNPMScheduleDeepDumps();   // v0.0.95: 每次亮/灭屏排程时序化深诊断
+    // v0.1.35: 白源探针 — 亮/灭屏后 0.05/0.15/0.35s 各一次(只读)
+    for (NSString *d in @[@"0.05", @"0.15", @"0.35"]) {
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
+                       (int64_t)([d doubleValue] * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            @try { HNPMWhiteSourceProbe(d); } @catch (NSException *e) {}
+        });
+    }
     // v0.1.8: 免登记亮屏直扫 — 立即一次 + 时序化九次, 不等登记/配方(见 HNPMCoversWakeSweep 注释)
     HNPMCoversWakeSweep();
     HNPMScheduleWakeSweeps();
@@ -3093,7 +3192,7 @@ static void HNPMAttachPanIfNeeded(UIView *view) {
 #pragma mark - 入口
 
 __attribute__((constructor)) static void HNPMRawCtor(void) {
-    HNPMAppendLog(@"v0.1.34: dylib 构造函数已执行(dyld 加载成功)");
+    HNPMAppendLog(@"v0.1.35: dylib 构造函数已执行(dyld 加载成功)");
 }
 
 // v0.0.50/51: 岛元素抑制策略钩子 — 隐藏期让系统把 NowPlaying 元素当作"应被抑制",
@@ -3156,7 +3255,7 @@ __attribute__((constructor)) static void HNPMRawCtor(void) {
 
 %ctor {
     @autoreleasepool {
-        HNPMAppendLog(@"v0.1.34: logos %ctor 进入");
+        HNPMAppendLog(@"v0.1.35: logos %ctor 进入");
     HNPMAppendLog(HNPMCoverMode()
         ? @"[透明] 罩层模式 ON(HideNowPlaying.cover 存在 → 系统材质不动, 用自有 blur 罩层)"
         : @"[透明] 罩层模式 OFF(经典 alpha 模式; 建 /var/mobile/Documents/HideNowPlaying.cover 可切换)");
@@ -3255,8 +3354,8 @@ __attribute__((constructor)) static void HNPMRawCtor(void) {
         HNPMIdleAlphaCheck();
         HNPMHookBackdrop();
         HNPMCapturePersistLoop();   // v0.1.34: 卡区捕获快照持续压住(0.5s 一拍, 自续)
-        HNPMAppendLog(@"v0.1.34: 卡区透明持续生效循环已启动");
-        HNPMAppendLog(@"v0.1.34: 空闲巡逻已启动");
-        HNPMAppendLog(@"v0.1.34: %ctor 正常完成");
+        HNPMAppendLog(@"v0.1.35: 卡区透明持续生效循环已启动");
+        HNPMAppendLog(@"v0.1.35: 空闲巡逻已启动");
+        HNPMAppendLog(@"v0.1.35: %ctor 正常完成");
     }
 }
