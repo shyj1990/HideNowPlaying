@@ -1027,10 +1027,7 @@ static void HNPMPlatterReapplyOnLayout(UIView *platter) {
     if (![NSThread isMainThread]) return;
     @try {
         CGFloat a = HNPMBgAlpha();
-        if (a >= 0.99) {
-            if (HNPMCoverMode()) HNPMCoverRestoreAll(cell);   // v0.1.0: 关闭时露出原生材质
-            return;   // 1.0 = 功能关闭
-        }
+        if (a >= 0.99) return;   // 1.0 = 功能关闭(罩层恢复由登记路径 HNPMCoverRestoreAll 兜底)
         // 只处理已登记卡的托盘: 沿祖先链找登记表命中(≤12 级足够)
         UIView *p = platter;
         UIView *cell = nil;
