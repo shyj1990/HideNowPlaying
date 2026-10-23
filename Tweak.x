@@ -1211,6 +1211,59 @@ static void HNPMCapturePersistLoop(void) {
     });
 }
 
+// v0.1.36: 捕获时刻钉扎 — v0.1.35 探针裁决(42 条探针逐卡区过滤): 白窗期间进程内
+//          全窗口/全树(view+layer)与卡区相交的只有全屏壁纸材质与 57x40 小元素,
+//          没有任何卡区尺寸的白底画手; CaptureOnly 宿主也从未出现在枚举/探针里
+//          → 白底是跨进程上屏的捕获快照, 轮询(0.5s 节拍/探针 0.05~0.35s)追不上
+//          它的生存期。改为钩住宿主类自身生命周期: 它一露头(didMoveToWindow/
+//          didMoveToSuperview/layoutSubviews)就从宿主根下钻, 把与卡区记忆相交的
+//          BSUIVibrancyBackdrop/AnimatingPortal 压住(宿主绝不隐藏, 时钟安全),
+//          让"拍进去"的快照天生透明; 再补 +0.05/+0.15 两拍防捕获晚于首次布局。
+//          共用 sHNPMCaptureHiddenViews 弱引用表 → 开关关闭/离场自动恢复。
+static void HNPMCaptureHostPin(UIView *host, NSString *tag) {
+    if (!host || !HNPMCoverMode() || CGRectIsEmpty(sHNPMCardRegion33)) return;
+    if (sHNPMCaptureHiddenViews == nil)
+        sHNPMCaptureHiddenViews = [NSHashTable weakObjectsHashTable];
+    int n = 0;
+    NSMutableArray *stack = [NSMutableArray arrayWithObject:host];
+    int guard = 0;
+    while (stack.count > 0 && guard++ < 600) {
+        UIView *v = stack.firstObject;
+        [stack removeObjectAtIndex:0];
+        if (!v) continue;
+        NSString *cls = NSStringFromClass([v class]);
+        if (![cls hasPrefix:@"BSUIVibrancyBackdrop"] && ![cls hasPrefix:@"BSUIVibrancyAnimatingPortal"]) {
+            [stack addObjectsFromArray:v.subviews];   // 一路下钻, 宿主本身不隐藏
+            continue;
+        }
+        CGRect vf = [v convertRect:v.bounds toView:nil];
+        CGRect inter = CGRectIntersection(vf, sHNPMCardRegion33);
+        if (CGRectIsNull(inter) || CGRectIsEmpty(inter) || v.hidden || v.alpha < 0.01) continue;
+        v.hidden = YES;
+        [sHNPMCaptureHiddenViews addObject:v];
+        n++;
+    }
+    if (n > 0)
+        HNPMAppendLog([NSString stringWithFormat:
+            @"[透明·罩层] 已隐卡区捕获快照 %d 处(捕获时刻@%@)", n, tag]);
+}
+
+static void HNPMCaptureHostPinDelayed(UIView *host, NSString *tag) {
+    if (!host) return;
+    __weak UIView *wh = host;
+    NSString *t = [tag copy];
+    for (NSString *d in @[@"0.05", @"0.15"]) {
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
+                       (int64_t)([d doubleValue] * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            @try {
+                UIView *s = wh;
+                if (s && s.window) HNPMCaptureHostPin(s, [NSString stringWithFormat:@"%@+%@", t, d]);
+            } @catch (NSException *e) {}
+        });
+    }
+}
+
 static void HNPMCoversWakeSweep(void);
 
 // v0.1.9 前置声明(定义在罩层收集区): 直扫按单元格整体收集目标要用
@@ -3192,7 +3245,7 @@ static void HNPMAttachPanIfNeeded(UIView *view) {
 #pragma mark - 入口
 
 __attribute__((constructor)) static void HNPMRawCtor(void) {
-    HNPMAppendLog(@"v0.1.35: dylib 构造函数已执行(dyld 加载成功)");
+    HNPMAppendLog(@"v0.1.36: dylib 构造函数已执行(dyld 加载成功)");
 }
 
 // v0.0.50/51: 岛元素抑制策略钩子 — 隐藏期让系统把 NowPlaying 元素当作"应被抑制",
@@ -3253,9 +3306,30 @@ __attribute__((constructor)) static void HNPMRawCtor(void) {
 %end
 %end
 
+// v0.1.36: 捕获快照宿主生命周期钩子 — 类不存在时 %init 不执行(安全), 见 %ctor 守卫
+%group HNPMCaptureHost
+%hook NCMaterialDisplayingCaptureOnlyViewControllerView
+- (void)didMoveToWindow {
+    %orig;
+    @try {
+        HNPMCaptureHostPin(self, @"挂窗");
+        HNPMCaptureHostPinDelayed(self, @"挂窗");
+    } @catch (NSException *e) {}
+}
+- (void)didMoveToSuperview {
+    %orig;
+    @try { HNPMCaptureHostPin(self, @"挂父"); } @catch (NSException *e) {}
+}
+- (void)layoutSubviews {
+    %orig;
+    @try { HNPMCaptureHostPin(self, @"布局"); } @catch (NSException *e) {}
+}
+%end
+%end
+
 %ctor {
     @autoreleasepool {
-        HNPMAppendLog(@"v0.1.35: logos %ctor 进入");
+        HNPMAppendLog(@"v0.1.36: logos %ctor 进入");
     HNPMAppendLog(HNPMCoverMode()
         ? @"[透明] 罩层模式 ON(HideNowPlaying.cover 存在 → 系统材质不动, 用自有 blur 罩层)"
         : @"[透明] 罩层模式 OFF(经典 alpha 模式; 建 /var/mobile/Documents/HideNowPlaying.cover 可切换)");
@@ -3328,6 +3402,9 @@ __attribute__((constructor)) static void HNPMRawCtor(void) {
         if (objc_getClass("_SAUIElementViewContentView"))    { %init(HNPMIslandElement); }
         if (objc_getClass("_SAUIProvidedViewContainerView")) { %init(HNPMIslandPortal); }
         if (objc_getClass("SBSystemApertureSceneElement"))   { %init(HNPMIslandSuppression); HNPMAppendLog(@"hook 已注册: 岛元素抑制策略+元素跟踪(NowPlaying)"); }
+        if (objc_getClass("NCMaterialDisplayingCaptureOnlyViewControllerView"))
+            { %init(HNPMCaptureHost); HNPMAppendLog(@"hook 已注册: 捕获快照宿主钉扎(捕获时刻压卡区, v0.1.36)"); }
+        else { HNPMAppendLog(@"v0.1.36: 捕获快照宿主类不存在, 钉扎钩子未注册"); }
 
         // v0.0.66: 16 秒后输出终判(此时所有 tweak 必已加载, 检测结果可靠)
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(16.0 * NSEC_PER_SEC)),
@@ -3354,8 +3431,8 @@ __attribute__((constructor)) static void HNPMRawCtor(void) {
         HNPMIdleAlphaCheck();
         HNPMHookBackdrop();
         HNPMCapturePersistLoop();   // v0.1.34: 卡区捕获快照持续压住(0.5s 一拍, 自续)
-        HNPMAppendLog(@"v0.1.35: 卡区透明持续生效循环已启动");
-        HNPMAppendLog(@"v0.1.35: 空闲巡逻已启动");
-        HNPMAppendLog(@"v0.1.35: %ctor 正常完成");
+        HNPMAppendLog(@"v0.1.36: 卡区透明持续生效循环已启动");
+        HNPMAppendLog(@"v0.1.36: 空闲巡逻已启动");
+        HNPMAppendLog(@"v0.1.36: %ctor 正常完成");
     }
 }
