@@ -1085,6 +1085,20 @@ static void HNPMPlatterReapplyOnLayout(UIView *platter) {
             if ([hnpmCardCells containsObject:p]) { cell = p; break; }
             p = p.superview;
         }
+        if (!cell || cell.hidden || HNPMCardHiddenGet(cell) || !cell.window) {
+            // v0.1.2: 托盘挂载可能早于内容视图(内容视图钩子才预登记) → 此处按类预登记,
+            //         让连扫在读函数里尽早看到该卡(罩层模式首帧即修, 不等 0.3s 登记)
+            if (cell || HNPMCoverMode()) {
+                Class cellCls = NSClassFromString(@"NCNotificationListCell");
+                UIView *p0 = platter;
+                int g2 = 0;
+                while (p0 && g2++ < 12 && ![p0 isKindOfClass:cellCls]) p0 = p0.superview;
+                if (p0 && HNPMIsMediaSized(p0.frame.size) && p0.window && !p0.hidden) {
+                    [hnpmCardCells addObject:p0];
+                    cell = p0;
+                }
+            }
+        }
         if (!cell || cell.hidden || HNPMCardHiddenGet(cell) || !cell.window) return;
         // v0.1.0: 罩层模式用罩层漂移检测(材质被露出/罩层丢失/alpha 偏)
         BOOL drift = HNPMCoverMode() ? HNPMPlatterCoverDrift(platter, a)
@@ -1149,10 +1163,19 @@ static CGFloat HNPMCardPlatterBgAlphaRead(void) {
                 NSMutableArray *targets = [NSMutableArray array];
                 HNPMCoverCollectTargets(cell, targets);
                 if (targets.count == 0) continue;   // 该卡暂无材质目标 → 看下一张
-                UIView *mat = targets.firstObject;
-                UIVisualEffectView *cover = objc_getAssociatedObject(mat, &kHNPMCoverSelfKey);
-                if (cover && mat.hidden) return cover.alpha;
-                return 1.0;   // 材质被露出/罩层未就位 → 满偏差, 触发修正
+                // v0.1.2: 检查**所有**目标 — v0.1.1 实测: 亮屏重建时系统会新建材质视图
+                //          (排在已盖住的旧材质之后), 只查 firstObject 会漏报"正常",
+                //          连扫稳定门永不触发, 白底要等 ~1.7s 后的登记路径才被盖住。
+                CGFloat firstAlpha = -1;
+                for (UIView *mat in targets) {
+                    UIVisualEffectView *cover = objc_getAssociatedObject(mat, &kHNPMCoverSelfKey);
+                    if (cover && mat.hidden) {
+                        if (firstAlpha < 0) firstAlpha = cover.alpha;
+                    } else {
+                        return 1.0;   // 任一材质被露出/罩层缺失 → 满偏差, 触发修正
+                    }
+                }
+                return firstAlpha;
             }
             return -1;
         }
@@ -2624,7 +2647,7 @@ static void HNPMAttachPanIfNeeded(UIView *view) {
 #pragma mark - 入口
 
 __attribute__((constructor)) static void HNPMRawCtor(void) {
-    HNPMAppendLog(@"v0.1.1: dylib 构造函数已执行(dyld 加载成功)");
+    HNPMAppendLog(@"v0.1.2: dylib 构造函数已执行(dyld 加载成功)");
 }
 
 // v0.0.50/51: 岛元素抑制策略钩子 — 隐藏期让系统把 NowPlaying 元素当作"应被抑制",
@@ -2687,7 +2710,7 @@ __attribute__((constructor)) static void HNPMRawCtor(void) {
 
 %ctor {
     @autoreleasepool {
-        HNPMAppendLog(@"v0.1.1: logos %ctor 进入");
+        HNPMAppendLog(@"v0.1.2: logos %ctor 进入");
     HNPMAppendLog(HNPMCoverMode()
         ? @"[透明] 罩层模式 ON(HideNowPlaying.cover 存在 → 系统材质不动, 用自有 blur 罩层)"
         : @"[透明] 罩层模式 OFF(经典 alpha 模式; 建 /var/mobile/Documents/HideNowPlaying.cover 可切换)");
@@ -2784,7 +2807,7 @@ __attribute__((constructor)) static void HNPMRawCtor(void) {
         HNPMAppendLog(@"v0.0.92: 设置面板通知观察者已挂");
         // v0.0.93: 空闲巡逻(0.5s 只读一次, 无在场卡自动停) — 堵"空闲期静默重置无事件触发"盲区
         HNPMIdleAlphaCheck();
-        HNPMAppendLog(@"v0.1.1: 空闲巡逻已启动");
-        HNPMAppendLog(@"v0.1.1: %ctor 正常完成");
+        HNPMAppendLog(@"v0.1.2: 空闲巡逻已启动");
+        HNPMAppendLog(@"v0.1.2: %ctor 正常完成");
     }
 }
