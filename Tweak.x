@@ -1312,7 +1312,7 @@ static void HNPMNeutralizeListPlaceholder(void) {
             if (!w) continue;
             NSMutableArray *stack = [NSMutableArray arrayWithObject:w];
             int guard = 0;
-            while (stack.count > 0 && guard++ < 500) {
+            while (stack.count > 0 && guard++ < 900) {
                 UIView *v = stack.firstObject;
                 [stack removeObjectAtIndex:0];
                 if (!v || v.tag == HNPM_COVER_TAG) continue;
@@ -1325,13 +1325,33 @@ static void HNPMNeutralizeListPlaceholder(void) {
                 // 进入 NCNotificationList 子树: 逐视图检查占位材质
                 NSMutableArray *st2 = [NSMutableArray arrayWithObject:v];
                 int g2 = 0;
-                while (st2.count > 0 && g2++ < 120) {
+                int nEnum = 0;   // v0.1.29: 无差别枚举限 8 行 — v0.1.28 零输出说明
+                                 // 类型模型(占位=EFX/MTMaterial/叶子)没匹配上, 先看清真身
+                while (st2.count > 0 && g2++ < 250) {
                     UIView *s = st2.firstObject;
                     [st2 removeObjectAtIndex:0];
                     if (!s || s.tag == HNPM_COVER_TAG || s.hidden || s.alpha < 0.01) continue;
                     NSString *sc = NSStringFromClass([s class]);
-                    if ([sc hasPrefix:@"CSActivityItem"]) continue;   // 内容 vibrancy 不碰
                     CGFloat h = s.frame.size.height;
+                    BOOL inItem = [sc hasPrefix:@"CSActivityItem"];
+                    if (diag && h >= 50.0 && nEnum < 8) {
+                        nEnum++;
+                        NSMutableString *bgDesc = [NSMutableString string];
+                        CGColorRef dbg = s.layer.backgroundColor;
+                        if (dbg) {
+                            size_t dnc = CGColorGetNumberOfComponents(dbg);
+                            const CGFloat *dcp = CGColorGetComponents(dbg);
+                            if (dnc > 0 && dcp[dnc - 1] > 0.01) {
+                                for (size_t i = 0; i < dnc && i < 4; i++) [bgDesc appendFormat:@"%.2f,", dcp[i]];
+                                [bgDesc insertString:@" bg=" atIndex:0];
+                            }
+                        }
+                        HNPMAppendLog([NSString stringWithFormat:
+                            @"[透明·罩层·占位枚举] %@%@ h=%.0f a=%.2f sub=%lu%@",
+                            inItem ? @"(item内)" : @"", sc, h, s.alpha,
+                            (unsigned long)s.subviews.count, bgDesc]);
+                    }
+                    if (inItem) continue;   // 内容 vibrancy 子树不中和不下钻(防误杀)
                     if (h >= 60.0) {
                         if ([s isKindOfClass:efxCls]) {
                             UIView *bd = nil;
@@ -1485,7 +1505,7 @@ static void HNPMCoversWakeSweep(void) {
         CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
         if (now - sHNPMCoversSweepDiag > 0.5) {
             sHNPMCoversSweepDiag = now;
-            HNPMAppendLog([NSString stringWithFormat:@"[透明·亮屏扫 v0.1.28] 窗口%lu 托盘%d 单元%d[%@] 过门%d 改动%d",
+            HNPMAppendLog([NSString stringWithFormat:@"[透明·亮屏扫 v0.1.29] 窗口%lu 托盘%d 单元%d[%@] 过门%d 改动%d",
                            (unsigned long)windows.count, nPlatter, nCell,
                            [cellSizes componentsJoinedByString:@","], nGated, hits]);
         }
@@ -3510,7 +3530,7 @@ static void HNPMAttachPanIfNeeded(UIView *view) {
 #pragma mark - 入口
 
 __attribute__((constructor)) static void HNPMRawCtor(void) {
-    HNPMAppendLog(@"v0.1.28: dylib 构造函数已执行(dyld 加载成功)");
+    HNPMAppendLog(@"v0.1.29: dylib 构造函数已执行(dyld 加载成功)");
 }
 
 // v0.0.50/51: 岛元素抑制策略钩子 — 隐藏期让系统把 NowPlaying 元素当作"应被抑制",
@@ -3573,7 +3593,7 @@ __attribute__((constructor)) static void HNPMRawCtor(void) {
 
 %ctor {
     @autoreleasepool {
-        HNPMAppendLog(@"v0.1.28: logos %ctor 进入");
+        HNPMAppendLog(@"v0.1.29: logos %ctor 进入");
     HNPMAppendLog(HNPMCoverMode()
         ? @"[透明] 罩层模式 ON(HideNowPlaying.cover 存在 → 系统材质不动, 用自有 blur 罩层)"
         : @"[透明] 罩层模式 OFF(经典 alpha 模式; 建 /var/mobile/Documents/HideNowPlaying.cover 可切换)");
@@ -3671,7 +3691,7 @@ __attribute__((constructor)) static void HNPMRawCtor(void) {
         // v0.0.93: 空闲巡逻(0.5s 只读一次, 无在场卡自动停) — 堵"空闲期静默重置无事件触发"盲区
         HNPMIdleAlphaCheck();
         HNPMHookBackdrop();
-        HNPMAppendLog(@"v0.1.28: 空闲巡逻已启动");
-        HNPMAppendLog(@"v0.1.28: %ctor 正常完成");
+        HNPMAppendLog(@"v0.1.29: 空闲巡逻已启动");
+        HNPMAppendLog(@"v0.1.29: %ctor 正常完成");
     }
 }
