@@ -1091,6 +1091,26 @@ static void hnpmBackdropDidMove(id self, SEL _cmd) {
                 if (gp && [gp isKindOfClass:platterCls]) {
                     HNPMSetAlphaNoAnim(v, 0.0);
                     HNPMAppendLog(@"[透明·罩层] backdrop 挂载即中和(规则2·占位EFX)");
+                } else {
+                    // v0.1.27 规则3: 列表占位 EFX — v0.1.26 白底盘次扫场裁决: 过门0(媒体卡
+                    //          cell 未创建, 列表里只有小通知单元)时白底照显 → 白块是列表预留
+                    //          区的占位材质, 不在托盘体系内, 扫场/避让无对象可藏。占位 EFX 的
+                    //          backdrop 挂载瞬间走本钩子 → 在列表子树内且宿主 EFX 高≥80pt
+                    //          (媒体卡占位尺寸)即压掉。避开 CSActivityItem 子树(通知卡内容
+                    //          vibrancy, v0.1.13 误杀教训)。
+                    UIView *anc = gp ? gp : p;
+                    BOOL inList = NO, inItem = NO;
+                    int g3 = 0;
+                    while (anc && g3++ < 8) {
+                        NSString *cn = NSStringFromClass([anc class]);
+                        if ([cn hasPrefix:@"CSActivityItem"]) { inItem = YES; break; }
+                        if ([cn hasPrefix:@"NCNotificationList"]) { inList = YES; break; }
+                        anc = anc.superview;
+                    }
+                    if (inList && !inItem && p.frame.size.height >= 80.0) {
+                        HNPMSetAlphaNoAnim(v, 0.0);
+                        HNPMAppendLog(@"[透明·罩层] backdrop 挂载即中和(规则3·列表占位EFX)");
+                    }
                 }
                 return;                                      // 更深的 EFX = 内容 vibrancy, 不碰
             }
@@ -1363,7 +1383,7 @@ static void HNPMCoversWakeSweep(void) {
         CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
         if (now - sHNPMCoversSweepDiag > 0.5) {
             sHNPMCoversSweepDiag = now;
-            HNPMAppendLog([NSString stringWithFormat:@"[透明·亮屏扫 v0.1.26] 窗口%lu 托盘%d 单元%d[%@] 过门%d 改动%d",
+            HNPMAppendLog([NSString stringWithFormat:@"[透明·亮屏扫 v0.1.27] 窗口%lu 托盘%d 单元%d[%@] 过门%d 改动%d",
                            (unsigned long)windows.count, nPlatter, nCell,
                            [cellSizes componentsJoinedByString:@","], nGated, hits]);
         }
@@ -1807,10 +1827,13 @@ static void HNPMScreenStateCB(CFNotificationCenterRef center, void *observer,
                               CFStringRef name, const void *object, CFDictionaryRef userInfo) {
     HNPMAppendLog([NSString stringWithFormat:@"[透明] 屏幕状态通知(%@) → 连扫窗口开启",
                    (__bridge NSString *)name]);
-    // v0.1.26: 去抖 0.8s — lockstate 与 hasBlankedScreen 常相隔 ~0.3s 连发,
-    //          若都重开避让窗, 第一次恢复(0.65s)后标志被第二次通知重置又藏一次, 加剧闪烁
+    // v0.1.27: 只有亮屏(hasBlankedScreen)刷新避让基准 — v0.1.26 日志裁决: lockstate(锁定/
+    //          解锁)也触发避让 → AOD 上音乐卡消失又恢复(用户报告"锁屏后卡消失几秒")。
+    //          锁定动作无白窗, 无需避让。0.8s 去抖保留(连发只算一轮)。
+    NSString *nn = (__bridge NSString *)name;
+    BOOL isBlanked = [nn containsString:@"hasBlankedScreen"];
     CFAbsoluteTime now2 = CFAbsoluteTimeGetCurrent();
-    if (sHNPMWakeAt <= 0 || now2 - sHNPMWakeAt > 0.8) {
+    if (isBlanked && (sHNPMWakeAt <= 0 || now2 - sHNPMWakeAt > 0.8)) {
         sHNPMWakeAt = now2;             // v0.1.25: 白窗避让时间基准
         sHNPMAvoidedThisWake = NO;      // v0.1.26: 新一轮亮屏, 允许避让一次
     }
@@ -3385,7 +3408,7 @@ static void HNPMAttachPanIfNeeded(UIView *view) {
 #pragma mark - 入口
 
 __attribute__((constructor)) static void HNPMRawCtor(void) {
-    HNPMAppendLog(@"v0.1.26: dylib 构造函数已执行(dyld 加载成功)");
+    HNPMAppendLog(@"v0.1.27: dylib 构造函数已执行(dyld 加载成功)");
 }
 
 // v0.0.50/51: 岛元素抑制策略钩子 — 隐藏期让系统把 NowPlaying 元素当作"应被抑制",
@@ -3448,7 +3471,7 @@ __attribute__((constructor)) static void HNPMRawCtor(void) {
 
 %ctor {
     @autoreleasepool {
-        HNPMAppendLog(@"v0.1.26: logos %ctor 进入");
+        HNPMAppendLog(@"v0.1.27: logos %ctor 进入");
     HNPMAppendLog(HNPMCoverMode()
         ? @"[透明] 罩层模式 ON(HideNowPlaying.cover 存在 → 系统材质不动, 用自有 blur 罩层)"
         : @"[透明] 罩层模式 OFF(经典 alpha 模式; 建 /var/mobile/Documents/HideNowPlaying.cover 可切换)");
@@ -3546,7 +3569,7 @@ __attribute__((constructor)) static void HNPMRawCtor(void) {
         // v0.0.93: 空闲巡逻(0.5s 只读一次, 无在场卡自动停) — 堵"空闲期静默重置无事件触发"盲区
         HNPMIdleAlphaCheck();
         HNPMHookBackdrop();
-        HNPMAppendLog(@"v0.1.26: 空闲巡逻已启动");
-        HNPMAppendLog(@"v0.1.26: %ctor 正常完成");
+        HNPMAppendLog(@"v0.1.27: 空闲巡逻已启动");
+        HNPMAppendLog(@"v0.1.27: %ctor 正常完成");
     }
 }
