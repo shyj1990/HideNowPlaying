@@ -453,25 +453,6 @@ static BOOL HNPMIsMediaSized(CGSize size) {
     return size.width >= 300 && size.height >= 150;
 }
 
-// v0.1.5: 判定托盘是否属于锁屏"正在播放"音乐卡 — 沿祖先链找 NCNotificationListCell
-//         且尺寸符合媒体卡(不要求已挂窗: 配方写入发生在托盘挂窗**之前**, 实测
-//         11:01:43.986 配方写入 → 45.264 才建罩层, v0.1.4 的 self.window 检查把
-//         直接应用拦掉了)。用于 setMaterialRecipe: 时刻的罩层就地应用目标过滤。
-static BOOL HNPMPlatterIsMusicCard(UIView *platter) {
-    @try {
-        if (!platter) return NO;
-        Class cellCls = NSClassFromString(@"NCNotificationListCell");
-        if (!cellCls) return NO;
-        UIView *p = platter;
-        int guard = 0;
-        while (p && guard++ < 12) {
-            if ([p isKindOfClass:cellCls]) return HNPMIsMediaSized(p.frame.size);
-            p = p.superview;
-        }
-    } @catch (NSException *e) {}
-    return NO;
-}
-
 static BOOL HNPMCellHasLiveMedia(UIView *cell) {
     @try {
         if (!cell) return NO;
