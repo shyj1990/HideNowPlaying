@@ -1432,8 +1432,7 @@ static void HNPMApplyCardBackgroundAlpha(UIView *cell, int kind) {
             NSMutableArray *targets = [NSMutableArray array];
             HNPMCoverCollectTargets(cell, targets);
             if (targets.count > 0) {
-                int ch = 0;
-                for (UIView *mat in targets) ch += HNPMCoverApplyOnMaterial(mat, a);
+                for (UIView *mat in targets) HNPMCoverApplyOnMaterial(mat, a);
                 HNPMAlphaRetrySet(cell, 0);
                 if (fabs(cell.alpha - 1.0) > 0.01) cell.alpha = 1.0;
                 HNPMAppendLog([NSString stringWithFormat:@"[透明] 罩层应用 %lu 目标(材质已隐藏, 零系统写入)",
