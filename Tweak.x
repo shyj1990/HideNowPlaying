@@ -976,6 +976,37 @@ static UIVisualEffectView *HNPMCoverForView(UIView *mat) {
     return nil;
 }
 
+// v0.1.11: 找到材质所属托盘内容层的原生 backdrop 渲染器。
+//          v0.1.10 日志裁决: 白底期与透明期的视图树逐字节相同(0.3s/0.8s/1.5s 三份 dump
+//          完全一致, MTMaterialView h=1/罩层 a=0.20 在场) → 白底→透明的转变发生在渲染
+//          内部, 视图层修复不可达。真身 = PLPlatterCustomContentView 内的
+//          _UIVisualEffectBackdropView(位于罩层之上, 按原生配方渲染 → 罩层模式下永远白底)。
+//          罩层模式设计 = 系统材质整体退场, backdrop 一并中和; 歌词/控件在
+//          CSActivityItemContentView(CustomContent 的另一子树), 不受影响。
+static UIView *HNPMPlatterBackdropOfMat(UIView *mat) {
+    @try {
+        Class platterCls = NSClassFromString(@"PLPlatterView");
+        Class customCls = NSClassFromString(@"PLPlatterCustomContentView");
+        Class backdropCls = NSClassFromString(@"_UIVisualEffectBackdropView");
+        if (!platterCls || !customCls || !backdropCls) return nil;
+        UIView *platter = mat;
+        int g = 0;
+        while (platter && g++ < 6) {
+            if ([platter isKindOfClass:platterCls]) break;
+            platter = platter.superview;
+        }
+        if (!platter || ![platter isKindOfClass:platterCls]) return nil;
+        for (UIView *c in platter.subviews) {
+            if ([c isKindOfClass:customCls]) {
+                for (UIView *b in c.subviews) {
+                    if ([b isKindOfClass:backdropCls]) return b;
+                }
+            }
+        }
+    } @catch (NSException *e) {}
+    return nil;
+}
+
 // 对单个系统材质层应用罩层(创建/校位/校 alpha/按需隐藏材质), 返回实际改动数。
 // v0.1.1 泛化: 材质层不限于托盘背景 — 亮屏重建序列里系统会先给卡内放一个
 //          UIVisualEffectView 白底(托盘惰性创建晚 ~1s), 罩层必须也能盖住它。
@@ -1019,6 +1050,15 @@ static int HNPMCoverApplyOnMaterial(UIView *mat, CGFloat a, BOOL hideMat) {
         }
         if (fabs(cover.alpha - a) > 0.01) { HNPMSetAlphaNoAnim(cover, a); hits++; }
         if (hideMat && !mat.hidden) { mat.hidden = YES; hits++; }
+        // v0.1.11: 罩层模式下中和内容层 backdrop(白底真身, 渲染内部状态, 视图层盖不住)
+        if (a < 0.99) {
+            UIView *bd = HNPMPlatterBackdropOfMat(mat);
+            if (bd && bd.alpha > 0.01) {
+                HNPMSetAlphaNoAnim(bd, 0.0);
+                HNPMAppendLog(@"[透明·罩层] 已中和 PLPlatterCustomContentView backdrop(白底真身退场)");
+                hits++;
+            }
+        }
     } @catch (NSException *e) {}
     return hits;
 }
@@ -2907,7 +2947,7 @@ static void HNPMAttachPanIfNeeded(UIView *view) {
 #pragma mark - 入口
 
 __attribute__((constructor)) static void HNPMRawCtor(void) {
-    HNPMAppendLog(@"v0.1.10: dylib 构造函数已执行(dyld 加载成功)");
+    HNPMAppendLog(@"v0.1.11: dylib 构造函数已执行(dyld 加载成功)");
 }
 
 // v0.0.50/51: 岛元素抑制策略钩子 — 隐藏期让系统把 NowPlaying 元素当作"应被抑制",
@@ -2970,7 +3010,7 @@ __attribute__((constructor)) static void HNPMRawCtor(void) {
 
 %ctor {
     @autoreleasepool {
-        HNPMAppendLog(@"v0.1.10: logos %ctor 进入");
+        HNPMAppendLog(@"v0.1.11: logos %ctor 进入");
     HNPMAppendLog(HNPMCoverMode()
         ? @"[透明] 罩层模式 ON(HideNowPlaying.cover 存在 → 系统材质不动, 用自有 blur 罩层)"
         : @"[透明] 罩层模式 OFF(经典 alpha 模式; 建 /var/mobile/Documents/HideNowPlaying.cover 可切换)");
@@ -3067,7 +3107,7 @@ __attribute__((constructor)) static void HNPMRawCtor(void) {
         HNPMAppendLog(@"v0.0.92: 设置面板通知观察者已挂");
         // v0.0.93: 空闲巡逻(0.5s 只读一次, 无在场卡自动停) — 堵"空闲期静默重置无事件触发"盲区
         HNPMIdleAlphaCheck();
-        HNPMAppendLog(@"v0.1.10: 空闲巡逻已启动");
-        HNPMAppendLog(@"v0.1.10: %ctor 正常完成");
+        HNPMAppendLog(@"v0.1.11: 空闲巡逻已启动");
+        HNPMAppendLog(@"v0.1.11: %ctor 正常完成");
     }
 }
