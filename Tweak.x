@@ -986,9 +986,8 @@ static UIVisualEffectView *HNPMCoverForView(UIView *mat) {
 static UIView *HNPMPlatterBackdropOfMat(UIView *mat) {
     @try {
         Class platterCls = NSClassFromString(@"PLPlatterView");
-        Class customCls = NSClassFromString(@"PLPlatterCustomContentView");
         Class backdropCls = NSClassFromString(@"_UIVisualEffectBackdropView");
-        if (!platterCls || !customCls || !backdropCls) return nil;
+        if (!platterCls || !backdropCls) return nil;
         UIView *platter = mat;
         int g = 0;
         while (platter && g++ < 6) {
@@ -996,12 +995,16 @@ static UIView *HNPMPlatterBackdropOfMat(UIView *mat) {
             platter = platter.superview;
         }
         if (!platter || ![platter isKindOfClass:platterCls]) return nil;
-        for (UIView *c in platter.subviews) {
-            if ([c isKindOfClass:customCls]) {
-                for (UIView *b in c.subviews) {
-                    if ([b isKindOfClass:backdropCls]) return b;
-                }
-            }
+        // v0.1.12: 直接子级迭代改为全子树 DFS + 先 copy — 托盘高频重建期对 subviews
+        //          做 for-in 会因并发变异抛 NSException(被 @try 吞掉 → v0.1.11 全场 miss 零日志)。
+        NSMutableArray *stack = [NSMutableArray arrayWithObject:platter];
+        int guard = 0;
+        while (stack.count > 0 && guard++ < 200) {
+            UIView *v = stack.firstObject;
+            [stack removeObjectAtIndex:0];
+            if (!v) continue;
+            if ([v isKindOfClass:backdropCls]) return v;
+            [stack addObjectsFromArray:[v.subviews copy]];
         }
     } @catch (NSException *e) {}
     return nil;
@@ -1057,6 +1060,32 @@ static int HNPMCoverApplyOnMaterial(UIView *mat, CGFloat a, BOOL hideMat) {
                 HNPMSetAlphaNoAnim(bd, 0.0);
                 HNPMAppendLog(@"[透明·罩层] 已中和 PLPlatterCustomContentView backdrop(白底真身退场)");
                 hits++;
+            } else if (!bd) {
+                // v0.1.12: miss 诊断(限频 1s) — 报告查找失败在哪一环, 消灭静默失败
+                static CFAbsoluteTime sHNPMBackDropMissAt = 0;
+                CFAbsoluteTime nnow = CFAbsoluteTimeGetCurrent();
+                if (nnow - sHNPMBackDropMissAt > 1.0) {
+                    sHNPMBackDropMissAt = nnow;
+                    @try {
+                        Class pCls = NSClassFromString(@"PLPlatterView");
+                        UIView *p = mat;
+                        int gg = 0;
+                        BOOL fp = NO;
+                        while (p && gg++ < 6) {
+                            if (pCls && [p isKindOfClass:pCls]) { fp = YES; break; }
+                            p = p.superview;
+                        }
+                        NSMutableString *info = [NSMutableString stringWithFormat:@"mat=%@ 托盘=%d",
+                                                 NSStringFromClass([mat class]), fp ? 1 : 0];
+                        if (fp) {
+                            NSArray *kids = [p.subviews copy];
+                            [info appendFormat:@" 子%d:[", (int)kids.count];
+                            for (UIView *c in kids) [info appendFormat:@"%@,", NSStringFromClass([c class])];
+                            [info appendString:@"]"];
+                        }
+                        HNPMAppendLog([NSString stringWithFormat:@"[透明·罩层·中和miss] %@", info]);
+                    } @catch (NSException *e) {}
+                }
             }
         }
     } @catch (NSException *e) {}
@@ -2947,7 +2976,7 @@ static void HNPMAttachPanIfNeeded(UIView *view) {
 #pragma mark - 入口
 
 __attribute__((constructor)) static void HNPMRawCtor(void) {
-    HNPMAppendLog(@"v0.1.11: dylib 构造函数已执行(dyld 加载成功)");
+    HNPMAppendLog(@"v0.1.12: dylib 构造函数已执行(dyld 加载成功)");
 }
 
 // v0.0.50/51: 岛元素抑制策略钩子 — 隐藏期让系统把 NowPlaying 元素当作"应被抑制",
@@ -3010,7 +3039,7 @@ __attribute__((constructor)) static void HNPMRawCtor(void) {
 
 %ctor {
     @autoreleasepool {
-        HNPMAppendLog(@"v0.1.11: logos %ctor 进入");
+        HNPMAppendLog(@"v0.1.12: logos %ctor 进入");
     HNPMAppendLog(HNPMCoverMode()
         ? @"[透明] 罩层模式 ON(HideNowPlaying.cover 存在 → 系统材质不动, 用自有 blur 罩层)"
         : @"[透明] 罩层模式 OFF(经典 alpha 模式; 建 /var/mobile/Documents/HideNowPlaying.cover 可切换)");
@@ -3107,7 +3136,7 @@ __attribute__((constructor)) static void HNPMRawCtor(void) {
         HNPMAppendLog(@"v0.0.92: 设置面板通知观察者已挂");
         // v0.0.93: 空闲巡逻(0.5s 只读一次, 无在场卡自动停) — 堵"空闲期静默重置无事件触发"盲区
         HNPMIdleAlphaCheck();
-        HNPMAppendLog(@"v0.1.11: 空闲巡逻已启动");
-        HNPMAppendLog(@"v0.1.11: %ctor 正常完成");
+        HNPMAppendLog(@"v0.1.12: 空闲巡逻已启动");
+        HNPMAppendLog(@"v0.1.12: %ctor 正常完成");
     }
 }
