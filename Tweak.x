@@ -1013,14 +1013,14 @@ static int HNPMPlatterApplyCover(UIView *platter, CGFloat a) {
 // v0.1.7 前置声明(v0.1.8 定义): 连扫帧内节流调用, 兜住登记缝隙期外的重建
 static void HNPMCoversWakeSweep(void);
 
-// v0.1.8: 免登记亮屏扫 — v0.1.7 日志裁决: 配方写入只在 respring 后首建卡时发生一次,
-//          之后每次亮屏系统直接重建单元格/背景(配方沿用, 不再走 setMaterialRecipe:)。
-//          而我们的罩层应用路径全部挂在"登记"或"配方"上: 亮屏后新白卡要等登记路径
-//          ~1.6-2.2s 才被盖住(12.844/19.725/27.630 vs 亮屏 10.96/17.48/26.03),
-//          亮屏+0.3s 的深诊断显示"罩层在"是旧登记锚点的假象 → 用户每次亮屏都看到 ~1s 白底。
-//          解法: 直接扫全部窗口找 PLPlatterView, 祖先命中 SupplementaryHostingView
-//          或 Cell(放宽: 媒体尺寸/未挂窗/空框) 即就地应用罩层 — 完全不依赖登记/配方。
-//          应用幂等(已有罩层只校位/校 alpha), 重复扫零写入。
+// v0.1.9: 免登记亮屏扫 — v0.1.8 日志裁决: 直扫"免登记直接应用"零次出现, 每次亮屏新罩层
+//          都在 +0.9s 才由布局钩子创建 → 亮屏后 0~0.9s 的白底来自**托盘创建之前的占位
+//          效果视图**(v0.1.1 已实锤: 系统先给卡内放一个 UIVisualEffectView 白底, 托盘
+//          惰性创建晚 ~1s), 而直扫只找 PLPlatterView, 对占位白底视而不见。
+//          解法: 按单元格整体处理 — 找到过关的 NCNotificationListCell(媒体尺寸/未挂窗/
+//          空框且未隐藏) 直接走 HNPMCoverCollectTargets(登记路径同款, 同时覆盖托盘/bg/
+//          占位 EFX); 构建期还没接进 cell 的托盘按祖先 SupplementaryHostingView/Cell 兜底。
+//          应用幂等; 加限频诊断行(窗口/托盘/单元/命中计数), 下次排障有据可查。
 static void HNPMCoversWakeSweep(void) {
     if (![NSThread isMainThread]) {
         dispatch_async(dispatch_get_main_queue(), ^{ HNPMCoversWakeSweep(); });
@@ -1034,7 +1034,8 @@ static void HNPMCoversWakeSweep(void) {
         Class cellCls = NSClassFromString(@"NCNotificationListCell");
         if (!platterCls) return;
         NSArray *windows = [UIApplication sharedApplication].windows;
-        int hits = 0;
+        int hits = 0, nPlatter = 0, nCell = 0, nGated = 0;
+        UIView *dumpCell = nil;
         for (UIWindow *w in windows) {
             if (!w) continue;
             NSMutableArray *stack = [NSMutableArray arrayWithObject:w];
@@ -1046,28 +1047,81 @@ static void HNPMCoversWakeSweep(void) {
                 NSString *cls = NSStringFromClass([v class]);
                 if ([cls containsString:@"Remote"]) continue;
                 if (v.tag == HNPM_COVER_TAG) continue;
+                if (cellCls && [v isKindOfClass:cellCls]) {
+                    nCell++;
+                    BOOL ok = !v.hidden &&
+                              (HNPMIsMediaSized(v.frame.size) || !v.window || CGRectIsEmpty(v.frame));
+                    if (ok) {
+                        nGated++;
+                        if (!dumpCell && ![hnpmCardCells containsObject:v]) dumpCell = v;
+                        // 登记路径同款目标收集: 托盘/bg/占位 EFX 一网打尽
+                        NSMutableArray *targets = [NSMutableArray array];
+                        HNPMCoverCollectTargets(v, targets);
+                        for (UIView *mat in targets) {
+                            hits += HNPMCoverApplyOnMaterial(mat, a,
+                                    !(platterCls && [mat isKindOfClass:platterCls]));
+                        }
+                    }
+                    continue;   // cell 子树已由 collect 遍历(或判定不过关不碰), 不再下钻
+                }
                 if ([v isKindOfClass:platterCls]) {
-                    // 与配方钩子同一判定: 补充卡宿主专属, 或 Cell 放宽(媒体尺寸/未挂窗/空框)
+                    nPlatter++;
+                    // 构建期托盘可能还没接进 cell: 祖先 SupplementaryHostingView 即命中
                     UIView *p = v.superview;
                     BOOL ok = NO;
                     int g2 = 0;
                     while (p && g2++ < 12) {
                         if (hostCls && [p isKindOfClass:hostCls]) { ok = YES; break; }
                         if (cellCls && [p isKindOfClass:cellCls]) {
-                            ok = HNPMIsMediaSized(p.frame.size) || !p.window || CGRectIsEmpty(p.frame);
+                            ok = !p.hidden &&
+                                 (HNPMIsMediaSized(p.frame.size) || !p.window || CGRectIsEmpty(p.frame));
                             break;
                         }
                         p = p.superview;
                     }
-                    if (ok) hits += HNPMPlatterApplyCover(v, a);
+                    if (ok) {
+                        nGated++;
+                        hits += HNPMPlatterApplyCover(v, a);
+                    }
                     continue;   // 托盘内不再下钻(bg 由 HNPMPlatterApplyCover 处理)
                 }
                 [stack addObjectsFromArray:v.subviews];
             }
         }
+        // 诊断: 限频 0.5s — 每次亮屏窗口输出 ~5 行, 记录直扫看到了什么
+        static CFAbsoluteTime sHNPMCoversSweepDiag = 0;
+        CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
+        if (now - sHNPMCoversSweepDiag > 0.5) {
+            sHNPMCoversSweepDiag = now;
+            HNPMAppendLog([NSString stringWithFormat:@"[透明·亮屏扫] 窗口%lu 托盘%d 单元%d 过门%d 改动%d",
+                           (unsigned long)windows.count, nPlatter, nCell, nGated, hits]);
+        }
         if (hits > 0) {
             HNPMAppendLog([NSString stringWithFormat:@"[透明·亮屏扫] 免登记直接应用 %d 处罩层", hits]);
             HNPMStartAlphaBurst();
+        }
+        // 一次性诊断: 过关但未登记的单元格(= 亮屏重建的新卡) → dump 子树看占位白底
+        static CFAbsoluteTime sHNPMNewCellDumpAt = 0;
+        if (dumpCell && now - sHNPMNewCellDumpAt > 5.0) {
+            sHNPMNewCellDumpAt = now;
+            NSMutableArray *rows = [NSMutableArray array];
+            NSMutableArray *st = [NSMutableArray arrayWithObject:dumpCell];
+            int g3 = 0;
+            while (st.count > 0 && g3++ < 60 && rows.count < 24) {
+                UIView *v = st.firstObject;
+                [st removeObjectAtIndex:0];
+                if (!v) continue;
+                if ([v isKindOfClass:[UIVisualEffectView class]]) {
+                    [rows addObject:[NSString stringWithFormat:@"%@ a=%.2f h=%d <EFX>",
+                                     NSStringFromClass([v class]), v.alpha, v.hidden ? 1 : 0]];
+                } else {
+                    [rows addObject:[NSString stringWithFormat:@"%@ a=%.2f h=%d",
+                                     NSStringFromClass([v class]), v.alpha, v.hidden ? 1 : 0]];
+                }
+                [st addObjectsFromArray:v.subviews];
+            }
+            HNPMAppendLog([NSString stringWithFormat:@"[透明·亮屏扫·新卡] %lu视图: %@",
+                           (unsigned long)rows.count, [rows componentsJoinedByString:@" || "]]);
         }
     } @catch (NSException *e) {}
 }
@@ -1082,12 +1136,22 @@ static void HNPMScheduleWakeSweeps(void) {
 }
 
 // v0.1.3: 托盘离开窗口时摘掉罩层(无bg期罩层挂在 platter.superview, 托盘被移除会变孤儿)
+// v0.1.9: 加日志 — 排查亮屏重建序列是否在拆罩层(白底窗口期罩层去向的关键证据)
 static void HNPMCoverDetach(UIView *platter) {
     @try {
         UIVisualEffectView *cover = objc_getAssociatedObject(platter, &kHNPMCoverSelfKey);
         if (cover) { [cover removeFromSuperview]; objc_setAssociatedObject(platter, &kHNPMCoverSelfKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC); }
+        int removed = cover ? 1 : 0;
         for (UIView *s in platter.subviews) {
-            if (s.tag == HNPM_COVER_TAG) [s removeFromSuperview];
+            if (s.tag == HNPM_COVER_TAG) { [s removeFromSuperview]; removed++; }
+        }
+        if (removed > 0) {
+            static CFAbsoluteTime sHNPMCoverDetachLog = 0;
+            CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
+            if (now - sHNPMCoverDetachLog > 0.5) {
+                sHNPMCoverDetachLog = now;
+                HNPMAppendLog([NSString stringWithFormat:@"[透明·罩层] 摘除 %d 处(托盘离开窗口)", removed]);
+            }
         }
     } @catch (NSException *e) {}
 }
@@ -2809,7 +2873,7 @@ static void HNPMAttachPanIfNeeded(UIView *view) {
 #pragma mark - 入口
 
 __attribute__((constructor)) static void HNPMRawCtor(void) {
-    HNPMAppendLog(@"v0.1.8: dylib 构造函数已执行(dyld 加载成功)");
+    HNPMAppendLog(@"v0.1.9: dylib 构造函数已执行(dyld 加载成功)");
 }
 
 // v0.0.50/51: 岛元素抑制策略钩子 — 隐藏期让系统把 NowPlaying 元素当作"应被抑制",
@@ -2872,7 +2936,7 @@ __attribute__((constructor)) static void HNPMRawCtor(void) {
 
 %ctor {
     @autoreleasepool {
-        HNPMAppendLog(@"v0.1.8: logos %ctor 进入");
+        HNPMAppendLog(@"v0.1.9: logos %ctor 进入");
     HNPMAppendLog(HNPMCoverMode()
         ? @"[透明] 罩层模式 ON(HideNowPlaying.cover 存在 → 系统材质不动, 用自有 blur 罩层)"
         : @"[透明] 罩层模式 OFF(经典 alpha 模式; 建 /var/mobile/Documents/HideNowPlaying.cover 可切换)");
@@ -2969,7 +3033,7 @@ __attribute__((constructor)) static void HNPMRawCtor(void) {
         HNPMAppendLog(@"v0.0.92: 设置面板通知观察者已挂");
         // v0.0.93: 空闲巡逻(0.5s 只读一次, 无在场卡自动停) — 堵"空闲期静默重置无事件触发"盲区
         HNPMIdleAlphaCheck();
-        HNPMAppendLog(@"v0.1.8: 空闲巡逻已启动");
-        HNPMAppendLog(@"v0.1.8: %ctor 正常完成");
+        HNPMAppendLog(@"v0.1.9: 空闲巡逻已启动");
+        HNPMAppendLog(@"v0.1.9: %ctor 正常完成");
     }
 }
