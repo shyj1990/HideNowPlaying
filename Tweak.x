@@ -1337,7 +1337,7 @@ static void HNPMCoversWakeSweep(void) {
         CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
         if (now - sHNPMCoversSweepDiag > 0.5) {
             sHNPMCoversSweepDiag = now;
-            HNPMAppendLog([NSString stringWithFormat:@"[透明·亮屏扫 v0.1.18] 窗口%lu 托盘%d 单元%d[%@] 过门%d 改动%d",
+            HNPMAppendLog([NSString stringWithFormat:@"[透明·亮屏扫 v0.1.19] 窗口%lu 托盘%d 单元%d[%@] 过门%d 改动%d",
                            (unsigned long)windows.count, nPlatter, nCell,
                            [cellSizes componentsJoinedByString:@","], nGated, hits]);
         }
@@ -1801,6 +1801,35 @@ static void HNPMDeepDumpAt(NSString *tag) {
         if (!cell) {
             HNPMAppendLog([NSString stringWithFormat:@"[透明·深诊断@%@] 无在场登记卡", tag]);
             return;
+        }
+        // v0.1.19: 祖先链 — v0.1.18 裁决: 子树 15 视图 bg 全透明/无 img/托盘 layer 无背景色,
+        //          白底窗口(@0.3 时点树已健康)仍白 → 白的画手只可能在 cell 上方的祖先链
+        //          (通知列表容器自己的材质/层背景)。沿 superview 走到 window:
+        //          类名链每轮亮屏只在 @0.3 打一条; 发现非透明 layer 背景色立即清掉(记原值)。
+        {
+            NSMutableString *chain = [NSMutableString string];
+            UIView *anc = cell.superview;
+            int ag = 0;
+            while (anc && ag++ < 24) {
+                NSString *ac = NSStringFromClass([anc class]);
+                if ([tag isEqualToString:@"0.3"]) [chain appendFormat:@"%@ >", ac];
+                CGColorRef abg = anc.layer.backgroundColor;
+                if (abg) {
+                    size_t nc2 = CGColorGetNumberOfComponents(abg);
+                    const CGFloat *acp = CGColorGetComponents(abg);
+                    if (nc2 > 0 && acp[nc2 - 1] > 0.01) {
+                        NSMutableString *abs2 = [NSMutableString string];
+                        for (size_t i = 0; i < nc2 && i < 4; i++) [abs2 appendFormat:@"%.2f,", acp[i]];
+                        anc.layer.backgroundColor = [UIColor clearColor].CGColor;
+                        HNPMAppendLog([NSString stringWithFormat:@"[透明·罩层] 已清祖先 layer 背景色 %@(bg=%@)",
+                                       ac, abs2]);
+                    }
+                }
+                anc = anc.superview;
+            }
+            if ([tag isEqualToString:@"0.3"] && chain.length > 0) {
+                HNPMAppendLog([NSString stringWithFormat:@"[透明·深诊断@%@] 祖先链: %@", tag, chain]);
+            }
         }
         NSMutableArray *rows = [NSMutableArray array];
         NSMutableArray *stack = [NSMutableArray arrayWithObject:cell];
@@ -3150,7 +3179,7 @@ static void HNPMAttachPanIfNeeded(UIView *view) {
 #pragma mark - 入口
 
 __attribute__((constructor)) static void HNPMRawCtor(void) {
-    HNPMAppendLog(@"v0.1.18: dylib 构造函数已执行(dyld 加载成功)");
+    HNPMAppendLog(@"v0.1.19: dylib 构造函数已执行(dyld 加载成功)");
 }
 
 // v0.0.50/51: 岛元素抑制策略钩子 — 隐藏期让系统把 NowPlaying 元素当作"应被抑制",
@@ -3213,7 +3242,7 @@ __attribute__((constructor)) static void HNPMRawCtor(void) {
 
 %ctor {
     @autoreleasepool {
-        HNPMAppendLog(@"v0.1.18: logos %ctor 进入");
+        HNPMAppendLog(@"v0.1.19: logos %ctor 进入");
     HNPMAppendLog(HNPMCoverMode()
         ? @"[透明] 罩层模式 ON(HideNowPlaying.cover 存在 → 系统材质不动, 用自有 blur 罩层)"
         : @"[透明] 罩层模式 OFF(经典 alpha 模式; 建 /var/mobile/Documents/HideNowPlaying.cover 可切换)");
@@ -3311,7 +3340,7 @@ __attribute__((constructor)) static void HNPMRawCtor(void) {
         // v0.0.93: 空闲巡逻(0.5s 只读一次, 无在场卡自动停) — 堵"空闲期静默重置无事件触发"盲区
         HNPMIdleAlphaCheck();
         HNPMHookBackdrop();
-        HNPMAppendLog(@"v0.1.18: 空闲巡逻已启动");
-        HNPMAppendLog(@"v0.1.18: %ctor 正常完成");
+        HNPMAppendLog(@"v0.1.19: 空闲巡逻已启动");
+        HNPMAppendLog(@"v0.1.19: %ctor 正常完成");
     }
 }
