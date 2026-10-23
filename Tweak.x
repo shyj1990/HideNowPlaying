@@ -2627,39 +2627,24 @@ static void HNPMAttachPanIfNeeded(UIView *view) {
     } @catch (NSException *e) {}
     %orig;
     @try {
-        // v0.1.6: v0.1.5 实测配方写入后罩层仍晚 1.3s — 说明此刻托盘不在单元格内或
-        //         单元格 frame 未设(媒体尺寸判定失败)。两步走:
-        //         ①诊断: dump 祖先链(类名/尺寸/挂窗/隐藏), 暴露判定到底卡在哪一环;
-        //         ②放宽: 找到 NCNotificationListCell 祖先且(媒体尺寸 或 尚未挂窗/未布局)
-        //           即应用 — 零 frame 视为"正在构建", 亮屏重建时并发构建的托盘极少,
-        //           误盖风险小且有日志可查。
+        // v0.1.7: v0.1.6 配方时链裁决 — 配方写入时刻祖先链是
+        //         PLPlatterView ← NCNotificationListSupplementaryHostingView(0,0,未挂窗),
+        //         单元格 NCNotificationListCell 还没接上 → 查 Cell 永远失败。
+        //         SupplementaryHostingView 就是"正在播放"补充卡的专属宿主, 比 Cell 更精准:
+        //         找到它即视为音乐卡托盘(无需尺寸/挂窗检查), 立即应用罩层。
         CGFloat a = HNPMBgAlpha();
         if (HNPMCoverMode() && a < 0.99) {
+            Class hostCls = NSClassFromString(@"NCNotificationListSupplementaryHostingView");
             Class cellCls = NSClassFromString(@"NCNotificationListCell");
-            UIView *p = self, *cell = nil;
+            UIView *p = self, *host = nil, *cell = nil;
             int guard = 0;
             while (p && guard++ < 12) {
-                if (cellCls && [p isKindOfClass:cellCls]) { cell = p; break; }
+                if (hostCls && !host && [p isKindOfClass:hostCls]) host = p;
+                if (cellCls && !cell && [p isKindOfClass:cellCls]) cell = p;
                 p = p.superview;
             }
-            // 诊断链(限频): 类名 f=尺寸 w=挂窗 h=隐藏, 8 级
-            static CFAbsoluteTime sChainLog = 0;
-            CFAbsoluteTime now2 = CFAbsoluteTimeGetCurrent();
-            if (now2 - sChainLog > 1.0) {
-                sChainLog = now2;
-                NSMutableArray *rows = [NSMutableArray array];
-                p = self; guard = 0;
-                while (p && guard++ < 8) {
-                    [rows addObject:[NSString stringWithFormat:@"%@ f=%@ w=%d h=%d",
-                        NSStringFromClass([p class]), NSStringFromCGRect(p.frame),
-                        p.window ? 1 : 0, p.hidden ? 1 : 0]];
-                    p = p.superview;
-                }
-                HNPMAppendLog([NSString stringWithFormat:@"[透明·配方时链] cell查找=%@ || %@",
-                               cell ? @"命中" : @"未命中",
-                               [rows componentsJoinedByString:@" <- "]]);
-            }
-            BOOL ok = cell && (HNPMIsMediaSized(cell.frame.size) || !cell.window || CGRectIsEmpty(cell.frame));
+            BOOL ok = (host != nil) ||
+                      (cell && (HNPMIsMediaSized(cell.frame.size) || !cell.window || CGRectIsEmpty(cell.frame)));
             if (ok) {
                 if (HNPMPlatterApplyCover(self, a) > 0) HNPMStartAlphaBurst();
             }
@@ -2741,7 +2726,7 @@ static void HNPMAttachPanIfNeeded(UIView *view) {
 #pragma mark - 入口
 
 __attribute__((constructor)) static void HNPMRawCtor(void) {
-    HNPMAppendLog(@"v0.1.6: dylib 构造函数已执行(dyld 加载成功)");
+    HNPMAppendLog(@"v0.1.7: dylib 构造函数已执行(dyld 加载成功)");
 }
 
 // v0.0.50/51: 岛元素抑制策略钩子 — 隐藏期让系统把 NowPlaying 元素当作"应被抑制",
@@ -2804,7 +2789,7 @@ __attribute__((constructor)) static void HNPMRawCtor(void) {
 
 %ctor {
     @autoreleasepool {
-        HNPMAppendLog(@"v0.1.6: logos %ctor 进入");
+        HNPMAppendLog(@"v0.1.7: logos %ctor 进入");
     HNPMAppendLog(HNPMCoverMode()
         ? @"[透明] 罩层模式 ON(HideNowPlaying.cover 存在 → 系统材质不动, 用自有 blur 罩层)"
         : @"[透明] 罩层模式 OFF(经典 alpha 模式; 建 /var/mobile/Documents/HideNowPlaying.cover 可切换)");
@@ -2901,7 +2886,7 @@ __attribute__((constructor)) static void HNPMRawCtor(void) {
         HNPMAppendLog(@"v0.0.92: 设置面板通知观察者已挂");
         // v0.0.93: 空闲巡逻(0.5s 只读一次, 无在场卡自动停) — 堵"空闲期静默重置无事件触发"盲区
         HNPMIdleAlphaCheck();
-        HNPMAppendLog(@"v0.1.6: 空闲巡逻已启动");
-        HNPMAppendLog(@"v0.1.6: %ctor 正常完成");
+        HNPMAppendLog(@"v0.1.7: 空闲巡逻已启动");
+        HNPMAppendLog(@"v0.1.7: %ctor 正常完成");
     }
 }
