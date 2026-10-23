@@ -1337,7 +1337,7 @@ static void HNPMCoversWakeSweep(void) {
         CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
         if (now - sHNPMCoversSweepDiag > 0.5) {
             sHNPMCoversSweepDiag = now;
-            HNPMAppendLog([NSString stringWithFormat:@"[透明·亮屏扫 v0.1.19] 窗口%lu 托盘%d 单元%d[%@] 过门%d 改动%d",
+            HNPMAppendLog([NSString stringWithFormat:@"[透明·亮屏扫 v0.1.20] 窗口%lu 托盘%d 单元%d[%@] 过门%d 改动%d",
                            (unsigned long)windows.count, nPlatter, nCell,
                            [cellSizes componentsJoinedByString:@","], nGated, hits]);
         }
@@ -1802,15 +1802,19 @@ static void HNPMDeepDumpAt(NSString *tag) {
             HNPMAppendLog([NSString stringWithFormat:@"[透明·深诊断@%@] 无在场登记卡", tag]);
             return;
         }
-        // v0.1.19: 祖先链 — v0.1.18 裁决: 子树 15 视图 bg 全透明/无 img/托盘 layer 无背景色,
-        //          白底窗口(@0.3 时点树已健康)仍白 → 白的画手只可能在 cell 上方的祖先链
-        //          (通知列表容器自己的材质/层背景)。沿 superview 走到 window:
-        //          类名链每轮亮屏只在 @0.3 打一条; 发现非透明 layer 背景色立即清掉(记原值)。
+        // v0.1.20: 旁支诊断 — v0.1.19 裁决: 祖先链(NCNotificationListView→...→SBCoverSheetWindow)
+        //          全程零非透明 layer 背景色(已清祖先 0 次), 纵向(子树+祖先)全部排除 →
+        //          白的画手只剩横向: cell 的兄弟视图(如列表容器垫底的背景材质)。
+        //          首轮: 收集祖先(链日志@0.3 + 非透明 layer bg 清除 + 祖先 img 标记);
+        //          次轮: 逐祖先枚举"非 cell 分支"的兄弟视图, 材质类/非透明 bg/有 contents/存活
+        //          backdrop 才上报; 存活 backdrop 定向中和(已验证配方), 材质 layer bg 清除。
         {
+            NSMutableArray *ancs = [NSMutableArray array];
             NSMutableString *chain = [NSMutableString string];
             UIView *anc = cell.superview;
             int ag = 0;
             while (anc && ag++ < 24) {
+                [ancs addObject:anc];
                 NSString *ac = NSStringFromClass([anc class]);
                 if ([tag isEqualToString:@"0.3"]) [chain appendFormat:@"%@ >", ac];
                 CGColorRef abg = anc.layer.backgroundColor;
@@ -1825,10 +1829,62 @@ static void HNPMDeepDumpAt(NSString *tag) {
                                        ac, abs2]);
                     }
                 }
+                if ([tag isEqualToString:@"0.3"] && anc.layer.contents) {
+                    HNPMAppendLog([NSString stringWithFormat:@"[透明·深诊断@%@] 祖先有contents: %@", tag, ac]);
+                }
                 anc = anc.superview;
             }
             if ([tag isEqualToString:@"0.3"] && chain.length > 0) {
                 HNPMAppendLog([NSString stringWithFormat:@"[透明·深诊断@%@] 祖先链: %@", tag, chain]);
+            }
+            // 次轮: 旁支枚举(仅 @0.3, 每轮亮屏一次)
+            if ([tag isEqualToString:@"0.3"]) {
+                CGRect cellWin = [cell convertRect:cell.bounds toView:cell.window];
+                int sibLog = 0;
+                for (NSUInteger ai = 0; ai < ancs.count && sibLog < 12; ai++) {
+                    UIView *A = ancs[ai];
+                    UIView *childBranch = (ai > 0) ? ancs[ai - 1] : cell;   // cell 所在分支
+                    NSArray *kids = [A.subviews copy];
+                    for (UIView *s in kids) {
+                        if (s == childBranch || s.tag == HNPM_COVER_TAG) continue;
+                        if (sibLog >= 12) break;
+                        NSString *sc = NSStringFromClass([s class]);
+                        BOOL materialLike = ([sc hasPrefix:@"MTMaterial"] || [sc hasPrefix:@"PLPlatter"] ||
+                                             [sc hasPrefix:@"_UIVisualEffect"] || [s isKindOfClass:[UIVisualEffectView class]]);
+                        CGColorRef sbg = s.layer.backgroundColor;
+                        CGFloat sbga = 0.0;
+                        NSMutableString *sbs = [NSMutableString string];
+                        if (sbg) {
+                            size_t nc3 = CGColorGetNumberOfComponents(sbg);
+                            const CGFloat *scp = CGColorGetComponents(sbg);
+                            if (nc3 > 0) sbga = scp[nc3 - 1];
+                            for (size_t i = 0; i < nc3 && i < 4; i++) [sbs appendFormat:@"%.2f,", scp[i]];
+                        }
+                        BOOL hasImg = (s.layer.contents != NULL);
+                        BOOL liveBD = NO;
+                        Class bdCls = NSClassFromString(@"_UIVisualEffectBackdropView");
+                        if (bdCls && [s isKindOfClass:bdCls] && s.alpha > 0.01) liveBD = YES;
+                        if (!materialLike && sbga <= 0.01 && !hasImg && !liveBD) continue;
+                        CGRect sWin = [s convertRect:s.bounds toView:s.window];
+                        BOOL overlap = CGRectIntersectsRect(cellWin, sWin);
+                        CGRect f = s.frame;
+                        HNPMAppendLog([NSString stringWithFormat:
+                                       @"[透明·深诊断@%@] 旁支[%@下] %@ a=%.2f h=%d bg=%@%@ frame=%.0fx%.0f@%.0f,%.0f %@%@",
+                                       tag, NSStringFromClass([A class]), sc, s.alpha, s.hidden ? 1 : 0,
+                                       sbs, hasImg ? @" img" : @"", f.size.width, f.size.height,
+                                       f.origin.x, f.origin.y,
+                                       overlap ? @"∩卡" : @"", liveBD ? @" <存活BD>" : @""]);
+                        sibLog++;
+                        // 定向中和: 存活 backdrop → 压 alpha; 材质类非透明 layer bg → 清除
+                        if (liveBD && HNPMCoverMode()) {
+                            HNPMSetAlphaNoAnim(s, 0.0);
+                            HNPMAppendLog([NSString stringWithFormat:@"[透明·罩层] 已中和旁支 backdrop(父=%@)", sc]);
+                        } else if (materialLike && sbga > 0.01) {
+                            s.layer.backgroundColor = [UIColor clearColor].CGColor;
+                            HNPMAppendLog([NSString stringWithFormat:@"[透明·罩层] 已清旁支 %@ layer 背景色(bg=%@)", sc, sbs]);
+                        }
+                    }
+                }
             }
         }
         NSMutableArray *rows = [NSMutableArray array];
@@ -3179,7 +3235,7 @@ static void HNPMAttachPanIfNeeded(UIView *view) {
 #pragma mark - 入口
 
 __attribute__((constructor)) static void HNPMRawCtor(void) {
-    HNPMAppendLog(@"v0.1.19: dylib 构造函数已执行(dyld 加载成功)");
+    HNPMAppendLog(@"v0.1.20: dylib 构造函数已执行(dyld 加载成功)");
 }
 
 // v0.0.50/51: 岛元素抑制策略钩子 — 隐藏期让系统把 NowPlaying 元素当作"应被抑制",
@@ -3242,7 +3298,7 @@ __attribute__((constructor)) static void HNPMRawCtor(void) {
 
 %ctor {
     @autoreleasepool {
-        HNPMAppendLog(@"v0.1.19: logos %ctor 进入");
+        HNPMAppendLog(@"v0.1.20: logos %ctor 进入");
     HNPMAppendLog(HNPMCoverMode()
         ? @"[透明] 罩层模式 ON(HideNowPlaying.cover 存在 → 系统材质不动, 用自有 blur 罩层)"
         : @"[透明] 罩层模式 OFF(经典 alpha 模式; 建 /var/mobile/Documents/HideNowPlaying.cover 可切换)");
@@ -3340,7 +3396,7 @@ __attribute__((constructor)) static void HNPMRawCtor(void) {
         // v0.0.93: 空闲巡逻(0.5s 只读一次, 无在场卡自动停) — 堵"空闲期静默重置无事件触发"盲区
         HNPMIdleAlphaCheck();
         HNPMHookBackdrop();
-        HNPMAppendLog(@"v0.1.19: 空闲巡逻已启动");
-        HNPMAppendLog(@"v0.1.19: %ctor 正常完成");
+        HNPMAppendLog(@"v0.1.20: 空闲巡逻已启动");
+        HNPMAppendLog(@"v0.1.20: %ctor 正常完成");
     }
 }
