@@ -1337,7 +1337,7 @@ static void HNPMCoversWakeSweep(void) {
         CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
         if (now - sHNPMCoversSweepDiag > 0.5) {
             sHNPMCoversSweepDiag = now;
-            HNPMAppendLog([NSString stringWithFormat:@"[透明·亮屏扫 v0.1.21] 窗口%lu 托盘%d 单元%d[%@] 过门%d 改动%d",
+            HNPMAppendLog([NSString stringWithFormat:@"[透明·亮屏扫 v0.1.22] 窗口%lu 托盘%d 单元%d[%@] 过门%d 改动%d",
                            (unsigned long)windows.count, nPlatter, nCell,
                            [cellSizes componentsJoinedByString:@","], nGated, hits]);
         }
@@ -1910,6 +1910,56 @@ static void HNPMDeepDumpAt(NSString *tag) {
                         }
                     }
                 }
+            }
+            // v0.1.22: 窗口表 + CA 层树 — v0.1.21 裁决: 全屏 EFX 在 0.1/0.3s 时点 subviews 为空
+            //          (无 backdrop 无 contentView, 空壳画不出白) → UIKit 视图路线(子树/祖先/旁支)
+            //          全部穷尽。白底只能来自非 UIView 来源: ①别的窗口(亮屏过渡快照窗) ②CA 层
+            //          replica(v0.1.17 曾见 PBUIPosterFloatingLayerReplica)。@0.1 各打一条:
+            //          全部窗口一览(类/a/h/frame/背景) + cell.window 顶层 CA 子树(深度≤3)。
+            if ([tag isEqualToString:@"0.1"]) {
+                @try {
+                    NSArray *ws = [[UIApplication sharedApplication] windows];
+                    NSMutableString *wt = [NSMutableString string];
+                    for (NSUInteger i = 0; i < ws.count && i < 26; i++) {
+                        UIWindow *w = ws[i];
+                        NSString *wc = NSStringFromClass([w class]);
+                        CGColorRef wbg = w.layer.backgroundColor;
+                        BOOL wbgO = NO;
+                        if (wbg) {
+                            size_t wnc = CGColorGetNumberOfComponents(wbg);
+                            const CGFloat *wcp = CGColorGetComponents(wbg);
+                            wbgO = (wnc > 0 && wcp[wnc - 1] > 0.01);
+                        }
+                        CGRect wf = w.frame;
+                        [wt appendFormat:@"[%lu]%@(%.0f,%.0fx%.0f,%.0f%s%s)",
+                         (unsigned long)i, wc, wf.origin.x, wf.origin.y, wf.size.width, wf.size.height,
+                         w.hidden ? ",隐" : "", wbgO ? ",bg!" : ""];
+                        if (w == cell.window) [wt appendString:@"←卡"];
+                        if (i + 1 < ws.count && i < 25) [wt appendString:@" "];
+                    }
+                    HNPMAppendLog([NSString stringWithFormat:@"[透明·深诊断@%@] 窗口表(%lu): %@",
+                                   tag, (unsigned long)ws.count, wt]);
+                    // CA 层树: 广度优先, 深度≤3, 最多 40 个; 只报类名+子层数(层无 alpha 语义则跳过细项)
+                    NSMutableString *lt = [NSMutableString string];
+                    NSMutableArray *lq = [NSMutableArray arrayWithObject:cell.window.layer];
+                    NSMutableArray *lqd = [NSMutableArray arrayWithObject:@0];
+                    int lg = 0;
+                    while (lq.count > 0 && lg++ < 40) {
+                        CALayer *L = lq.firstObject;
+                        [lq removeObjectAtIndex:0];
+                        NSInteger d = [(lqd.firstObject ?: @0) integerValue];
+                        [lqd removeObjectAtIndex:0];
+                        if (!L) continue;
+                        [lt appendFormat:@"%@(%lu) ", NSStringFromClass([L class]), (unsigned long)L.sublayers.count];
+                        if (d < 3) {
+                            for (CALayer *sl in [L.sublayers copy]) {
+                                [lq addObject:sl];
+                                [lqd addObject:@(d + 1)];
+                            }
+                        }
+                    }
+                    HNPMAppendLog([NSString stringWithFormat:@"[透明·深诊断@%@] 层树: %@", tag, lt]);
+                } @catch (NSException *e) {}
             }
         }
         NSMutableArray *rows = [NSMutableArray array];
@@ -3260,7 +3310,7 @@ static void HNPMAttachPanIfNeeded(UIView *view) {
 #pragma mark - 入口
 
 __attribute__((constructor)) static void HNPMRawCtor(void) {
-    HNPMAppendLog(@"v0.1.21: dylib 构造函数已执行(dyld 加载成功)");
+    HNPMAppendLog(@"v0.1.22: dylib 构造函数已执行(dyld 加载成功)");
 }
 
 // v0.0.50/51: 岛元素抑制策略钩子 — 隐藏期让系统把 NowPlaying 元素当作"应被抑制",
@@ -3323,7 +3373,7 @@ __attribute__((constructor)) static void HNPMRawCtor(void) {
 
 %ctor {
     @autoreleasepool {
-        HNPMAppendLog(@"v0.1.21: logos %ctor 进入");
+        HNPMAppendLog(@"v0.1.22: logos %ctor 进入");
     HNPMAppendLog(HNPMCoverMode()
         ? @"[透明] 罩层模式 ON(HideNowPlaying.cover 存在 → 系统材质不动, 用自有 blur 罩层)"
         : @"[透明] 罩层模式 OFF(经典 alpha 模式; 建 /var/mobile/Documents/HideNowPlaying.cover 可切换)");
@@ -3421,7 +3471,7 @@ __attribute__((constructor)) static void HNPMRawCtor(void) {
         // v0.0.93: 空闲巡逻(0.5s 只读一次, 无在场卡自动停) — 堵"空闲期静默重置无事件触发"盲区
         HNPMIdleAlphaCheck();
         HNPMHookBackdrop();
-        HNPMAppendLog(@"v0.1.21: 空闲巡逻已启动");
-        HNPMAppendLog(@"v0.1.21: %ctor 正常完成");
+        HNPMAppendLog(@"v0.1.22: 空闲巡逻已启动");
+        HNPMAppendLog(@"v0.1.22: %ctor 正常完成");
     }
 }
