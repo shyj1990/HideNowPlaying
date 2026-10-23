@@ -1151,7 +1151,7 @@ static int HNPMPlatterApplyCover(UIView *platter, CGFloat a) {
 //          常未创建, 用静态记忆值; 全屏 h=852 的 ShadowView 不碰——无法隔离卡区)。
 static CFAbsoluteTime sHNPMWakeAt33 = 0;      // 最近一次屏幕状态通知时刻
 static BOOL sHNPMCaptureHidden33 = NO;        // 本轮亮屏是否已成功隐藏(每轮一次)
-static CGRect sHNPMCardRegion33 = CGRectZero; // 最近一次登记媒体卡的区域(窗口坐标)
+static CGRect sHNPMCardRegion33 = {{0, 0}, {0, 0}}; // 最近一次登记媒体卡的区域(窗口坐标)
 
 static void HNPMHideCaptureCardRegion(void) {
     if (!HNPMCoverMode()) return;
