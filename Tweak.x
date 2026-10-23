@@ -933,42 +933,54 @@ static BOOL HNPMCoverMode(void) {
     return sHNPMCoverCached;
 }
 
-static UIVisualEffectView *HNPMCoverFind(UIView *platter) {
-    for (UIView *s in platter.subviews) {
-        if (s.tag == HNPM_COVER_TAG && [s isKindOfClass:[UIVisualEffectView class]])
-            return (UIVisualEffectView *)s;
+// v0.1.3: 罩层查找 — 材质的关联罩层 → 兄弟 tag → 祖先托盘的关联罩层
+//          (托盘无 bg 期罩层挂在 platter.superview, 关联在托盘上)
+static char kHNPMCoverSelfKey;
+static UIVisualEffectView *HNPMCoverForView(UIView *mat) {
+    UIVisualEffectView *cover = objc_getAssociatedObject(mat, &kHNPMCoverSelfKey);
+    if (cover && cover.superview) return cover;
+    if (mat.superview) {
+        for (UIView *s in mat.superview.subviews) {
+            if (s.tag == HNPM_COVER_TAG && [s isKindOfClass:[UIVisualEffectView class]])
+                return (UIVisualEffectView *)s;
+        }
+    }
+    Class platterCls = NSClassFromString(@"PLPlatterView");
+    UIView *anc = mat.superview;
+    int g = 0;
+    while (anc && g++ < 6) {
+        if (platterCls && [anc isKindOfClass:platterCls])
+            return objc_getAssociatedObject(anc, &kHNPMCoverSelfKey);
+        anc = anc.superview;
     }
     return nil;
 }
 
-// 对单个系统材质层应用罩层(创建/校位/校 alpha/隐藏材质), 返回实际改动数。
-// v0.1.1 泛化: 材质层不限于托盘背景(PLPlatterView 的 backgroundView) — 亮屏重建序列里
-//          系统会先给卡内放一个 UIVisualEffectView 白底(托盘惰性创建晚 ~1s), 罩层必须
-//          也能盖住它, 否则亮屏首秒呈原生白底(用户实测 v0.1.0)。罩层与材质层一一对应
-//          (associated object 反查 + tag 兜底), 挂在材质层的父视图里、其正上方。
-static char kHNPMCoverSelfKey;
-static int HNPMCoverApplyOnMaterial(UIView *mat, CGFloat a) {
+// 对单个系统材质层应用罩层(创建/校位/校 alpha/按需隐藏材质), 返回实际改动数。
+// v0.1.1 泛化: 材质层不限于托盘背景 — 亮屏重建序列里系统会先给卡内放一个
+//          UIVisualEffectView 白底(托盘惰性创建晚 ~1s), 罩层必须也能盖住它。
+// v0.1.3: bg 材质本身也是惰性创建(亮屏 dump 实锤: 卡/托盘 0.3s 已在窗口, bg 晚 ~1s,
+//          期间白底来自托盘自身渲染) → hideMat=NO 模式直接盖托盘: 罩层插在
+//          platter.superview 里托盘正上方(内容是托盘的兄弟层, 不受影响), 托盘不隐藏;
+//          bg 一出现, 同一罩层经 HNPMCoverForView 祖先链找到后移入托盘内盖上 bg。
+static int HNPMCoverApplyOnMaterial(UIView *mat, CGFloat a, BOOL hideMat) {
     int hits = 0;
     @try {
         if (!mat || !mat.superview) return 0;
         UIView *parent = mat.superview;
-        UIVisualEffectView *cover = objc_getAssociatedObject(mat, &kHNPMCoverSelfKey);
-        if (!cover || cover.superview != parent) {
-            cover = nil;
-            for (UIView *s in parent.subviews) {
-                if (s.tag == HNPM_COVER_TAG && [s isKindOfClass:[UIVisualEffectView class]]) {
-                    cover = (UIVisualEffectView *)s; break;
-                }
-            }
-        }
+        UIVisualEffectView *cover = HNPMCoverForView(mat);
         if (!cover) {
             UIBlurEffect *eff = [UIBlurEffect effectWithStyle:UIBlurEffectStyleSystemUltraThinMaterial];
             cover = [[UIVisualEffectView alloc] initWithEffect:eff];
             cover.tag = HNPM_COVER_TAG;
-            [parent insertSubview:cover aboveSubview:mat];
             objc_setAssociatedObject(mat, &kHNPMCoverSelfKey, cover, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-            HNPMAppendLog([NSString stringWithFormat:@"[透明·罩层] 已创建 blur 罩层 a=%.2f(材质%@已隐藏)",
-                           a, NSStringFromClass([mat class])]);
+            [parent insertSubview:cover aboveSubview:mat];
+            HNPMAppendLog([NSString stringWithFormat:@"[透明·罩层] 已创建 blur 罩层 a=%.2f(材质%@%@)",
+                           a, NSStringFromClass([mat class]),
+                           hideMat ? @"已隐藏" : @", 盖托盘层(无bg期, 内容不受影响)")]);
+            hits++;
+        } else if (cover.superview != parent) {
+            [parent insertSubview:cover aboveSubview:mat];   // 移入当前父视图(bg 出现后从托盘上层移入)
             hits++;
         }
         // 系统重建材质时新层可能插到罩层之下 → 每次应用保证罩层在材质正上方 + 帧同步
@@ -981,27 +993,39 @@ static int HNPMCoverApplyOnMaterial(UIView *mat, CGFloat a) {
         if (!CGRectEqualToRect(cover.frame, mat.frame)) {
             cover.frame = mat.frame;
             cover.autoresizingMask = mat.autoresizingMask;
-            cover.layer.cornerRadius = mat.layer.cornerRadius;
+            cover.layer.cornerRadius = hideMat ? mat.layer.cornerRadius : 0.0;
             cover.layer.masksToBounds = YES;
             hits++;
         }
         if (fabs(cover.alpha - a) > 0.01) { HNPMSetAlphaNoAnim(cover, a); hits++; }
-        if (!mat.hidden) { mat.hidden = YES; hits++; }
+        if (hideMat && !mat.hidden) { mat.hidden = YES; hits++; }
     } @catch (NSException *e) {}
     return hits;
 }
 
-// 对单个托盘应用罩层(v0.1.1 薄包装: 找背景子层 → 通用材质罩层)
+// 对单个托盘应用罩层: 有 bg 盖 bg(隐藏); 无 bg(惰性创建期)直接盖托盘(不隐藏托盘/内容)
 static int HNPMPlatterApplyCover(UIView *platter, CGFloat a) {
     UIView *bg = HNPMPlatterBgView(platter, NULL);
-    if (!bg) return 0;
-    return HNPMCoverApplyOnMaterial(bg, a);
+    if (bg) return HNPMCoverApplyOnMaterial(bg, a, YES);
+    return HNPMCoverApplyOnMaterial(platter, a, NO);
+}
+
+// v0.1.3: 托盘离开窗口时摘掉罩层(无bg期罩层挂在 platter.superview, 托盘被移除会变孤儿)
+static void HNPMCoverDetach(UIView *platter) {
+    @try {
+        UIVisualEffectView *cover = objc_getAssociatedObject(platter, &kHNPMCoverSelfKey);
+        if (cover) { [cover removeFromSuperview]; objc_setAssociatedObject(platter, &kHNPMCoverSelfKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC); }
+        for (UIView *s in platter.subviews) {
+            if (s.tag == HNPM_COVER_TAG) [s removeFromSuperview];
+        }
+    } @catch (NSException *e) {}
 }
 
 // v0.1.0: 恢复原生(alpha 调回 1.0 / 功能关闭时) — 露出系统材质, 隐藏罩层
 static void HNPMCoverRestoreAll(UIView *root) {
     if (![NSThread isMainThread]) return;
     @try {
+        Class platterCls = NSClassFromString(@"PLPlatterView");
         NSMutableArray *stack = [NSMutableArray arrayWithObject:root];
         int guard = 0;
         while (stack.count > 0 && guard++ < 200) {
@@ -1009,11 +1033,12 @@ static void HNPMCoverRestoreAll(UIView *root) {
             [stack removeObjectAtIndex:0];
             if (!v) continue;
             if ([NSStringFromClass([v class]) containsString:@"Remote"]) continue;
-            // v0.1.1: 任意挂了罩层的材质层(托盘背景/卡内效果视图) → 露出材质, 隐藏罩层
+            // v0.1.1: 任意挂了罩层的材质层(托盘背景/卡内效果视图/无bg期托盘) → 露出材质, 隐藏罩层
             UIVisualEffectView *cover = objc_getAssociatedObject(v, &kHNPMCoverSelfKey);
             if (cover) {
-                if (v.hidden) v.hidden = NO;
                 if (!cover.hidden) cover.hidden = YES;
+                BOOL isPlatter = platterCls && [v isKindOfClass:platterCls];
+                if (!isPlatter && v.hidden) v.hidden = NO;   // 托盘从未隐藏, 不动
             }
             [stack addObjectsFromArray:v.subviews];
         }
@@ -1037,7 +1062,9 @@ static void HNPMCoverCollectTargets(UIView *root, NSMutableArray *outTargets) {
             if (v.tag == HNPM_COVER_TAG) continue;   // 自家罩层不是目标
             if ([v isKindOfClass:platterCls]) {
                 UIView *bg = HNPMPlatterBgView(v, NULL);
-                if (bg) { [outTargets addObject:bg]; continue; }   // 托盘内不再下钻(bg 已收)
+                // v0.1.3: bg 惰性创建期以托盘为目标(罩层盖托盘层, 不隐藏); bg 就绪后以 bg 为目标
+                [outTargets addObject:bg ? bg : v];
+                continue;   // 托盘内不再下钻
             }
             if ([v isKindOfClass:[UIVisualEffectView class]]) {
                 [outTargets addObject:v];
@@ -1048,13 +1075,18 @@ static void HNPMCoverCollectTargets(UIView *root, NSMutableArray *outTargets) {
     } @catch (NSException *e) {}
 }
 
-// v0.1.0: 罩层漂移检测(只读) — 材质被系统重新露出/罩层丢失/罩层 alpha 偏了
+// v0.1.3: 罩层漂移检测(只读) — 目标(bg 或无bg期的托盘)无罩/罩层 alpha 偏/罩层不在其上方
 static BOOL HNPMPlatterCoverDrift(UIView *platter, CGFloat a) {
     UIView *bg = HNPMPlatterBgView(platter, NULL);
-    if (!bg) return NO;
-    if (!bg.hidden) return YES;
-    UIVisualEffectView *cover = HNPMCoverFind(platter);
-    if (!cover || fabs(cover.alpha - a) > 0.01) return YES;
+    UIView *mat = bg ? bg : platter;   // v0.1.3: bg 缺席时以托盘为覆盖目标
+    UIVisualEffectView *cover = HNPMCoverForView(mat);
+    if (!cover) return YES;
+    if (fabs(cover.alpha - a) > 0.01) return YES;
+    UIView *parent = cover.superview;
+    if (!parent) return YES;
+    NSUInteger ci = [parent.subviews indexOfObject:cover];
+    NSUInteger mi = [parent.subviews indexOfObject:mat];
+    if (mi == NSNotFound || ci == NSNotFound || ci < mi) return YES;   // 罩层必须在其正上方
     return NO;
 }
 
@@ -1126,7 +1158,12 @@ static int HNPMInstantPlatterAlpha(UIView *cell) {
             NSMutableArray *targets = [NSMutableArray array];
             HNPMCoverCollectTargets(cell, targets);
             int t = 0;
-            for (UIView *mat in targets) t += HNPMCoverApplyOnMaterial(mat, a);
+            Class platterClsC = NSClassFromString(@"PLPlatterView");
+            for (UIView *mat in targets) {
+                // 托盘目标(bg 缺席期)不隐藏; 材质目标隐藏
+                t += HNPMCoverApplyOnMaterial(mat, a,
+                        !(platterClsC && [mat isKindOfClass:platterCls]));
+            }
             if (t > 0 && fabs(cell.alpha - 1.0) > 0.01) cell.alpha = 1.0;
             return t;
         }
@@ -1163,17 +1200,17 @@ static CGFloat HNPMCardPlatterBgAlphaRead(void) {
                 NSMutableArray *targets = [NSMutableArray array];
                 HNPMCoverCollectTargets(cell, targets);
                 if (targets.count == 0) continue;   // 该卡暂无材质目标 → 看下一张
-                // v0.1.2: 检查**所有**目标 — v0.1.1 实测: 亮屏重建时系统会新建材质视图
-                //          (排在已盖住的旧材质之后), 只查 firstObject 会漏报"正常",
-                //          连扫稳定门永不触发, 白底要等 ~1.7s 后的登记路径才被盖住。
+                // v0.1.2: 检查**所有**目标 — 亮屏重建时系统会新建材质视图, 只查 firstObject
+                //          会漏报"正常", 连扫稳定门永不触发(v0.1.1 实测)。
+                // v0.1.3: 覆盖判定 = 罩层存在 + alpha 达标(隐藏与否不再判 — bg 被系统
+                //          重新露出时仍在罩层之下, 视觉无影响; z 序由每次应用时校正)
                 CGFloat firstAlpha = -1;
                 for (UIView *mat in targets) {
-                    UIVisualEffectView *cover = objc_getAssociatedObject(mat, &kHNPMCoverSelfKey);
-                    if (cover && mat.hidden) {
-                        if (firstAlpha < 0) firstAlpha = cover.alpha;
-                    } else {
-                        return 1.0;   // 任一材质被露出/罩层缺失 → 满偏差, 触发修正
+                    UIVisualEffectView *cover = HNPMCoverForView(mat);
+                    if (!cover || fabs(cover.alpha - a) > 0.01) {
+                        return 1.0;   // 任一目标无罩/alpha 偏 → 满偏差, 触发修正
                     }
+                    if (firstAlpha < 0) firstAlpha = cover.alpha;
                 }
                 return firstAlpha;
             }
@@ -1455,7 +1492,11 @@ static void HNPMApplyCardBackgroundAlpha(UIView *cell, int kind) {
             NSMutableArray *targets = [NSMutableArray array];
             HNPMCoverCollectTargets(cell, targets);
             if (targets.count > 0) {
-                for (UIView *mat in targets) HNPMCoverApplyOnMaterial(mat, a);
+                Class platterClsC = NSClassFromString(@"PLPlatterView");
+                for (UIView *mat in targets) {
+                    HNPMCoverApplyOnMaterial(mat, a,
+                            !(platterClsC && [mat isKindOfClass:platterCls]));
+                }
                 HNPMAlphaRetrySet(cell, 0);
                 if (fabs(cell.alpha - 1.0) > 0.01) cell.alpha = 1.0;
                 HNPMAppendLog([NSString stringWithFormat:@"[透明] 罩层应用 %lu 目标(材质已隐藏, 零系统写入)",
@@ -2537,7 +2578,13 @@ static void HNPMAttachPanIfNeeded(UIView *view) {
 %hook PLPlatterView
 - (void)didMoveToWindow {
     %orig;
-    @try { HNPMPlatterReapplyOnLayout(self); } @catch (NSException *e) {}
+    @try {
+        if (!self.window) {
+            HNPMCoverDetach(self);   // v0.1.3: 托盘离窗摘罩(无bg期罩层挂托盘上层, 防孤儿罩层)
+            return;
+        }
+        HNPMPlatterReapplyOnLayout(self);
+    } @catch (NSException *e) {}
 }
 - (void)layoutSubviews {
     %orig;
@@ -2647,7 +2694,7 @@ static void HNPMAttachPanIfNeeded(UIView *view) {
 #pragma mark - 入口
 
 __attribute__((constructor)) static void HNPMRawCtor(void) {
-    HNPMAppendLog(@"v0.1.2: dylib 构造函数已执行(dyld 加载成功)");
+    HNPMAppendLog(@"v0.1.3: dylib 构造函数已执行(dyld 加载成功)");
 }
 
 // v0.0.50/51: 岛元素抑制策略钩子 — 隐藏期让系统把 NowPlaying 元素当作"应被抑制",
@@ -2710,7 +2757,7 @@ __attribute__((constructor)) static void HNPMRawCtor(void) {
 
 %ctor {
     @autoreleasepool {
-        HNPMAppendLog(@"v0.1.2: logos %ctor 进入");
+        HNPMAppendLog(@"v0.1.3: logos %ctor 进入");
     HNPMAppendLog(HNPMCoverMode()
         ? @"[透明] 罩层模式 ON(HideNowPlaying.cover 存在 → 系统材质不动, 用自有 blur 罩层)"
         : @"[透明] 罩层模式 OFF(经典 alpha 模式; 建 /var/mobile/Documents/HideNowPlaying.cover 可切换)");
@@ -2807,7 +2854,7 @@ __attribute__((constructor)) static void HNPMRawCtor(void) {
         HNPMAppendLog(@"v0.0.92: 设置面板通知观察者已挂");
         // v0.0.93: 空闲巡逻(0.5s 只读一次, 无在场卡自动停) — 堵"空闲期静默重置无事件触发"盲区
         HNPMIdleAlphaCheck();
-        HNPMAppendLog(@"v0.1.2: 空闲巡逻已启动");
-        HNPMAppendLog(@"v0.1.2: %ctor 正常完成");
+        HNPMAppendLog(@"v0.1.3: 空闲巡逻已启动");
+        HNPMAppendLog(@"v0.1.3: %ctor 正常完成");
     }
 }
