@@ -1337,7 +1337,7 @@ static void HNPMCoversWakeSweep(void) {
         CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
         if (now - sHNPMCoversSweepDiag > 0.5) {
             sHNPMCoversSweepDiag = now;
-            HNPMAppendLog([NSString stringWithFormat:@"[透明·亮屏扫 v0.1.20] 窗口%lu 托盘%d 单元%d[%@] 过门%d 改动%d",
+            HNPMAppendLog([NSString stringWithFormat:@"[透明·亮屏扫 v0.1.21] 窗口%lu 托盘%d 单元%d[%@] 过门%d 改动%d",
                            (unsigned long)windows.count, nPlatter, nCell,
                            [cellSizes componentsJoinedByString:@","], nGated, hits]);
         }
@@ -1837,8 +1837,8 @@ static void HNPMDeepDumpAt(NSString *tag) {
             if ([tag isEqualToString:@"0.3"] && chain.length > 0) {
                 HNPMAppendLog([NSString stringWithFormat:@"[透明·深诊断@%@] 祖先链: %@", tag, chain]);
             }
-            // 次轮: 旁支枚举(仅 @0.3, 每轮亮屏一次)
-            if ([tag isEqualToString:@"0.3"]) {
+            // 次轮: 旁支枚举(@0.1 + @0.3 — v0.1.21 提前到 0.1s, 进入白底窗口内生效)
+            if ([tag isEqualToString:@"0.3"] || [tag isEqualToString:@"0.1"]) {
                 CGRect cellWin = [cell convertRect:cell.bounds toView:cell.window];
                 int sibLog = 0;
                 for (NSUInteger ai = 0; ai < ancs.count && sibLog < 12; ai++) {
@@ -1882,6 +1882,31 @@ static void HNPMDeepDumpAt(NSString *tag) {
                         } else if (materialLike && sbga > 0.01) {
                             s.layer.backgroundColor = [UIColor clearColor].CGColor;
                             HNPMAppendLog([NSString stringWithFormat:@"[透明·罩层] 已清旁支 %@ layer 背景色(bg=%@)", sc, sbs]);
+                        }
+                        // v0.1.21: 全屏 EFX 旁支 — v0.1.20 裁决: 旁支仅两种, TouchPassThrough(a=0,h=1)无害,
+                        //          SBFTouchPassThroughView 下全屏 UIVisualEffectView a=1.00 h=0 ∩卡 = 树上
+                        //          最后一个存活材质。亮屏瞬间材质 recipe 未就绪 → backdrop 平铺白 ≈ 首帧白底
+                        //          (~0.5s 后 recipe 加载转模糊, 与视频白窗吻合)。处理: 枚举其子层留证据,
+                        //          backdrop 存活即压 alpha(与卡内配方一致, 幂等)。
+                        if ([s isKindOfClass:[UIVisualEffectView class]] && HNPMCoverMode() && overlap) {
+                            NSArray *efxKids = [s.subviews copy];
+                            for (UIView *ek in efxKids) {
+                                if (ek.tag == HNPM_COVER_TAG) continue;
+                                Class bdc2 = NSClassFromString(@"_UIVisualEffectBackdropView");
+                                if (bdc2 && [ek isKindOfClass:bdc2]) {
+                                    HNPMAppendLog([NSString stringWithFormat:
+                                                   @"[透明·深诊断@%@] 全屏EFX子层 backdrop a=%.2f h=%d",
+                                                   tag, ek.alpha, ek.hidden ? 1 : 0]);
+                                    if (ek.alpha > 0.01) {
+                                        HNPMSetAlphaNoAnim(ek, 0.0);
+                                        HNPMAppendLog(@"[透明·罩层] 已中和全屏EFX backdrop");
+                                    }
+                                } else {
+                                    HNPMAppendLog([NSString stringWithFormat:
+                                                   @"[透明·深诊断@%@] 全屏EFX子层 %@ a=%.2f h=%d",
+                                                   tag, NSStringFromClass([ek class]), ek.alpha, ek.hidden ? 1 : 0]);
+                                }
+                            }
                         }
                     }
                 }
@@ -1947,7 +1972,7 @@ static void HNPMDeepDumpAt(NSString *tag) {
 }
 
 static void HNPMScheduleDeepDumps(void) {
-    for (NSString *d in @[@"0.3", @"0.8", @"1.5", @"2.5"]) {
+    for (NSString *d in @[@"0.1", @"0.3", @"0.8", @"1.5", @"2.5"]) {
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)([d doubleValue] * NSEC_PER_SEC)),
                        dispatch_get_main_queue(), ^{
             @try {
@@ -3235,7 +3260,7 @@ static void HNPMAttachPanIfNeeded(UIView *view) {
 #pragma mark - 入口
 
 __attribute__((constructor)) static void HNPMRawCtor(void) {
-    HNPMAppendLog(@"v0.1.20: dylib 构造函数已执行(dyld 加载成功)");
+    HNPMAppendLog(@"v0.1.21: dylib 构造函数已执行(dyld 加载成功)");
 }
 
 // v0.0.50/51: 岛元素抑制策略钩子 — 隐藏期让系统把 NowPlaying 元素当作"应被抑制",
@@ -3298,7 +3323,7 @@ __attribute__((constructor)) static void HNPMRawCtor(void) {
 
 %ctor {
     @autoreleasepool {
-        HNPMAppendLog(@"v0.1.20: logos %ctor 进入");
+        HNPMAppendLog(@"v0.1.21: logos %ctor 进入");
     HNPMAppendLog(HNPMCoverMode()
         ? @"[透明] 罩层模式 ON(HideNowPlaying.cover 存在 → 系统材质不动, 用自有 blur 罩层)"
         : @"[透明] 罩层模式 OFF(经典 alpha 模式; 建 /var/mobile/Documents/HideNowPlaying.cover 可切换)");
@@ -3396,7 +3421,7 @@ __attribute__((constructor)) static void HNPMRawCtor(void) {
         // v0.0.93: 空闲巡逻(0.5s 只读一次, 无在场卡自动停) — 堵"空闲期静默重置无事件触发"盲区
         HNPMIdleAlphaCheck();
         HNPMHookBackdrop();
-        HNPMAppendLog(@"v0.1.20: 空闲巡逻已启动");
-        HNPMAppendLog(@"v0.1.20: %ctor 正常完成");
+        HNPMAppendLog(@"v0.1.21: 空闲巡逻已启动");
+        HNPMAppendLog(@"v0.1.21: %ctor 正常完成");
     }
 }
