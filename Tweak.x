@@ -1012,6 +1012,30 @@ static UIView *HNPMPlatterBackdropOfMat(UIView *mat) {
             if (activityCls && [v isKindOfClass:activityCls]) continue;
             [stack addObjectsFromArray:[v.subviews copy]];
         }
+        // v0.1.17: 扩展搜索 — v0.1.16 日志矛盾: apply 路径 55 次 miss(说全树无 backdrop),
+        //          同秒深诊断 dump 却显示登记卡托盘的 CustomContent 下 backdrop a=1.00 在场。
+        //          假说: apply 拿到的 mat 属于旧/孤儿托盘, 真正可见卡在登记卡的新托盘里。
+        //          → 找不到时遍历登记卡, 对每张在场卡的托盘跑同款 DFS。
+        for (UIView *c in [hnpmCardCells copy]) {
+            if (![c isKindOfClass:[UIView class]] || !c.window) continue;
+            NSMutableArray *st2 = [NSMutableArray arrayWithObject:c];
+            int g2 = 0;
+            while (st2.count > 0 && g2++ < 200) {
+                UIView *v2 = st2.firstObject;
+                [st2 removeObjectAtIndex:0];
+                if (!v2) continue;
+                if (v2.tag == HNPM_COVER_TAG) continue;
+                if ([v2 isKindOfClass:backdropCls]) {
+                    if (v2.alpha > 0.01) {
+                        HNPMAppendLog(@"[透明·罩层] backdrop 在登记卡托盘中找到且存活(mat托盘没有→两托盘实锤)");
+                        return v2;
+                    }
+                    continue;   // 已中和的 backdrop, 继续找活的
+                }
+                if (activityCls && [v2 isKindOfClass:activityCls]) continue;
+                [st2 addObjectsFromArray:[v2.subviews copy]];
+            }
+        }
     } @catch (NSException *e) {}
     return nil;
 }
@@ -1032,7 +1056,20 @@ static void hnpmBackdropDidMove(id self, SEL _cmd) {
     @try {
         if (![NSThread isMainThread]) return;
         UIView *v = (UIView *)self;
-        if (!v || v.alpha < 0.01) return;
+        if (!v) return;
+        // v0.1.17: 钩子现场诊断(限频 1s) — v0.1.16 日志裁决: 钩子已挂但整场零触发,
+        //          而 dump 显示 backdrop a=1.00 在场。先留下"钩子确实被调用过"的痕迹,
+        //          否则无法区分"没触发"与"触发但规则不匹配"。
+        static CFAbsoluteTime sHNPMHookDiagAt = 0;
+        CFAbsoluteTime nowDiag = CFAbsoluteTimeGetCurrent();
+        if (nowDiag - sHNPMHookDiagAt > 1.0) {
+            sHNPMHookDiagAt = nowDiag;
+            UIView *pp = v.superview;
+            HNPMAppendLog([NSString stringWithFormat:@"[透明·罩层·钩子现场] backdrop挂载 父=%@ a=%.2f coverMode=%d",
+                           pp ? NSStringFromClass([pp class]) : @"(nil)", v.alpha,
+                           HNPMCoverMode() ? 1 : 0]);
+        }
+        if (v.alpha < 0.01) return;
         if (!HNPMCoverMode()) return;
         CGFloat a = HNPMBgAlpha();
         if (a >= 0.99) return;
@@ -1093,9 +1130,10 @@ static int HNPMCoverApplyOnMaterial(UIView *mat, CGFloat a, BOOL hideMat) {
             cover.tag = HNPM_COVER_TAG;
             objc_setAssociatedObject(mat, &kHNPMCoverSelfKey, cover, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
             [parent insertSubview:cover aboveSubview:mat];
-            HNPMAppendLog([NSString stringWithFormat:@"[透明·罩层] 已创建 blur 罩层 a=%.2f(材质%@%@)",
+            HNPMAppendLog([NSString stringWithFormat:@"[透明·罩层] 已创建 blur 罩层 a=%.2f(材质%@%@ 父=%p)",
                            a, NSStringFromClass([mat class]),
-                           hideMat ? @"已隐藏" : @", 盖托盘层(无bg期, 内容不受影响)"]);
+                           hideMat ? @"已隐藏" : @", 盖托盘层(无bg期, 内容不受影响)",
+                           (__bridge void *)parent]);
             hits++;
         } else if (cover.superview != parent) {
             [parent insertSubview:cover aboveSubview:mat];   // 移入当前父视图(bg 出现后从托盘上层移入)
@@ -1142,10 +1180,23 @@ static int HNPMCoverApplyOnMaterial(UIView *mat, CGFloat a, BOOL hideMat) {
                         NSMutableString *info = [NSMutableString stringWithFormat:@"mat=%@ 托盘=%d",
                                                  NSStringFromClass([mat class]), fp ? 1 : 0];
                         if (fp) {
+                            [info appendFormat:@" 托盘指针=%p", (__bridge void *)p];   // v0.1.17: 与深诊断 dump 的 托盘=%p 对账
                             NSArray *kids = [p.subviews copy];
                             [info appendFormat:@" 子%d:[", (int)kids.count];
                             for (UIView *c in kids) [info appendFormat:@"%@,", NSStringFromClass([c class])];
                             [info appendString:@"]"];
+                            // v0.1.17: 第二层 — 裁决 DFS 眼中的 CustomContent 内部与 dump 是否一致
+                            for (UIView *c in kids) {
+                                NSArray *gk = [c.subviews copy];
+                                if (gk.count == 0) continue;
+                                [info appendFormat:@" %@子%d:[", NSStringFromClass([c class]), (int)gk.count];
+                                int gi = 0;
+                                for (UIView *g in gk) {
+                                    if (gi++ >= 5) { [info appendString:@"…"]; break; }
+                                    [info appendFormat:@"%@(a=%.2f),", NSStringFromClass([g class]), g.alpha];
+                                }
+                                [info appendString:@"]"];
+                            }
                         }
                         HNPMAppendLog([NSString stringWithFormat:@"[透明·罩层·中和miss] %@", info]);
                     } @catch (NSException *e) {}
@@ -1727,12 +1778,29 @@ static void HNPMDeepDumpAt(NSString *tag) {
         }
         NSMutableArray *rows = [NSMutableArray array];
         NSMutableArray *stack = [NSMutableArray arrayWithObject:cell];
+        NSMutableArray *inPlat = [NSMutableArray arrayWithObject:@NO];   // v0.1.17: 与 stack 平行的"在托盘子树内"标记
+        void *platterPtr = NULL;                                         // v0.1.17: 托盘指针, 与 apply 日志对账
         int guard = 0;
         while (stack.count > 0 && guard++ < 200 && rows.count < 40) {
             UIView *v = stack.firstObject;
             [stack removeObjectAtIndex:0];
+            BOOL underPlatter = [(inPlat.firstObject ?: @NO) boolValue];
+            [inPlat removeObjectAtIndex:0];
             if (!v) continue;
+            if (v.tag == HNPM_COVER_TAG) continue;   // v0.1.17: 不下钻自家罩层(内部 backdrop 是我们的 blur)
             NSString *cls = NSStringFromClass([v class]);
+            // v0.1.17: dump 兜底中和 — v0.1.16 裁决: apply 路径 55 次 miss + 挂载钩子零触发,
+            //          同秒 dump 却能看到托盘内 backdrop a=1.00 → dump 是唯一看得见的路径,
+            //          反正在跑, 顺手中和(仅限托盘子树内的 backdrop, 内容 vibrancy 不受影响)。
+            if (underPlatter && HNPMCoverMode()) {
+                CGFloat aa = HNPMBgAlpha();
+                Class bdCls = NSClassFromString(@"_UIVisualEffectBackdropView");
+                if (aa < 0.99 && bdCls && [v isKindOfClass:bdCls] && v.alpha > 0.01) {
+                    HNPMSetAlphaNoAnim(v, 0.0);
+                    HNPMAppendLog([NSString stringWithFormat:@"[透明·罩层] 已中和 backdrop(深诊断兜底, 父=%@)",
+                                   v.superview ? NSStringFromClass([v.superview class]) : @"?"]);
+                }
+            }
             NSString *extra = @"";
             if ([v isKindOfClass:[UILabel class]]) {
                 NSString *t = [(UILabel *)v text] ?: @"";
@@ -1744,10 +1812,14 @@ static void HNPMDeepDumpAt(NSString *tag) {
             CGFloat pop = pl ? pl.opacity : -1.0;
             [rows addObject:[NSString stringWithFormat:@"%@ a=%.2f p=%.2f h=%d%@",
                              cls, v.alpha, pop, v.hidden ? 1 : 0, extra]];
-            [stack addObjectsFromArray:v.subviews];
+            BOOL nextIn = underPlatter || [cls isEqualToString:@"PLPlatterView"];
+            if ([cls isEqualToString:@"PLPlatterView"] && !platterPtr) platterPtr = (__bridge void *)v;
+            NSArray *kidsDump = [v.subviews copy];   // v0.1.17: copy 一次, 防两次取值之间树变异导致平行数组错位
+            [stack addObjectsFromArray:kidsDump];
+            for (NSUInteger i = 0; i < kidsDump.count; i++) [inPlat addObject:@(nextIn)];
         }
-        HNPMAppendLog([NSString stringWithFormat:@"[透明·深诊断@%@] %lu视图: %@",
-                       tag, (unsigned long)rows.count, [rows componentsJoinedByString:@" || "]]);
+        HNPMAppendLog([NSString stringWithFormat:@"[透明·深诊断@%@] 托盘=%p %lu视图: %@",
+                       tag, platterPtr, (unsigned long)rows.count, [rows componentsJoinedByString:@" || "]]);
     } @catch (NSException *e) {}
 }
 
@@ -3040,7 +3112,7 @@ static void HNPMAttachPanIfNeeded(UIView *view) {
 #pragma mark - 入口
 
 __attribute__((constructor)) static void HNPMRawCtor(void) {
-    HNPMAppendLog(@"v0.1.16: dylib 构造函数已执行(dyld 加载成功)");
+    HNPMAppendLog(@"v0.1.17: dylib 构造函数已执行(dyld 加载成功)");
 }
 
 // v0.0.50/51: 岛元素抑制策略钩子 — 隐藏期让系统把 NowPlaying 元素当作"应被抑制",
@@ -3103,7 +3175,7 @@ __attribute__((constructor)) static void HNPMRawCtor(void) {
 
 %ctor {
     @autoreleasepool {
-        HNPMAppendLog(@"v0.1.16: logos %ctor 进入");
+        HNPMAppendLog(@"v0.1.17: logos %ctor 进入");
     HNPMAppendLog(HNPMCoverMode()
         ? @"[透明] 罩层模式 ON(HideNowPlaying.cover 存在 → 系统材质不动, 用自有 blur 罩层)"
         : @"[透明] 罩层模式 OFF(经典 alpha 模式; 建 /var/mobile/Documents/HideNowPlaying.cover 可切换)");
@@ -3201,7 +3273,7 @@ __attribute__((constructor)) static void HNPMRawCtor(void) {
         // v0.0.93: 空闲巡逻(0.5s 只读一次, 无在场卡自动停) — 堵"空闲期静默重置无事件触发"盲区
         HNPMIdleAlphaCheck();
         HNPMHookBackdrop();
-        HNPMAppendLog(@"v0.1.16: 空闲巡逻已启动");
-        HNPMAppendLog(@"v0.1.16: %ctor 正常完成");
+        HNPMAppendLog(@"v0.1.17: 空闲巡逻已启动");
+        HNPMAppendLog(@"v0.1.17: %ctor 正常完成");
     }
 }
