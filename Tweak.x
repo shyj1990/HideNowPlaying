@@ -1337,7 +1337,7 @@ static void HNPMCoversWakeSweep(void) {
         CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
         if (now - sHNPMCoversSweepDiag > 0.5) {
             sHNPMCoversSweepDiag = now;
-            HNPMAppendLog([NSString stringWithFormat:@"[透明·亮屏扫 v0.1.23] 窗口%lu 托盘%d 单元%d[%@] 过门%d 改动%d",
+            HNPMAppendLog([NSString stringWithFormat:@"[透明·亮屏扫 v0.1.24] 窗口%lu 托盘%d 单元%d[%@] 过门%d 改动%d",
                            (unsigned long)windows.count, nPlatter, nCell,
                            [cellSizes componentsJoinedByString:@","], nGated, hits]);
         }
@@ -1961,13 +1961,28 @@ static void HNPMDeepDumpAt(NSString *tag) {
                     HNPMAppendLog([NSString stringWithFormat:@"[透明·深诊断@%@] 层树: %@", tag, lt]);
                 } @catch (NSException *e) {}
             }
-            // v0.1.23: 自家罩层首帧白 — 最后盲区: 深诊断从不下钻自家罩层(tag 跳过), 旁支扫描同样
-            //          跳过 → 自家 backdrop 亮屏期 recipe 重解析, 未就绪时平铺白, 恰好盖在卡区,
-            //          全程不可见。且白底症状正是罩层路线引入的, 时间线吻合。
-            //          @0.05/@0.1 隐自家罩层 EFX, 0.75s 后恢复(用户所选 blur 观感不受长期影响);
-            //          隐前记录子层状态留证据。
-            if ([tag isEqualToString:@"0.05"] || [tag isEqualToString:@"0.1"]) {
+            // v0.1.24: 整卡避让 — v0.1.23 裁决: 自家罩层已隐(含 a=1.00 backdrop)整个白窗期,
+            //          白底依旧 ~1s → 自家罩层洗清, 本地视图树 100% 排除。结合 cell 子树仅
+            //          15 视图却挂 _UIScenePresentationView→_UISceneLayerHostContainerView
+            //          场景宿主链 → 卡片视觉内容是跨进程远程渲染, 亮屏时远程进程重绘首帧
+            //          即白底, 本地无法阻止其渲染, 只能整卡避让: @0.05/@0.1/@0.3 隐 cell,
+            //          0.65s 后恢复。白窗期卡区直接显示壁纸, 卡片随后出现。
+            //          同时是终极诊断: 若整卡已隐仍白, 白必在卡外(转查窗口级来源)。
+            if ([tag isEqualToString:@"0.05"] || [tag isEqualToString:@"0.1"] ||
+                [tag isEqualToString:@"0.3"]) {
                 @try {
+                    if (HNPMCoverMode() && !cell.hidden && cell.window) {
+                        cell.hidden = YES;
+                        HNPMAppendLog(@"[透明·罩层] 已隐媒体卡(白窗避让, 防远程场景白帧)");
+                        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.65 * NSEC_PER_SEC)),
+                                       dispatch_get_main_queue(), ^{
+                            @try {
+                                cell.hidden = NO;
+                                HNPMAppendLog(@"[透明·罩层] 已恢复媒体卡(白窗结束)");
+                            } @catch (NSException *e) {}
+                        });
+                    }
+                    // v0.1.23: 自家罩层避让(整卡已隐时为冗余保险, 保留)
                     UIView *cover = nil;
                     NSMutableArray *cs = [NSMutableArray arrayWithObject:cell];
                     int cg = 0;
@@ -3346,7 +3361,7 @@ static void HNPMAttachPanIfNeeded(UIView *view) {
 #pragma mark - 入口
 
 __attribute__((constructor)) static void HNPMRawCtor(void) {
-    HNPMAppendLog(@"v0.1.23: dylib 构造函数已执行(dyld 加载成功)");
+    HNPMAppendLog(@"v0.1.24: dylib 构造函数已执行(dyld 加载成功)");
 }
 
 // v0.0.50/51: 岛元素抑制策略钩子 — 隐藏期让系统把 NowPlaying 元素当作"应被抑制",
@@ -3409,7 +3424,7 @@ __attribute__((constructor)) static void HNPMRawCtor(void) {
 
 %ctor {
     @autoreleasepool {
-        HNPMAppendLog(@"v0.1.23: logos %ctor 进入");
+        HNPMAppendLog(@"v0.1.24: logos %ctor 进入");
     HNPMAppendLog(HNPMCoverMode()
         ? @"[透明] 罩层模式 ON(HideNowPlaying.cover 存在 → 系统材质不动, 用自有 blur 罩层)"
         : @"[透明] 罩层模式 OFF(经典 alpha 模式; 建 /var/mobile/Documents/HideNowPlaying.cover 可切换)");
@@ -3507,7 +3522,7 @@ __attribute__((constructor)) static void HNPMRawCtor(void) {
         // v0.0.93: 空闲巡逻(0.5s 只读一次, 无在场卡自动停) — 堵"空闲期静默重置无事件触发"盲区
         HNPMIdleAlphaCheck();
         HNPMHookBackdrop();
-        HNPMAppendLog(@"v0.1.23: 空闲巡逻已启动");
-        HNPMAppendLog(@"v0.1.23: %ctor 正常完成");
+        HNPMAppendLog(@"v0.1.24: 空闲巡逻已启动");
+        HNPMAppendLog(@"v0.1.24: %ctor 正常完成");
     }
 }
