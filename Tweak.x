@@ -977,7 +977,7 @@ static int HNPMCoverApplyOnMaterial(UIView *mat, CGFloat a, BOOL hideMat) {
             [parent insertSubview:cover aboveSubview:mat];
             HNPMAppendLog([NSString stringWithFormat:@"[透明·罩层] 已创建 blur 罩层 a=%.2f(材质%@%@)",
                            a, NSStringFromClass([mat class]),
-                           hideMat ? @"已隐藏" : @", 盖托盘层(无bg期, 内容不受影响)"));
+                           hideMat ? @"已隐藏" : @", 盖托盘层(无bg期, 内容不受影响)"]);
             hits++;
         } else if (cover.superview != parent) {
             [parent insertSubview:cover aboveSubview:mat];   // 移入当前父视图(bg 出现后从托盘上层移入)
