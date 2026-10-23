@@ -771,8 +771,12 @@ static CGFloat HNPMBgAlpha(void) {
 }
 
 // v0.0.99: 前置声明(诊断 dump/登记路径直接调 materialRecipe/isBackgroundBlurred,
-//          原声明在文件尾部 %hook 前, 编译顺序不够)
-@interface PLPlatterView : UIView @end
+//          原声明在文件尾部 %hook 前, 编译顺序不够) — 空接口不够, 须声明用到的属性
+//          (真机类由 PLPlatterKit 提供, 此处仅让编译器放行, 运行时按真实现解析)
+@interface PLPlatterView : UIView
+@property (nonatomic) long long materialRecipe;
+@property (getter=isBackgroundBlurred, nonatomic) BOOL backgroundBlurred;
+@end
 
 // v0.0.99: 官方材质配方实验 — /var/mobile/Documents/HideNowPlaying.recipe 写入整数(如 2/3/0)
 //          → 登记路径对托盘 setMaterialRecipe:, 让系统自己渲该配方(候选免 alpha 写入路线)。
