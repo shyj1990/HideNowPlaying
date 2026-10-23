@@ -1403,6 +1403,23 @@ static void HNPMNeutralizeListPlaceholder(void) {
                                         @"[透明·罩层] 已清占位材质 %@ layer 背景(bg=%@)", sc, ls]);
                                 }
                             }
+                        } else if ([sc containsString:@"CaptureOnly"] || [sc hasPrefix:@"BSUIVibrancy"]) {
+                            // v0.1.31: 通知中心材质跨进程捕获快照(v0.1.30 白底盘次实锤:
+                            //          cell 不在场时 NCMaterialDisplayingCaptureOnlyViewControllerView
+                            //          + BSUIVibrancyBackdropView h=251(卡区高度) 显示过期/白底快照)。
+                            //          白窗内隐藏, 0.65s 后恢复 — 与卡避让同节奏。
+                            if (!s.hidden && s.alpha > 0.01) {
+                                s.hidden = YES;
+                                HNPMAppendLog([NSString stringWithFormat:
+                                    @"[透明·罩层] 已隐捕获快照 %@ h=%.0f", sc, h]);
+                                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.65 * NSEC_PER_SEC)),
+                                               dispatch_get_main_queue(), ^{
+                                    @try {
+                                        s.hidden = NO;
+                                        HNPMAppendLog(@"[透明·罩层] 已恢复捕获快照");
+                                    } @catch (NSException *e) {}
+                                });
+                            }
                         } else if (diag && s.subviews.count == 0 && h >= 80.0) {
                             // 陌生叶子视图 — 仅记录, 不动(防误杀)
                             HNPMAppendLog([NSString stringWithFormat:
@@ -1511,7 +1528,7 @@ static void HNPMCoversWakeSweep(void) {
         CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
         if (now - sHNPMCoversSweepDiag > 0.5) {
             sHNPMCoversSweepDiag = now;
-            HNPMAppendLog([NSString stringWithFormat:@"[透明·亮屏扫 v0.1.30] 窗口%lu 托盘%d 单元%d[%@] 过门%d 改动%d",
+            HNPMAppendLog([NSString stringWithFormat:@"[透明·亮屏扫 v0.1.31] 窗口%lu 托盘%d 单元%d[%@] 过门%d 改动%d",
                            (unsigned long)windows.count, nPlatter, nCell,
                            [cellSizes componentsJoinedByString:@","], nGated, hits]);
         }
@@ -3536,7 +3553,7 @@ static void HNPMAttachPanIfNeeded(UIView *view) {
 #pragma mark - 入口
 
 __attribute__((constructor)) static void HNPMRawCtor(void) {
-    HNPMAppendLog(@"v0.1.30: dylib 构造函数已执行(dyld 加载成功)");
+    HNPMAppendLog(@"v0.1.31: dylib 构造函数已执行(dyld 加载成功)");
 }
 
 // v0.0.50/51: 岛元素抑制策略钩子 — 隐藏期让系统把 NowPlaying 元素当作"应被抑制",
@@ -3599,7 +3616,7 @@ __attribute__((constructor)) static void HNPMRawCtor(void) {
 
 %ctor {
     @autoreleasepool {
-        HNPMAppendLog(@"v0.1.30: logos %ctor 进入");
+        HNPMAppendLog(@"v0.1.31: logos %ctor 进入");
     HNPMAppendLog(HNPMCoverMode()
         ? @"[透明] 罩层模式 ON(HideNowPlaying.cover 存在 → 系统材质不动, 用自有 blur 罩层)"
         : @"[透明] 罩层模式 OFF(经典 alpha 模式; 建 /var/mobile/Documents/HideNowPlaying.cover 可切换)");
@@ -3697,7 +3714,7 @@ __attribute__((constructor)) static void HNPMRawCtor(void) {
         // v0.0.93: 空闲巡逻(0.5s 只读一次, 无在场卡自动停) — 堵"空闲期静默重置无事件触发"盲区
         HNPMIdleAlphaCheck();
         HNPMHookBackdrop();
-        HNPMAppendLog(@"v0.1.30: 空闲巡逻已启动");
-        HNPMAppendLog(@"v0.1.30: %ctor 正常完成");
+        HNPMAppendLog(@"v0.1.31: 空闲巡逻已启动");
+        HNPMAppendLog(@"v0.1.31: %ctor 正常完成");
     }
 }
