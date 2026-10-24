@@ -50,6 +50,26 @@
 			<key>PostNotification</key>
 			<string>com.aha.hidenowplaying/prefschanged</string>
 		</dict>
+		<dict>
+			<key>cell</key>
+			<string>PSGroupCell</string>
+			<key>footerText</key>
+			<string>罩层透明模式：开启后不改写系统材质，改用自建模糊罩层实现透明（更稳定，推荐保持开启）；关闭则回退经典直接改 alpha 方式。原 HideNowPlaying.cover 文件开关已退役，装新版后可删除该文件。</string>
+		</dict>
+		<dict>
+			<key>cell</key>
+			<string>PSSwitchCell</string>
+			<key>default</key>
+			<true/>
+			<key>defaults</key>
+			<string>com.aha.hidenowplaying</string>
+			<key>key</key>
+			<string>coverMode</string>
+			<key>label</key>
+			<string>罩层透明模式</string>
+			<key>PostNotification</key>
+			<string>com.aha.hidenowplaying/prefschanged</string>
+		</dict>
 	</array>
 </dict>
 </plist>
