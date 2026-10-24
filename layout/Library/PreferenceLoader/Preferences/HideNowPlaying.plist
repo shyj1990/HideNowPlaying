@@ -8,6 +8,8 @@
 		<string>HideNowPlayingPrefs</string>
 		<key>cell</key>
 		<string>PSLinkCell</string>
+		<key>icon</key>
+		<string>icon@3x.png</string>
 		<key>isController</key>
 		<true/>
 		<key>label</key>

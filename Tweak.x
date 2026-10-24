@@ -273,89 +273,9 @@ static void HNPMNotifyHit(NSString *path) {
     });
 }
 
-// 嗅探器: name=nil 收所有分布式通知 — 回答两个问题: ①NS分布式在iOS17到底送不送货
-// ②媒体广播有哪些名字(定向监听静默可能是名字不对)。[嗅探]行上限30/会话防刷屏。
-static NSMutableSet *hnpmSniffSeen = nil;
-static int hnpmSniffLines = 0;
-
-static void HNPMNotifySniff(NSNotification *note) {
-    dispatch_async(dispatch_get_main_queue(), ^{
-        @try {
-            if (hnpmSniffLines >= 30 || !note.name) return;
-            NSString *name = note.name;
-            BOOL media = ([name rangeOfString:@"ediaRemote"].location != NSNotFound
-                          || [name rangeOfString:@"owPlaying"].location != NSNotFound);
-            if (!hnpmSniffSeen) hnpmSniffSeen = [NSMutableSet set];
-            if (![hnpmSniffSeen containsObject:name]) {
-                [hnpmSniffSeen addObject:name];
-                hnpmSniffLines++;
-                HNPMAppendLog([NSString stringWithFormat:@"[嗅探] %@", name]);
-            } else if (media) {
-                hnpmSniffLines++;
-                HNPMAppendLog([NSString stringWithFormat:@"[嗅探] %@(再次)", name]);
-            }
-            if (media) HNPMNotifyHit(@"B(嗅探)");
-        } @catch (NSException *e) {}
-    });
-}
-
-// B路: NSDistributedNotificationCenter(Foundation 全链接, 内部自己解析 CF 符号, 绕开 dlsym 死路)
-// v0.0.60 实锤: 运行时存在、挂载成功, 但定向监听全程静默 → v0.0.61 加全量嗅探分辨"不送货"还是"名字不对"
-static void HNPMPassiveListenB(void) {
-    @try {
-        Class dncClass = objc_getClass("NSDistributedNotificationCenter");
-        if (!dncClass) { HNPMAppendLog(@"监听B(NS分布式): 运行时无此类, 未挂起"); return; }
-        id dnc = [(id)dncClass performSelector:@selector(defaultCenter)];
-        if (!dnc) { HNPMAppendLog(@"监听B(NS分布式): defaultCenter 为空, 未挂起"); return; }
-        typedef id (*AddObsMsgSend)(id, SEL, id, id, id, id);
-        SEL addSel = NSSelectorFromString(@"addObserverForName:object:queue:usingBlock:");
-        ((AddObsMsgSend)objc_msgSend)(dnc, addSel,
-            @"com.apple.mediaremote.nowplaying.info-did-change", (id)nil, (id)nil,
-            ^(NSNotification *note) { HNPMNotifyHit(@"B(定向)"); });
-        ((AddObsMsgSend)objc_msgSend)(dnc, addSel, (id)nil, (id)nil, (id)nil,
-            ^(NSNotification *note) { HNPMNotifySniff(note); });
-        HNPMAppendLog(@"监听B已挂×2: 定向(info-did-change) + 全量嗅探(纯收听)");
-    } @catch (NSException *e) {
-        HNPMAppendLog(@"监听B(NS分布式): 挂载异常, 未挂起");
-    }
-}
-
-// A路: CF Darwin 中心(纯收听) — v0.0.60"死路"真相=函数名拼错: iOS 真名无s, 之前查的是 macOS 名(带s)。
-// dlsym 正名优先+旧名兜底(拿不到只降级不崩, 不走链接期符号避开 dyld 硬崩); 挂两个候选广播名。
-static void HNPMDarwinCallback(CFNotificationCenterRef center, void *observer,
-                               CFStringRef name, const void *object, CFDictionaryRef userInfo) {
-    static BOOL loggedName = NO;
-    if (!loggedName) {
-        loggedName = YES;
-        NSString *n = name ? (__bridge NSString *)name : @"(空)";
-        HNPMAppendLog([NSString stringWithFormat:@"[通知] A路回调首次触发 name=%@", n]);
-    }
-    HNPMNotifyHit(@"A(定向)");
-}
-
-static void HNPMPassiveListenA(void) {
-    @try {
-        typedef void *(*GetCenterFunc)(void);
-        GetCenterFunc getCenter = (GetCenterFunc)dlsym(RTLD_DEFAULT, "CFNotificationCenterGetDarwinNotifyCenter");
-        const char *via = "NotifyCenter(iOS真名,无s)";
-        if (!getCenter) {
-            getCenter = (GetCenterFunc)dlsym(RTLD_DEFAULT, "CFNotificationCenterGetDarwinNotificationCenter");
-            via = "NotificationCenter(macOS旧名,带s)";
-        }
-        if (!getCenter) { HNPMAppendLog(@"监听A: 两名均dlsym不到, 未挂起"); return; }
-        CFNotificationCenterRef dc = (CFNotificationCenterRef)getCenter();
-        if (!dc) { HNPMAppendLog([NSString stringWithFormat:@"监听A: 中心空(%s), 未挂起", via]); return; }
-        CFNotificationCenterAddObserver(dc, NULL, HNPMDarwinCallback,
-            CFSTR("com.apple.mediaremote.nowplaying.info-did-change"),
-            NULL, CFNotificationSuspensionBehaviorCoalesce);
-        CFNotificationCenterAddObserver(dc, NULL, HNPMDarwinCallback,
-            CFSTR("com.apple.mediaremote.nowplayinginfochanged"),
-            NULL, CFNotificationSuspensionBehaviorCoalesce);
-        HNPMAppendLog([NSString stringWithFormat:@"监听A已挂(%s)×2候选名", via]);
-    } @catch (NSException *e) {
-        HNPMAppendLog(@"监听A: 挂载异常, 未挂起");
-    }
-}
+// v0.1.48 清理: 移除 A/B 被动监听对照路(Darwin中心/NS分布式 + 全量嗅探) —
+// v0.0.62 两次实锤两路零输出(非媒体通道), v0.0.63 起主监听 = MR注册(隐藏期短暂挂链)。
+// 此处原挂载 HNPMPassiveListenA/B + HNPMNotifySniff(+hnpmSniffSeen/Lines), 已删。
 
 #pragma mark - 岛侧共存 (v0.0.66)
 
@@ -812,49 +732,9 @@ static NSInteger HNPMRecipeOverride(void) {
     return hnpmRecipeCached;
 }
 
-// v0.0.75: 托盘内部结构一次性诊断 — 确认 backgroundView(白底)/customContentView(内容)分层,
-//          供排障; 每次解锁进程只 dump 一次。
-static BOOL sHNPMPlatterDiagDumped = NO;
-static void HNPMPlatterDiagDump(UIView *platter, UIView *bg, NSString *via) {
-    if (sHNPMPlatterDiagDumped) return;
-    sHNPMPlatterDiagDumped = YES;
-    @try {
-        NSMutableArray *rows = [NSMutableArray array];
-        NSString *recipeStr = @"";
-        @try {
-            if ([platter respondsToSelector:@selector(materialRecipe)])
-                recipeStr = [NSString stringWithFormat:@" recipe=%lld", [(PLPlatterView *)platter materialRecipe]];
-        } @catch (NSException *e) {}
-        [rows addObject:[NSString stringWithFormat:@"托盘%@ f=%@ via=%@(%@)%@", NSStringFromClass([platter class]), NSStringFromCGRect(platter.frame), via, NSStringFromCGRect(bg.frame), recipeStr]];
-        for (UIView *s in platter.subviews) {
-            [rows addObject:[NSString stringWithFormat:@"%@ f=%@ a=%.2f h=%d", NSStringFromClass([s class]), NSStringFromCGRect(s.frame), s.alpha, s.isHidden ? 1 : 0]];
-        }
-        HNPMAppendLog([NSString stringWithFormat:@"[透明·诊断] %@", [rows componentsJoinedByString:@" || "]]);
-        // v0.0.98/99: 官方旋钮探测 — materialRecipe(配方号)/isBackgroundBlurred/
-        //          recipeNamesByTraitCollection(配方名映射, 供猜可用配方)
-        @try {
-            if ([platter respondsToSelector:@selector(materialRecipe)]) {
-                HNPMAppendLog([NSString stringWithFormat:@"[透明·诊断] materialRecipe=%lld",
-                               [(PLPlatterView *)platter materialRecipe]]);
-            } else {
-                HNPMAppendLog(@"[透明·诊断] materialRecipe 选择器不存在");
-            }
-            // v0.0.99: 修正 v0.0.98 探测笔误 — backgroundBlurred 的 getter 是 isBackgroundBlurred
-            if ([platter respondsToSelector:@selector(isBackgroundBlurred)]) {
-                HNPMAppendLog([NSString stringWithFormat:@"[透明·诊断] backgroundBlurred=%d",
-                               [(PLPlatterView *)platter isBackgroundBlurred] ? 1 : 0]);
-            } else {
-                HNPMAppendLog(@"[透明·诊断] isBackgroundBlurred 选择器不存在");
-            }
-            id names = nil;
-            @try { names = [platter valueForKey:@"recipeNamesByTraitCollection"]; } @catch (NSException *e) {}
-            if (names) HNPMAppendLog([NSString stringWithFormat:@"[透明·诊断] 配方名映射=%@",
-                                      [names description]]);
-        } @catch (NSException *e) {
-            HNPMAppendLog(@"[透明·诊断] 旋钮探测异常");
-        }
-    } @catch (NSException *e) {}
-}
+// v0.1.48 清理: 移除托盘一次性诊断 dump(v0.0.75 HNPMPlatterDiagDump) — 分层结论
+// (backgroundView=白底材质 / customContentView=内容)与配方旋钮探测结果已固化在上
+// 方 v0.0.74/88 注释, 结论不会再变, 保留只会在每次解锁刷一次日志。
 
 // v0.0.88: 取托盘的背景子层(KVC backgroundView → backgroundMaterialView), 登记路径与亮屏重申共用
 static UIView *HNPMPlatterBgView(UIView *platter, NSString **viaOut) {
@@ -1142,8 +1022,8 @@ static int HNPMPlatterApplyCover(UIView *platter, CGFloat a) {
 }
 
 // v0.1.7 前置声明(v0.1.8 定义): 连扫帧内节流调用, 兜住登记缝隙期外的重建
-// v0.1.34: 卡区记忆(最近一次登记媒体卡 cell 的窗口坐标) — 持续生效版(v0.1.34)的避让依据
-static CGRect sHNPMCardRegion33 = {{0, 0}, {0, 0}};
+// v0.1.48 清理: 移除卡区记忆 sHNPMCardRegion33(v0.1.34 避让依据) — 其全部读者
+// (持续生效/钉扎/侦察/白巡)已于 v0.1.47 拆除, 现在只剩写入, 无保留价值。
 
 
 static void HNPMCoversWakeSweep(void);
@@ -1203,10 +1083,6 @@ static void HNPMCoversWakeSweep(void) {
                     if (ok) {
                         nGated++;
                         if (![hnpmCardCells containsObject:v]) [hnpmCardCells addObject:v];
-                        {   // v0.1.34: 记录卡区(窗口坐标) — 白底盘次 cell 未创建时的避让依据
-                            CGRect cf = [v convertRect:v.bounds toView:nil];
-                            if (!CGRectIsEmpty(cf)) sHNPMCardRegion33 = cf;
-                        }
                         // 登记路径同款目标收集: 托盘/bg/占位 EFX 一网打尽
                         NSMutableArray *targets = [NSMutableArray array];
                         HNPMCoverCollectTargets(v, targets);
@@ -1539,8 +1415,8 @@ static CGFloat HNPMCardPlatterBgAlphaRead(void) {
 //          (实拍 model a=0.00 / presentation p=0.54/0.91 / h=0), 渐显期间整个远端
 //          内容(歌词行)被压暗 = 用户所见"歌词变暗"。v0.0.96 零命中但 dump 拍到渐显中,
 //          说明旧条件(model alpha)有盲区 → 改为 presentation 层触发(动画中值可见):
-//          在窗 + 未隐藏 + (model<1 或 presentation<1) → 钳 model=1.0 + removeAllAnimations;
-//          并在连扫窗口内每秒输出一次宿主巡检心跳(无论是否命中), 供下次排障定位条件盲区。
+//          在窗 + 未隐藏 + (model<1 或 presentation<1) → 钳 model=1.0 + removeAllAnimations。
+//          v0.1.48: 移除"未渐显"心跳日志(连扫窗口内每秒一条纯噪音), 只留截断日志。
 static CFAbsoluteTime sHNPMFadeClampLastLog = 0;
 static BOOL HNPMClampSceneHostFade(UIView *cell) {
     if (![NSThread isMainThread]) return NO;
@@ -1567,15 +1443,10 @@ static BOOL HNPMClampSceneHostFade(UIView *cell) {
                     clamped = YES;
                 }
                 CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
-                if (now - sHNPMFadeClampLastLog > 1.0) {   // 心跳/截断日志限频 1s
+                if (need && now - sHNPMFadeClampLastLog > 1.0) {   // 截断日志限频 1s
                     sHNPMFadeClampLastLog = now;
-                    if (need) {
-                        HNPMAppendLog([NSString stringWithFormat:@"[透明] 场景宿主渐显截断(a=%.2f p=%.2f→1.0)",
-                                       oldA, pop]);
-                    } else {
-                        HNPMAppendLog([NSString stringWithFormat:@"[透明·宿主巡检] a=%.2f p=%.2f h=%d(未渐显)",
-                                       oldA, pop, v.hidden ? 1 : 0]);
-                    }
+                    HNPMAppendLog([NSString stringWithFormat:@"[透明] 场景宿主渐显截断(a=%.2f p=%.2f→1.0)",
+                                   oldA, pop]);
                 }
                 return clamped;   // 找到宿主包装即停(无论是否钳制)
             }
@@ -1803,7 +1674,6 @@ static void HNPMApplyCardBackgroundAlpha(UIView *cell, int kind) {
                             if (fabs(bg.alpha - a) > 0.01) bg.alpha = a;
                             [touched addObject:bg];
                             pHits++; pVia = via;
-                            HNPMPlatterDiagDump(v, bg, via);
                         } else {
                             if (fabs(v.alpha - a) > 0.01) v.alpha = a;
                             [touched addObject:v];
@@ -2975,7 +2845,7 @@ static void HNPMAttachPanIfNeeded(UIView *view) {
 #pragma mark - 入口
 
 __attribute__((constructor)) static void HNPMRawCtor(void) {
-    HNPMAppendLog(@"v0.1.47: dylib 构造函数已执行(dyld 加载成功)");
+    HNPMAppendLog(@"v0.1.48: dylib 构造函数已执行(dyld 加载成功)");
 }
 
 // v0.0.50/51: 岛元素抑制策略钩子 — 隐藏期让系统把 NowPlaying 元素当作"应被抑制",
@@ -3039,7 +2909,7 @@ __attribute__((constructor)) static void HNPMRawCtor(void) {
 
 %ctor {
     @autoreleasepool {
-        HNPMAppendLog(@"v0.1.47: logos %ctor 进入");
+        HNPMAppendLog(@"v0.1.48: logos %ctor 进入");
     HNPMAppendLog(HNPMCoverMode()
         ? @"[透明] 罩层模式 ON(HideNowPlaying.cover 存在 → 系统材质不动, 用自有 blur 罩层)"
         : @"[透明] 罩层模式 OFF(经典 alpha 模式; 建 /var/mobile/Documents/HideNowPlaying.cover 可切换)");
@@ -3095,10 +2965,6 @@ __attribute__((constructor)) static void HNPMRawCtor(void) {
         } else {
             HNPMAppendLog(@"MediaRemote 加载失败");
         }
-        // v0.0.62 A/B路(Darwin/NS分布式)保留作对照 — 0.0.62 实锤两路零输出(非媒体通道);
-        // v0.0.63 主监听 = MR注册(隐藏期短暂挂链, 见 [监听MR])
-        HNPMPassiveListenA();
-        HNPMPassiveListenB();
 
         if (objc_getClass("CSActivityItemContentView"))      { %init(HNPMActivityCard); HNPMAppendLog(@"hook 已注册: 媒体卡片(高度>=150 过滤)"); }
         // v0.0.88: 托盘透明重申 hook(PLPlatterView 不一定在所有注入进程都存在, 存在才注册)
@@ -3137,7 +3003,7 @@ __attribute__((constructor)) static void HNPMRawCtor(void) {
         // v0.0.93: 空闲巡逻(0.5s 只读一次, 无在场卡自动停) — 堵"空闲期静默重置无事件触发"盲区
         HNPMIdleAlphaCheck();
         HNPMHookBackdrop();
-        HNPMAppendLog(@"v0.1.47: 空闲巡逻已启动");
-        HNPMAppendLog(@"v0.1.47: %ctor 正常完成");
+        HNPMAppendLog(@"v0.1.48: 空闲巡逻已启动");
+        HNPMAppendLog(@"v0.1.48: %ctor 正常完成");
     }
 }
