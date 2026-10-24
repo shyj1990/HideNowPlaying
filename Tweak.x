@@ -1873,6 +1873,64 @@ static void HNPMRegionWhiteProbe(NSString *tag) {
     } @catch (NSException *e) {}
 }
 
+// v0.1.42: 整卡避让·预隐藏 — 白底根因定论为渲染服务首帧滞后(视图层无解, v0.1.41 裁决:
+//          树内无满亮度系统材质、罩层提前就位、白/透明期树逐字节相同)。
+//          对策: 在屏幕还黑的按压/灭屏瞬间先把与卡区记忆相交的 NCNotificationListCell
+//          alpha=0(首帧渲染时卡区为空 → 无白底可拍), +0.3s 后 0.25s 动画淡入恢复。
+//          与 v0.1.24 失败版的本质区别: 那次是亮屏后才藏(白底已上屏), 这次赶在首帧渲染前。
+//          互斥规律兜底: 按压时 cell 不在场 → 亮屏首帧也不在场 → 本就无白底。
+static NSHashTable *sHNPMPrehiddenCells = nil;
+
+static void HNPMPrehideRestore(void) {
+    if (![NSThread isMainThread]) {
+        dispatch_async(dispatch_get_main_queue(), ^{ HNPMPrehideRestore(); });
+        return;
+    }
+    @try {
+        if (!sHNPMPrehiddenCells || sHNPMPrehiddenCells.count == 0) return;
+        int n = 0;
+        for (UIView *v in [sHNPMPrehiddenCells copy]) {
+            if (![v isKindOfClass:[UIView class]] || !v.window) continue;
+            [UIView animateWithDuration:0.25 animations:^{ v.alpha = 1.0; }];
+            n++;
+        }
+        [sHNPMPrehiddenCells removeAllObjects];
+        HNPMAppendLog([NSString stringWithFormat:@"[透明·预隐藏] 淡入恢复 %d 处", n]);
+    } @catch (NSException *e) {}
+}
+
+static void HNPMPrehideCardCells(void) {
+    if (![NSThread isMainThread]) {
+        dispatch_async(dispatch_get_main_queue(), ^{ HNPMPrehideCardCells(); });
+        return;
+    }
+    @try {
+        if (!sHNPMPrehiddenCells) sHNPMPrehiddenCells = [NSHashTable weakObjectsHashTable];
+        int n = 0;
+        for (UIWindow *w in [UIApplication sharedApplication].windows) {
+            if (!w || w.hidden) continue;
+            int guard = 0;
+            NSMutableArray *stack = [NSMutableArray arrayWithObject:w];
+            while (stack.count > 0 && guard++ < 600) {
+                UIView *v = stack.firstObject;
+                [stack removeObjectAtIndex:0];
+                if (!v) continue;
+                if (v != w && (v.hidden || v.alpha < 0.01)) continue;
+                if ([NSStringFromClass([v class]) isEqualToString:@"NCNotificationListCell"]) {
+                    if (v.alpha > 0.01 && ![sHNPMPrehiddenCells containsObject:v]) {
+                        v.alpha = 0.0;
+                        [sHNPMPrehiddenCells addObject:v];
+                        n++;
+                    }
+                    continue;   // cell 整体藏, 不再下钻
+                }
+                [stack addObjectsFromArray:v.subviews];
+            }
+        }
+        if (n > 0) HNPMAppendLog([NSString stringWithFormat:@"[透明·预隐藏] 已藏卡 %d 处(首帧避让)", n]);
+    } @catch (NSException *e) {}
+}
+
 // v0.0.91: 亮屏盲区补漏 — v0.0.90 真机毫秒日志实锤: 系统每隔几秒随机重置一次 bg alpha
 //          (连扫均当帧修掉), 但若重置恰好发生在"亮屏瞬间、任何触发点出现之前"
 //          (旧卡未重建/无布局/无挂载), 连扫窗口不在跑 → 首帧不透明, 等 ~1s 重建才修 →
@@ -1884,6 +1942,10 @@ static void HNPMScreenStateCB(CFNotificationCenterRef center, void *observer,
     HNPMAppendLog([NSString stringWithFormat:@"[透明] 屏幕状态通知(%@) → 连扫窗口开启",
                    (__bridge NSString *)name]);
     HNPMCapturePersistOnce();   // v0.1.34: 通知即刻压一次(不等 0.5s 节拍)
+    // v0.1.42: 整卡避让·预隐藏 — 屏幕还黑的此刻藏卡 cell, +0.3s 淡入恢复(赶在首帧渲染前)
+    HNPMPrehideCardCells();
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.3 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{ @try { HNPMPrehideRestore(); } @catch (NSException *e) {} });
     HNPMStartAlphaBurst();
     HNPMScheduleDeepDumps();   // v0.0.95: 每次亮/灭屏排程时序化深诊断
     // v0.1.37: 卡区白巡 — 亮/灭屏后 0.05/0.2/0.5/1.0s 各一次(只读, 几何+颜色抓白)
@@ -3238,7 +3300,7 @@ static void HNPMAttachPanIfNeeded(UIView *view) {
 #pragma mark - 入口
 
 __attribute__((constructor)) static void HNPMRawCtor(void) {
-    HNPMAppendLog(@"v0.1.41: dylib 构造函数已执行(dyld 加载成功)");
+    HNPMAppendLog(@"v0.1.42: dylib 构造函数已执行(dyld 加载成功)");
 }
 
 // v0.0.50/51: 岛元素抑制策略钩子 — 隐藏期让系统把 NowPlaying 元素当作"应被抑制",
@@ -3322,7 +3384,7 @@ __attribute__((constructor)) static void HNPMRawCtor(void) {
 
 %ctor {
     @autoreleasepool {
-        HNPMAppendLog(@"v0.1.41: logos %ctor 进入");
+        HNPMAppendLog(@"v0.1.42: logos %ctor 进入");
     HNPMAppendLog(HNPMCoverMode()
         ? @"[透明] 罩层模式 ON(HideNowPlaying.cover 存在 → 系统材质不动, 用自有 blur 罩层)"
         : @"[透明] 罩层模式 OFF(经典 alpha 模式; 建 /var/mobile/Documents/HideNowPlaying.cover 可切换)");
@@ -3424,8 +3486,8 @@ __attribute__((constructor)) static void HNPMRawCtor(void) {
         HNPMIdleAlphaCheck();
         HNPMHookBackdrop();
         HNPMCapturePersistLoop();   // v0.1.34: 卡区捕获快照持续压住(0.5s 一拍, 自续)
-        HNPMAppendLog(@"v0.1.41: 卡区透明持续生效循环已启动");
-        HNPMAppendLog(@"v0.1.41: 空闲巡逻已启动");
-        HNPMAppendLog(@"v0.1.41: %ctor 正常完成");
+        HNPMAppendLog(@"v0.1.42: 卡区透明持续生效循环已启动");
+        HNPMAppendLog(@"v0.1.42: 空闲巡逻已启动");
+        HNPMAppendLog(@"v0.1.42: %ctor 正常完成");
     }
 }
