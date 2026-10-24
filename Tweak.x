@@ -1932,6 +1932,11 @@ static void HNPMDeepDumpAt(NSString *tag) {
             if ([cls isEqualToString:@"_UIVisualEffectBackdropView"]) extra = [extra stringByAppendingString:@" <BD>"];
             if ([cls isEqualToString:@"MTMaterialView"]) extra = [extra stringByAppendingString:@" <MT>"];
             if ([cls isEqualToString:@"PLPlatterView"]) extra = [extra stringByAppendingString:@" <PL>"];
+            // v0.1.41: 父链消歧 — BD 到底挂在谁下面(我们罩层子树内=无害 / 系统内容层=白底真身)
+            NSString *sup = v.superview ? NSStringFromClass([v.superview class]) : @"(nil)";
+            if (sup.length > 24) sup = [sup substringFromIndex:sup.length - 24];
+            if (v.tag == HNPM_COVER_TAG) extra = [extra stringByAppendingString:@" <COVER>"];
+            extra = [extra stringByAppendingFormat:@" sup=%@", sup];
             CALayer *pl = (CALayer *)v.layer.presentationLayer;
             CGFloat pop = pl ? pl.opacity : -1.0;
             [rows addObject:[NSString stringWithFormat:@"%@ a=%.2f p=%.2f h=%d%@",
@@ -3233,7 +3238,7 @@ static void HNPMAttachPanIfNeeded(UIView *view) {
 #pragma mark - 入口
 
 __attribute__((constructor)) static void HNPMRawCtor(void) {
-    HNPMAppendLog(@"v0.1.40: dylib 构造函数已执行(dyld 加载成功)");
+    HNPMAppendLog(@"v0.1.41: dylib 构造函数已执行(dyld 加载成功)");
 }
 
 // v0.0.50/51: 岛元素抑制策略钩子 — 隐藏期让系统把 NowPlaying 元素当作"应被抑制",
@@ -3317,7 +3322,7 @@ __attribute__((constructor)) static void HNPMRawCtor(void) {
 
 %ctor {
     @autoreleasepool {
-        HNPMAppendLog(@"v0.1.40: logos %ctor 进入");
+        HNPMAppendLog(@"v0.1.41: logos %ctor 进入");
     HNPMAppendLog(HNPMCoverMode()
         ? @"[透明] 罩层模式 ON(HideNowPlaying.cover 存在 → 系统材质不动, 用自有 blur 罩层)"
         : @"[透明] 罩层模式 OFF(经典 alpha 模式; 建 /var/mobile/Documents/HideNowPlaying.cover 可切换)");
@@ -3419,8 +3424,8 @@ __attribute__((constructor)) static void HNPMRawCtor(void) {
         HNPMIdleAlphaCheck();
         HNPMHookBackdrop();
         HNPMCapturePersistLoop();   // v0.1.34: 卡区捕获快照持续压住(0.5s 一拍, 自续)
-        HNPMAppendLog(@"v0.1.40: 卡区透明持续生效循环已启动");
-        HNPMAppendLog(@"v0.1.40: 空闲巡逻已启动");
-        HNPMAppendLog(@"v0.1.40: %ctor 正常完成");
+        HNPMAppendLog(@"v0.1.41: 卡区透明持续生效循环已启动");
+        HNPMAppendLog(@"v0.1.41: 空闲巡逻已启动");
+        HNPMAppendLog(@"v0.1.41: %ctor 正常完成");
     }
 }
