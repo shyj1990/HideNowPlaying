@@ -3312,17 +3312,17 @@ __attribute__((constructor)) static void HNPMRawCtor(void) {
 - (void)didMoveToWindow {
     %orig;
     @try {
-        HNPMCaptureHostPin(self, @"挂窗");
-        HNPMCaptureHostPinDelayed(self, @"挂窗");
+        HNPMCaptureHostPin((UIView *)self, @"挂窗");
+        HNPMCaptureHostPinDelayed((UIView *)self, @"挂窗");
     } @catch (NSException *e) {}
 }
 - (void)didMoveToSuperview {
     %orig;
-    @try { HNPMCaptureHostPin(self, @"挂父"); } @catch (NSException *e) {}
+    @try { HNPMCaptureHostPin((UIView *)self, @"挂父"); } @catch (NSException *e) {}
 }
 - (void)layoutSubviews {
     %orig;
-    @try { HNPMCaptureHostPin(self, @"布局"); } @catch (NSException *e) {}
+    @try { HNPMCaptureHostPin((UIView *)self, @"布局"); } @catch (NSException *e) {}
 }
 %end
 %end
