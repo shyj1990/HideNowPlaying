@@ -717,20 +717,9 @@ static CGFloat HNPMBgAlpha(void) {
 @property (getter=isBackgroundBlurred, nonatomic) BOOL backgroundBlurred;
 @end
 
-// v0.0.99: 官方材质配方实验 — /var/mobile/Documents/HideNowPlaying.recipe 写入整数(如 2/3/0)
-//          → 登记路径对托盘 setMaterialRecipe:, 让系统自己渲该配方(候选免 alpha 写入路线)。
-//          删文件或写 -1 = 不覆盖。5s 缓存。
-static NSInteger hnpmRecipeCached = -2;   // -2 = 未读
-static CFAbsoluteTime hnpmRecipeCachedAt = 0;
-static NSInteger HNPMRecipeOverride(void) {
-    if (hnpmRecipeCached != -2 && CFAbsoluteTimeGetCurrent() - hnpmRecipeCachedAt < 5.0)
-        return hnpmRecipeCached;
-    NSString *s = [NSString stringWithContentsOfFile:@"/var/mobile/Documents/HideNowPlaying.recipe"
-                                            encoding:NSUTF8StringEncoding error:nil];
-    hnpmRecipeCached = s ? (NSInteger)s.integerValue : -1;
-    hnpmRecipeCachedAt = CFAbsoluteTimeGetCurrent();
-    return hnpmRecipeCached;
-}
+// v0.1.49 清理: 官方材质配方实验退役 — /var/mobile/Documents/HideNowPlaying.recipe
+//          文件覆盖路线(HNPMRecipeOverride)删除: 罩层模式(现默认开)下系统材质完全
+//          不动, 配方覆盖本就永远跳过; 经典模式亦无继续实验价值。文件可删。
 
 // v0.1.48 清理: 移除托盘一次性诊断 dump(v0.0.75 HNPMPlatterDiagDump) — 分层结论
 // (backgroundView=白底材质 / customContentView=内容)与配方旋钮探测结果已固化在上
@@ -817,16 +806,20 @@ static int HNPMPlatterApplyBg(UIView *platter, CGFloat a) {
 // 把系统材质 hidden, 在其上方插入我们自己的半透明 blur 罩层。
 // 系统随便重配置它自己的材质(α=1.0/recipe=1 原生默认, 不触发任何重配置战争),
 // 罩层是我们自己的视图, 系统不会动它。诱因链(写入→重建→歌词暗)从根上消失。
-// 开关: /var/mobile/Documents/HideNowPlaying.cover 文件存在 = 罩层模式(默认关, 可 A/B)。
+// 开关(v0.1.49): 收进设置面板(CFPreferences coverMode, 默认开) — 原
+// /var/mobile/Documents/HideNowPlaying.cover 文件开关退役, 装本版后该文件可删。
+// 面板改动经 darwin 通知即时清缓存(见 HNPMPrefsChangedCB)。
 #define HNPM_COVER_TAG 0x484E5043   // 'HNPC'
 static BOOL sHNPMCoverCached = NO;
 static BOOL sHNPMCoverCachedValid = NO;
 static CFAbsoluteTime sHNPMCoverCachedAt = 0;
+static void HNPMCoverInvalidate(void) { sHNPMCoverCachedValid = NO; }
 static BOOL HNPMCoverMode(void) {
     if (sHNPMCoverCachedValid && CFAbsoluteTimeGetCurrent() - sHNPMCoverCachedAt < 5.0)
         return sHNPMCoverCached;
-    sHNPMCoverCached = [[NSFileManager defaultManager]
-        fileExistsAtPath:@"/var/mobile/Documents/HideNowPlaying.cover"];
+    Boolean ok = NO;
+    BOOL v = CFPreferencesGetAppBooleanValue(CFSTR("coverMode"), CFSTR("com.aha.hidenowplaying"), &ok);
+    sHNPMCoverCached = ok ? (BOOL)v : YES;   // 无配置默认开(与历代 .cover 用户观感一致)
     sHNPMCoverCachedValid = YES;
     sHNPMCoverCachedAt = CFAbsoluteTimeGetCurrent();
     return sHNPMCoverCached;
@@ -1680,18 +1673,7 @@ static void HNPMApplyCardBackgroundAlpha(UIView *cell, int kind) {
                             pHits++; pVia = @"整托盘";
                         }
                         }
-                        // v0.0.99: 官方配方覆盖实验(独立于 alpha; 用户以肉眼判断配方观感)
-                        //          v0.1.0: 罩层模式下跳过 — 系统材质完全不动
-                        if (!HNPMCoverMode()) @try {
-                            NSInteger ro = HNPMRecipeOverride();
-                            if (ro >= 0) {
-                                long long cur = [(PLPlatterView *)v materialRecipe];
-                                if (cur != (long long)ro) {
-                                    [(PLPlatterView *)v setMaterialRecipe:(long long)ro];
-                                    HNPMAppendLog([NSString stringWithFormat:@"[透明] 配方覆盖 %lld→%ld", cur, (long)ro]);
-                                }
-                            }
-                        } @catch (NSException *e) {}
+                        // v0.1.49: 配方覆盖实验块已删(罩层模式下本就永不触发)
                     }
                     [stack addObjectsFromArray:v.subviews];
                 }
@@ -2429,6 +2411,7 @@ static void HNPMStartRestorePolling(void) {
 static void HNPMPrefsChangedCB(CFNotificationCenterRef center, void *observer, CFStringRef name, const void *object, CFDictionaryRef userInfo) {
     CFPreferencesAppSynchronize(CFSTR("com.aha.hidenowplaying"));
     HNPMBgAlphaInvalidate();
+    HNPMCoverInvalidate();   // v0.1.49: 罩层模式开关即时生效
     dispatch_async(dispatch_get_main_queue(), ^{
         @try {
             if (!HNPMPrefSwipeHide() && hnpmHidden) {
@@ -2845,7 +2828,7 @@ static void HNPMAttachPanIfNeeded(UIView *view) {
 #pragma mark - 入口
 
 __attribute__((constructor)) static void HNPMRawCtor(void) {
-    HNPMAppendLog(@"v0.1.48: dylib 构造函数已执行(dyld 加载成功)");
+    HNPMAppendLog(@"v0.1.49: dylib 构造函数已执行(dyld 加载成功)");
 }
 
 // v0.0.50/51: 岛元素抑制策略钩子 — 隐藏期让系统把 NowPlaying 元素当作"应被抑制",
@@ -2909,10 +2892,10 @@ __attribute__((constructor)) static void HNPMRawCtor(void) {
 
 %ctor {
     @autoreleasepool {
-        HNPMAppendLog(@"v0.1.48: logos %ctor 进入");
+        HNPMAppendLog(@"v0.1.49: logos %ctor 进入");
     HNPMAppendLog(HNPMCoverMode()
-        ? @"[透明] 罩层模式 ON(HideNowPlaying.cover 存在 → 系统材质不动, 用自有 blur 罩层)"
-        : @"[透明] 罩层模式 OFF(经典 alpha 模式; 建 /var/mobile/Documents/HideNowPlaying.cover 可切换)");
+        ? @"[透明] 罩层模式 ON(设置面板 coverMode → 系统材质不动, 用自有 blur 罩层)"
+        : @"[透明] 罩层模式 OFF(经典 alpha 模式; 设置面板可切换)");
 
         if ([[NSFileManager defaultManager] fileExistsAtPath:@"/var/mobile/Documents/HideNowPlaying.off"]) {
             HNPMAppendLog(@"检测到开关文件 HideNowPlaying.off, 不注册任何 hook");
@@ -3003,7 +2986,7 @@ __attribute__((constructor)) static void HNPMRawCtor(void) {
         // v0.0.93: 空闲巡逻(0.5s 只读一次, 无在场卡自动停) — 堵"空闲期静默重置无事件触发"盲区
         HNPMIdleAlphaCheck();
         HNPMHookBackdrop();
-        HNPMAppendLog(@"v0.1.48: 空闲巡逻已启动");
-        HNPMAppendLog(@"v0.1.48: %ctor 正常完成");
+        HNPMAppendLog(@"v0.1.49: 空闲巡逻已启动");
+        HNPMAppendLog(@"v0.1.49: %ctor 正常完成");
     }
 }
