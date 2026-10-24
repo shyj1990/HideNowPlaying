@@ -2828,7 +2828,7 @@ static void HNPMAttachPanIfNeeded(UIView *view) {
 #pragma mark - 入口
 
 __attribute__((constructor)) static void HNPMRawCtor(void) {
-    HNPMAppendLog(@"v0.1.50: dylib 构造函数已执行(dyld 加载成功)");
+    HNPMAppendLog(@"v0.1.51: dylib 构造函数已执行(dyld 加载成功)");
 }
 
 // v0.0.50/51: 岛元素抑制策略钩子 — 隐藏期让系统把 NowPlaying 元素当作"应被抑制",
@@ -2892,7 +2892,7 @@ __attribute__((constructor)) static void HNPMRawCtor(void) {
 
 %ctor {
     @autoreleasepool {
-        HNPMAppendLog(@"v0.1.50: logos %ctor 进入");
+        HNPMAppendLog(@"v0.1.51: logos %ctor 进入");
     HNPMAppendLog(HNPMCoverMode()
         ? @"[透明] 罩层模式 ON(设置面板 coverMode → 系统材质不动, 用自有 blur 罩层)"
         : @"[透明] 罩层模式 OFF(经典 alpha 模式; 设置面板可切换)");
@@ -2986,7 +2986,7 @@ __attribute__((constructor)) static void HNPMRawCtor(void) {
         // v0.0.93: 空闲巡逻(0.5s 只读一次, 无在场卡自动停) — 堵"空闲期静默重置无事件触发"盲区
         HNPMIdleAlphaCheck();
         HNPMHookBackdrop();
-        HNPMAppendLog(@"v0.1.50: 空闲巡逻已启动");
-        HNPMAppendLog(@"v0.1.50: %ctor 正常完成");
+        HNPMAppendLog(@"v0.1.51: 空闲巡逻已启动");
+        HNPMAppendLog(@"v0.1.51: %ctor 正常完成");
     }
 }

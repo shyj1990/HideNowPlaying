@@ -174,6 +174,21 @@ static Ivar HNPSpecIvar(void) {
     HNPPrefsLog([NSString stringWithFormat:@"锁屏左滑隐藏=%@ (已写 CFPreferences+通知)", v ? @"开" : @"关"]);
 }
 
+// v0.1.51: 罩层透明模式开关(与 swipeHide 同模式: target+自定义读写)
+- (NSNumber *)coverModeForSpecifier:(PSSpecifier *)spec {
+    Boolean ok = NO;
+    BOOL v = CFPreferencesGetAppBooleanValue(CFSTR("coverMode"), (__bridge CFStringRef)HNPDomain, &ok);
+    if (!ok) v = YES;   // 无配置默认开(与 tweak 侧 HNPMCoverMode 默认一致)
+    return @(v);
+}
+
+- (void)setCoverMode:(NSNumber *)val forSpecifier:(PSSpecifier *)spec {
+    BOOL v = val.boolValue;
+    CFPreferencesSetAppValue(CFSTR("coverMode"), (__bridge CFTypeRef)@(v), (__bridge CFStringRef)HNPDomain);
+    HNPPostPrefsChanged();   // 主 tweak darwin 回调 → HNPMCoverInvalidate 即时生效
+    HNPPrefsLog([NSString stringWithFormat:@"罩层透明模式=%@ (已写 CFPreferences+通知)", v ? @"开" : @"关"]);
+}
+
 - (NSArray *)specifiers {
     if (_specs) {
         // v0.0.87: reloadSpecifiers 清空 _specifiers ivar 后会再调本方法 — 缓存命中也要补写回
@@ -242,6 +257,19 @@ static Ivar HNPSpecIvar(void) {
     [sl setProperty:HNPDomain forKey:@"defaults"];
     [sl setProperty:HNPValCellClass() forKey:@"cellClass"];
     [m addObject:sl];
+
+    // v0.1.51: 罩层透明模式 — 组页脚 + 开关(代码构建, plist 不参与渲染)
+    if (hasGroup) {
+        PSSpecifier *g3 = [PSS groupSpecifierWithName:nil];
+        [g3 setProperty:@"罩层透明模式：开启后不改写系统材质，改用自建模糊罩层实现透明（更稳定，推荐保持开启）；关闭则回退经典直接改 alpha 方式。原 HideNowPlaying.cover 文件开关已退役。"
+                 forKey:@"footerText"];
+        [m addObject:g3];
+    }
+    PSSpecifier *cm = [PSS preferenceSpecifierNamed:@"罩层透明模式"
+            target:self set:@selector(setCoverMode:forSpecifier:) get:@selector(coverModeForSpecifier:)
+            detail:nil cell:6 edit:nil];
+    [m addObject:cm];
+    HNPPrefsLog(@"v0.1.51 specifiers 构建: 罩层透明模式开关完成");
 
     // v0.0.87 核心: 通过官方 setter 写入 _specifiers ivar — 渲染管线读的是这个 ivar,
     // 只 return 不写入 = 上游拿到数组但表格按 nil 渲染 → 空白页
