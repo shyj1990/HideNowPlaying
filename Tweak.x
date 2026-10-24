@@ -1928,6 +1928,10 @@ static void HNPMDeepDumpAt(NSString *tag) {
                 extra = [NSString stringWithFormat:@" text=%@", t];
             }
             if ([v isKindOfClass:[UIVisualEffectView class]]) extra = [extra stringByAppendingString:@" <EFX>"];
+            // v0.1.40: 标记白底嫌疑犯 — 原生模糊渲染器与材质容器
+            if ([cls isEqualToString:@"_UIVisualEffectBackdropView"]) extra = [extra stringByAppendingString:@" <BD>"];
+            if ([cls isEqualToString:@"MTMaterialView"]) extra = [extra stringByAppendingString:@" <MT>"];
+            if ([cls isEqualToString:@"PLPlatterView"]) extra = [extra stringByAppendingString:@" <PL>"];
             CALayer *pl = (CALayer *)v.layer.presentationLayer;
             CGFloat pop = pl ? pl.opacity : -1.0;
             [rows addObject:[NSString stringWithFormat:@"%@ a=%.2f p=%.2f h=%d%@",
@@ -1940,7 +1944,8 @@ static void HNPMDeepDumpAt(NSString *tag) {
 }
 
 static void HNPMScheduleDeepDumps(void) {
-    for (NSString *d in @[@"0.3", @"0.8", @"1.5", @"2.5"]) {
+    // v0.1.40: 提前到 +0.01/+0.05/+0.15 — 抓亮屏首帧材质满亮度渲染的时序(v0.1.39 裁决)
+    for (NSString *d in @[@"0.01", @"0.05", @"0.15", @"0.3", @"0.8", @"1.5", @"2.5"]) {
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)([d doubleValue] * NSEC_PER_SEC)),
                        dispatch_get_main_queue(), ^{
             @try {
@@ -3228,7 +3233,7 @@ static void HNPMAttachPanIfNeeded(UIView *view) {
 #pragma mark - 入口
 
 __attribute__((constructor)) static void HNPMRawCtor(void) {
-    HNPMAppendLog(@"v0.1.39: dylib 构造函数已执行(dyld 加载成功)");
+    HNPMAppendLog(@"v0.1.40: dylib 构造函数已执行(dyld 加载成功)");
 }
 
 // v0.0.50/51: 岛元素抑制策略钩子 — 隐藏期让系统把 NowPlaying 元素当作"应被抑制",
@@ -3312,7 +3317,7 @@ __attribute__((constructor)) static void HNPMRawCtor(void) {
 
 %ctor {
     @autoreleasepool {
-        HNPMAppendLog(@"v0.1.39: logos %ctor 进入");
+        HNPMAppendLog(@"v0.1.40: logos %ctor 进入");
     HNPMAppendLog(HNPMCoverMode()
         ? @"[透明] 罩层模式 ON(HideNowPlaying.cover 存在 → 系统材质不动, 用自有 blur 罩层)"
         : @"[透明] 罩层模式 OFF(经典 alpha 模式; 建 /var/mobile/Documents/HideNowPlaying.cover 可切换)");
@@ -3414,8 +3419,8 @@ __attribute__((constructor)) static void HNPMRawCtor(void) {
         HNPMIdleAlphaCheck();
         HNPMHookBackdrop();
         HNPMCapturePersistLoop();   // v0.1.34: 卡区捕获快照持续压住(0.5s 一拍, 自续)
-        HNPMAppendLog(@"v0.1.39: 卡区透明持续生效循环已启动");
-        HNPMAppendLog(@"v0.1.39: 空闲巡逻已启动");
-        HNPMAppendLog(@"v0.1.39: %ctor 正常完成");
+        HNPMAppendLog(@"v0.1.40: 卡区透明持续生效循环已启动");
+        HNPMAppendLog(@"v0.1.40: 空闲巡逻已启动");
+        HNPMAppendLog(@"v0.1.40: %ctor 正常完成");
     }
 }
