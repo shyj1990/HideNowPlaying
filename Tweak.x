@@ -87,7 +87,6 @@ static void HNPMSetHidden(BOOL hide, NSString *reason, BOOL linkIsland);
 static BOOL HNPMPrefSwipeHide(void);   // v0.0.87: 前置声明(设置面板"锁屏左滑隐藏"总闸, 定义在后)
 static void HNPMStartRestorePolling(void);
 static void HNPMStartAlphaBurst(void);   // v0.0.90: 前置声明(亮屏逐帧连扫窗口, 定义在透明区)
-static void HNPMScheduleDeepDumps(void);   // v0.0.95: 前置声明(时序化深诊断, 定义在屏幕状态CB之后)
 
 #pragma mark - 日志
 
@@ -1146,287 +1145,6 @@ static int HNPMPlatterApplyCover(UIView *platter, CGFloat a) {
 // v0.1.34: 卡区记忆(最近一次登记媒体卡 cell 的窗口坐标) — 持续生效版(v0.1.34)的避让依据
 static CGRect sHNPMCardRegion33 = {{0, 0}, {0, 0}};
 
-// v0.1.34: 用户裁决"让透明度一直生效" — 白底=调整透明度后亮屏首帧配方未生效(用户观察,
-//          与日志互斥证据吻合: 白底盘次 cell 未创建, 占位材质从未被配方覆盖)。
-//          v0.1.34 的白窗内临时避让升级为**持续生效**: 0.5s 一拍, 最近登记卡区内的
-//          BSUIVibrancyBackdrop/AnimatingPortal 只要可见就压住; 覆盖开关关闭时恢复。
-//          宿主本身绝不隐藏(时钟安全, v0.1.31 教训); 全屏 ShadowView 不碰(无法隔离卡区)。
-static NSHashTable *sHNPMCaptureHiddenViews = nil;   // 弱引用: 我们隐藏的快照材质
-
-static void HNPMCapturePersistOnce(void) {
-    @try {
-        BOOL on = HNPMCoverMode();
-        if (sHNPMCaptureHiddenViews == nil)
-            sHNPMCaptureHiddenViews = [NSHashTable weakObjectsHashTable];
-        for (UIView *hv in [sHNPMCaptureHiddenViews copy]) {
-            if (!on || !hv.window) {           // 开关关闭/视图离场 → 恢复
-                hv.hidden = NO;
-                [sHNPMCaptureHiddenViews removeObject:hv];
-            }
-        }
-        if (!on || CGRectIsEmpty(sHNPMCardRegion33)) return;
-        int n = 0;
-        NSArray *windows = [UIApplication sharedApplication].windows;
-        for (UIWindow *w in windows) {
-            if (!w) continue;
-            NSMutableArray *stack = [NSMutableArray arrayWithObject:w];
-            int guard = 0;
-            while (stack.count > 0 && guard++ < 600) {
-                UIView *v = stack.firstObject;
-                [stack removeObjectAtIndex:0];
-                if (!v || v.tag == HNPM_COVER_TAG) continue;
-                NSString *cls = NSStringFromClass([v class]);
-                if ([cls containsString:@"CaptureOnly"]) {
-                    [stack addObjectsFromArray:v.subviews];   // 只下钻宿主, 绝不隐藏宿主本身
-                    continue;
-                }
-                if (![cls hasPrefix:@"BSUIVibrancyBackdrop"] && ![cls hasPrefix:@"BSUIVibrancyAnimatingPortal"]) {
-                    [stack addObjectsFromArray:v.subviews];
-                    continue;
-                }
-                // 命中: 与卡区相交才隐藏(时钟在屏幕上方, frame 不相交)
-                CGRect vf = [v convertRect:v.bounds toView:nil];
-                CGRect inter = CGRectIntersection(vf, sHNPMCardRegion33);
-                if (CGRectIsNull(inter) || CGRectIsEmpty(inter) || v.hidden || v.alpha < 0.01) continue;
-                v.hidden = YES;
-                [sHNPMCaptureHiddenViews addObject:v];
-                n++;
-            }
-        }
-        if (n > 0)
-            HNPMAppendLog([NSString stringWithFormat:
-                @"[透明·罩层] 已隐卡区捕获快照 %d 处(持续生效)", n]);
-    } @catch (NSException *e) {}
-}
-
-static void HNPMCapturePersistLoop(void) {
-    if (![NSThread isMainThread]) {
-        dispatch_async(dispatch_get_main_queue(), ^{ HNPMCapturePersistLoop(); });
-        return;
-    }
-    HNPMCapturePersistOnce();
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)),
-                   dispatch_get_main_queue(), ^{
-        @try { HNPMCapturePersistLoop(); } @catch (NSException *e) {}
-    });
-}
-
-static NSString *HNPMCGColorDesc(CGColorRef c);   // 前向声明(v0.1.44 宿主解剖用, 定义于后)
-// v0.1.44: CaptureOnly 宿主完整解剖 — v0.1.43 侦察实锤: NCMaterialDisplayingCapture-
-//          OnlyViewControllerView 常驻 SBCoverSheetWindow(393x852@0,0 a=1.00 h=0 全屏,
-//          与卡区相交, 96 条侦察行全程在案), 但钉扎 0 命中(宿主内无 BSUIVibrancy* 类
-//          可压) → 白底要么是宿主自身材质层(它是 NCMaterial*View 材质视图), 要么是
-//          宿主内其他类名的子层。本版亮/灭屏 +0.05s 对该宿主做一次完整 DFS 解剖:
-//          类名/frame/alpha/hidden/背景色(view+layer), 上限 48 行 — 看清内部后精打。
-static void HNPMCaptureHostAutopsy(NSString *tag) {
-    if (![NSThread isMainThread]) {
-        dispatch_async(dispatch_get_main_queue(), ^{ HNPMCaptureHostAutopsy(tag); });
-        return;
-    }
-    @try {
-        UIView *host = nil;
-        for (UIWindow *w in [UIApplication sharedApplication].windows) {
-            if (!w) continue;
-            NSMutableArray *stack = [NSMutableArray arrayWithObject:w];
-            int guard = 0;
-            while (stack.count > 0 && guard++ < 1500 && !host) {
-                UIView *v = stack.firstObject;
-                [stack removeObjectAtIndex:0];
-                if (!v) continue;
-                if ([NSStringFromClass([v class]) containsString:@"CaptureOnly"]) { host = v; break; }
-                [stack addObjectsFromArray:v.subviews];
-            }
-            if (host) break;
-        }
-        if (!host) {
-            HNPMAppendLog([NSString stringWithFormat:@"[宿主解剖@%@] 无 CaptureOnly 宿主在场", tag]);
-            return;
-        }
-        NSMutableArray *rows = [NSMutableArray array];
-        NSMutableArray *stack = [NSMutableArray arrayWithObject:host];
-        int guard = 0;
-        while (stack.count > 0 && guard++ < 400 && rows.count < 48) {
-            UIView *v = stack.firstObject;
-            [stack removeObjectAtIndex:0];
-            if (!v) continue;
-            NSString *cls = NSStringFromClass([v class]);
-            CGRect vf = [v convertRect:v.bounds toView:nil];
-            NSString *bg = v.backgroundColor ? HNPMCGColorDesc(v.backgroundColor.CGColor) : @"nil";
-            NSString *lbg = v.layer.backgroundColor ? HNPMCGColorDesc(v.layer.backgroundColor) : @"nil";
-            CALayer *pl = (CALayer *)v.layer.presentationLayer;
-            CGFloat pop = pl ? pl.opacity : -1.0;
-            [rows addObject:[NSString stringWithFormat:@"%@ %.0fx%.0f@%.0f,%.0f a=%.2f p=%.2f h=%d bg=%@ lbg=%@",
-                             cls, vf.size.width, vf.size.height, vf.origin.x, vf.origin.y,
-                             v.alpha, pop, v.hidden ? 1 : 0, bg, lbg]];
-            [stack addObjectsFromArray:v.subviews];
-        }
-        HNPMAppendLog([NSString stringWithFormat:@"[宿主解剖@%@] %lu行: %@", tag,
-                       (unsigned long)rows.count, [rows componentsJoinedByString:@" || "]]);
-    } @catch (NSException *e) {}
-}
-
-// v0.1.43: AOD 捕获层侦察+钉扎 — 根因坐实: 白底 = AOD(始终显示)灭屏时独立渲染的音乐卡
-//          材质, 亮屏过渡瞬间闪现(用户关闭 AOD 白底消失实测)。AOD 捕获宿主
-//          (NCMaterialDisplayingCaptureOnlyViewControllerView, v0.1.30 唯一一次在案)
-//          不在常规巡检时机在场 → 本版亮/灭屏后 +0.02/0.05/0.1/0.2/0.4/0.8s 高频扫:
-//          ①CaptureOnly 命中→立即钉扎宿主内与卡区相交的 BSUIVibrancyBackdrop/Portal
-//          ②与卡区记忆相交的顶层 BSUIVibrancy* → 直接压(同 PersistOnce 判定)
-//          ③AOD/AlwaysOn/Idle 关键词命中→侦察记录(类名/窗口/frame/hidden), 下版精打
-//          全树无 hidden 剪枝(捕获快照视图常以 hidden 态预渲染)。
-static void HNPMCaptureHostPin(UIView *host, NSString *tag);   // 前向声明(v0.1.36 定义于后)
-
-// v0.1.46: 捕获类方法表 dump — v0.1.45 实测裁决: 宿主材质压掉(h=1)后白底依旧,
-//          白底为系统 AOD 过渡合成(进程外)。最后一搏路线: 运行时枚举
-//          NCMaterialDisplaying* 全部类的方法表(实例+类方法), 找可 hook 的
-//          捕获/快照方法, 供下版精准拦截。一次会话只 dump 一份。
-static void HNPMCaptureVCDump(void) {
-    static BOOL done = NO;
-    if (done) return;
-    done = YES;
-    @try {
-        unsigned int cnt = 0;
-        Class *classes = objc_copyClassList(&cnt);
-        if (!classes) return;
-        int dumped = 0;
-        for (unsigned int i = 0; i < cnt && dumped < 8; i++) {
-            NSString *name = NSStringFromClass(classes[i]);
-            if (![name hasPrefix:@"NCMaterialDisplaying"]) continue;
-            dumped++;
-            unsigned int m = 0;
-            Method *list = class_copyMethodList(classes[i], &m);
-            NSMutableString *s = [NSMutableString stringWithFormat:@"[捕获类] %@ (%u):", name, m];
-            for (unsigned int j = 0; j < m && j < 80; j++)
-                [s appendFormat:@" %@", NSStringFromSelector(method_getName(list[j]))];
-            HNPMAppendLog(s);
-            if (list) free(list);
-            unsigned int cm = 0;
-            Method *clist = class_copyMethodList(object_getClass(classes[i]), &cm);
-            if (cm > 0) {
-                NSMutableString *cs = [NSMutableString stringWithFormat:@"[捕获类+] %@ 类方法(%u):", name, cm];
-                for (unsigned int j = 0; j < cm && j < 40; j++)
-                    [cs appendFormat:@" %@", NSStringFromSelector(method_getName(clist[j]))];
-                HNPMAppendLog(cs);
-            }
-            if (clist) free(clist);
-        }
-        free(classes);
-        HNPMAppendLog([NSString stringWithFormat:@"[捕获类] NCMaterialDisplaying* 扫描完成, 命中 %d 类", dumped]);
-    } @catch (NSException *e) {}
-}
-
-static void HNPMCaptureSweep(NSString *tag) {
-    if (![NSThread isMainThread]) {
-        dispatch_async(dispatch_get_main_queue(), ^{ HNPMCaptureSweep(tag); });
-        return;
-    }
-    @try {
-        if (!HNPMCoverMode() || CGRectIsEmpty(sHNPMCardRegion33)) return;
-        HNPMCaptureVCDump();   // v0.1.46: 一次性 dump 捕获类方法表
-        if (sHNPMCaptureHiddenViews == nil)
-            sHNPMCaptureHiddenViews = [NSHashTable weakObjectsHashTable];
-        int capCount = 0, pinCount = 0;
-        NSMutableArray *rows = [NSMutableArray array];
-        for (UIWindow *w in [UIApplication sharedApplication].windows) {
-            if (!w) continue;
-            NSMutableArray *stack = [NSMutableArray arrayWithObject:w];
-            int guard = 0;
-            while (stack.count > 0 && guard++ < 1200) {
-                UIView *v = stack.firstObject;
-                [stack removeObjectAtIndex:0];
-                if (!v || v.tag == HNPM_COVER_TAG) continue;
-                NSString *cls = NSStringFromClass([v class]);
-                CGRect vf = [v convertRect:v.bounds toView:nil];
-                CGRect inter = CGRectIntersection(vf, sHNPMCardRegion33);
-                BOOL inCard = !CGRectIsNull(inter) && !CGRectIsEmpty(inter);
-                BOOL isCap = [cls containsString:@"CaptureOnly"];
-                BOOL isAODkw = [cls containsString:@"AlwaysOn"] ||
-                               [cls containsString:@"AOD"] ||
-                               [cls rangeOfString:@"Idle" options:NSCaseInsensitiveSearch].location != NSNotFound;
-                BOOL isVib = [cls hasPrefix:@"BSUIVibrancyBackdrop"] ||
-                             [cls hasPrefix:@"BSUIVibrancyAnimatingPortal"];
-                if (isCap || isAODkw || (isVib && inCard)) {
-                    if (rows.count < 20)
-                        [rows addObject:[NSString stringWithFormat:
-                            @"%@|win=%@ %.0fx%.0f@%.0f,%.0f a=%.2f h=%d 卡区=%d",
-                            cls, NSStringFromClass([w class]),
-                            vf.size.width, vf.size.height, vf.origin.x, vf.origin.y,
-                            v.alpha, v.hidden ? 1 : 0, inCard ? 1 : 0]];
-                }
-                if (isCap) {                       // 宿主绝不隐藏, 钉扎其内卡区 backdrop
-                    HNPMCaptureHostPin(v, tag);
-                    capCount++;
-                } else if (isVib && inCard && !v.hidden && v.alpha > 0.01) {
-                    v.hidden = YES;                // 顶层独立 Vibrancy 与卡区相交 → 压
-                    [sHNPMCaptureHiddenViews addObject:v];
-                    pinCount++;
-                }
-                [stack addObjectsFromArray:v.subviews];
-            }
-        }
-        if (rows.count > 0)
-            HNPMAppendLog([NSString stringWithFormat:@"[AOD侦察@%@] %lu处: %@", tag,
-                           (unsigned long)rows.count, [rows componentsJoinedByString:@" || "]]);
-        if (capCount > 0 || pinCount > 0)
-            HNPMAppendLog([NSString stringWithFormat:
-                @"[AOD侦察@%@] 钉扎: CaptureOnly宿主 %d 个, 顶层卡区Vibrancy %d 处", tag, capCount, pinCount]);
-    } @catch (NSException *e) {}
-}
-
-// v0.1.36: 捕获时刻钉扎 — v0.1.35 探针裁决(42 条探针逐卡区过滤): 白窗期间进程内
-//          全窗口/全树(view+layer)与卡区相交的只有全屏壁纸材质与 57x40 小元素,
-//          没有任何卡区尺寸的白底画手; CaptureOnly 宿主也从未出现在枚举/探针里
-//          → 白底是跨进程上屏的捕获快照, 轮询(0.5s 节拍/探针 0.05~0.35s)追不上
-//          它的生存期。改为钩住宿主类自身生命周期: 它一露头(didMoveToWindow/
-//          didMoveToSuperview/layoutSubviews)就从宿主根下钻, 把与卡区记忆相交的
-//          BSUIVibrancyBackdrop/AnimatingPortal 压住(宿主绝不隐藏, 时钟安全),
-//          让"拍进去"的快照天生透明; 再补 +0.05/+0.15 两拍防捕获晚于首次布局。
-//          共用 sHNPMCaptureHiddenViews 弱引用表 → 开关关闭/离场自动恢复。
-static void HNPMCaptureHostPin(UIView *host, NSString *tag) {
-    if (!host || !HNPMCoverMode() || CGRectIsEmpty(sHNPMCardRegion33)) return;
-    if (sHNPMCaptureHiddenViews == nil)
-        sHNPMCaptureHiddenViews = [NSHashTable weakObjectsHashTable];
-    int n = 0;
-    NSMutableArray *stack = [NSMutableArray arrayWithObject:host];
-    int guard = 0;
-    while (stack.count > 0 && guard++ < 600) {
-        UIView *v = stack.firstObject;
-        [stack removeObjectAtIndex:0];
-        if (!v) continue;
-        NSString *cls = NSStringFromClass([v class]);
-        // v0.1.46: 回退 v0.1.45 的 MTMaterialView 隐藏通道 — 实测宿主材质 h=1 后
-        //          白底依旧(白底=系统 AOD 过渡合成, 进程外), 反致 AOD 音乐卡消失
-        //          数秒的纯代价副作用。钉扎恢复 v0.1.44 行为(只压 BSUIVibrancy*)。
-        if (![cls hasPrefix:@"BSUIVibrancyBackdrop"] && ![cls hasPrefix:@"BSUIVibrancyAnimatingPortal"]) {
-            [stack addObjectsFromArray:v.subviews];   // 一路下钻, 宿主本身不隐藏
-            continue;
-        }
-        CGRect vf = [v convertRect:v.bounds toView:nil];
-        CGRect inter = CGRectIntersection(vf, sHNPMCardRegion33);
-        if (CGRectIsNull(inter) || CGRectIsEmpty(inter) || v.hidden || v.alpha < 0.01) continue;
-        v.hidden = YES;
-        [sHNPMCaptureHiddenViews addObject:v];
-        n++;
-    }
-    if (n > 0)
-        HNPMAppendLog([NSString stringWithFormat:
-            @"[透明·罩层] 已隐卡区捕获快照 %d 处(捕获时刻@%@)", n, tag]);
-}
-
-static void HNPMCaptureHostPinDelayed(UIView *host, NSString *tag) {
-    if (!host) return;
-    __weak UIView *wh = host;
-    NSString *t = [tag copy];
-    for (NSString *d in @[@"0.05", @"0.15"]) {
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
-                       (int64_t)([d doubleValue] * NSEC_PER_SEC)),
-                       dispatch_get_main_queue(), ^{
-            @try {
-                UIView *s = wh;
-                if (s && s.window) HNPMCaptureHostPin(s, [NSString stringWithFormat:@"%@+%@", t, d]);
-            } @catch (NSException *e) {}
-        });
-    }
-}
 
 static void HNPMCoversWakeSweep(void);
 
@@ -1453,7 +1171,6 @@ static void HNPMCoversWakeSweep(void) {
         Class hostCls = NSClassFromString(@"NCNotificationListSupplementaryHostingView");
         Class cellCls = NSClassFromString(@"NCNotificationListCell");
         if (!platterCls) return;
-        HNPMCapturePersistOnce();   // v0.1.34: 持续生效 — 亮屏扫顺手压一次(幂等)
         NSArray *windows = [UIApplication sharedApplication].windows;
         int hits = 0, nPlatter = 0, nCell = 0, nGated = 0;
         UIView *dumpCell = nil;
@@ -1963,137 +1680,6 @@ static void HNPMStartAlphaBurst(void) {
     [sHNPMAlphaBurst addToRunLoop:[NSRunLoop mainRunLoop] forMode:NSRunLoopCommonModes];
 }
 
-// v0.1.37: 卡区白巡(只读) — v0.1.36 实测裁决: 钉扎钩子注册成功(宿主类存在)但 24 次
-//          亮/灭屏全程 0 次捕获时刻触发, 白源探针也从未见到 CaptureOnly 宿主 → 该宿主
-//          不参与本机唤醒首帧; 且关键词探针只认 6 类关键词, 普通类名的白底视图
-//          (纯 UIView/ContentView 的 backgroundColor)全部漏网。本巡检改按"几何+颜色"
-//          抓白: 亮/灭屏 +0.05/0.2/0.5/1.0s 各一次, 对所有与卡区记忆相交且有效可见
-//          (隐祖/透明祖剪枝)的视图 dump 类名/窗口/frame/alpha/背景色(view+layer),
-//          白底画手无论叫什么名字都无处遁形。
-static NSString *HNPMCGColorDesc(CGColorRef c) {
-    if (!c) return @"nil";
-    size_t n = CGColorGetNumberOfComponents(c);
-    const CGFloat *cs = CGColorGetComponents(c);
-    if (n >= 4)
-        return [NSString stringWithFormat:@"rgba(%.2f,%.2f,%.2f,%.2f)", cs[0], cs[1], cs[2], cs[3]];
-    if (n == 2)
-        return [NSString stringWithFormat:@"ga(%.2f,%.2f)", cs[0], cs[1]];
-    return [NSString stringWithFormat:@"cmp%zu", n];
-}
-
-static void HNPMRegionWhiteProbe(NSString *tag) {
-    if (![NSThread isMainThread]) return;
-    @try {
-        if (CGRectIsEmpty(sHNPMCardRegion33)) {
-            HNPMAppendLog([NSString stringWithFormat:@"[卡区白巡@%@] 卡区=空(未登记)", tag]);
-            return;
-        }
-        NSMutableArray *all = [NSMutableArray array];
-        for (UIWindow *w in [UIApplication sharedApplication].windows) {
-            if (!w || w.hidden || w.alpha < 0.01) continue;
-            int guard = 0;
-            NSMutableArray *stack = [NSMutableArray arrayWithObject:w];
-            while (stack.count > 0 && guard++ < 1200 && all.count < 160) {
-                UIView *v = stack.firstObject;
-                [stack removeObjectAtIndex:0];
-                if (!v) continue;
-                if (v != w && (v.hidden || v.alpha < 0.01)) continue;   // 不可见→子树一并剪枝
-                if (v.tag == HNPM_COVER_TAG) continue;                  // 自家罩层不算
-                CGRect vf = [v convertRect:v.bounds toView:nil];
-                CGRect inter = CGRectIntersection(vf, sHNPMCardRegion33);
-                if (!CGRectIsNull(inter) && !CGRectIsEmpty(inter)) {
-                    NSString *bg = v.backgroundColor ? HNPMCGColorDesc(v.backgroundColor.CGColor) : @"nil";
-                    NSString *lbg = v.layer.backgroundColor ? HNPMCGColorDesc(v.layer.backgroundColor) : @"nil";
-                    [all addObject:[NSString stringWithFormat:
-                        @"%@|win=%@ %.0fx%.0f@%.0f,%.0f a=%.2f bg=%@ lbg=%@",
-                        NSStringFromClass([v class]), NSStringFromClass([w class]),
-                        vf.size.width, vf.size.height, vf.origin.x, vf.origin.y,
-                        v.alpha, bg, lbg]];
-                }
-                [stack addObjectsFromArray:v.subviews];
-            }
-        }
-        // v0.1.39: 修复 v0.1.38 尺寸解析 bug(尺寸在'@'之前, 之前取到的是坐标→全屏判定从未生效)
-        NSMutableArray *rows = [NSMutableArray array];
-        for (NSString *r in all) {
-            if (rows.count >= 24) break;
-            NSUInteger at = [r rangeOfString:@"@"].location;
-            if (at == NSNotFound) { [rows addObject:r]; continue; }
-            NSString *pre = [r substringToIndex:at];               // "类|win=窗 393x852"
-            NSRange sp = [pre rangeOfString:@" " options:NSBackwardsSearch];
-            if (sp.location == NSNotFound) { [rows addObject:r]; continue; }
-            NSString *sizeTok = [pre substringFromIndex:sp.location + 1];   // "393x852"
-            NSArray *wh = [sizeTok componentsSeparatedByString:@"x"];
-            if (wh.count != 2) { [rows addObject:r]; continue; }
-            double pw = [wh[0] doubleValue], ph = [wh[1] doubleValue];
-            BOOL fullscreen = (pw >= 360 && ph >= 790);
-            BOOL hasBG = (![r containsString:@" bg=nil lbg=nil"]);
-            if (fullscreen && !hasBG) continue;   // 透明全屏容器→丢
-            [rows addObject:r];
-        }
-        HNPMAppendLog([NSString stringWithFormat:@"[卡区白巡@%@] %lu行: %@",
-            tag, (unsigned long)rows.count,
-            rows.count ? [rows componentsJoinedByString:@" || "] : @"无(卡区无任何可见视图)"]);
-    } @catch (NSException *e) {}
-}
-
-// v0.1.42: 整卡避让·预隐藏 — 白底根因定论为渲染服务首帧滞后(视图层无解, v0.1.41 裁决:
-//          树内无满亮度系统材质、罩层提前就位、白/透明期树逐字节相同)。
-//          对策: 在屏幕还黑的按压/灭屏瞬间先把与卡区记忆相交的 NCNotificationListCell
-//          alpha=0(首帧渲染时卡区为空 → 无白底可拍), +0.3s 后 0.25s 动画淡入恢复。
-//          与 v0.1.24 失败版的本质区别: 那次是亮屏后才藏(白底已上屏), 这次赶在首帧渲染前。
-//          互斥规律兜底: 按压时 cell 不在场 → 亮屏首帧也不在场 → 本就无白底。
-static NSHashTable *sHNPMPrehiddenCells = nil;
-
-static void HNPMPrehideRestore(void) {
-    if (![NSThread isMainThread]) {
-        dispatch_async(dispatch_get_main_queue(), ^{ HNPMPrehideRestore(); });
-        return;
-    }
-    @try {
-        if (!sHNPMPrehiddenCells || sHNPMPrehiddenCells.count == 0) return;
-        int n = 0;
-        for (UIView *v in [sHNPMPrehiddenCells copy]) {
-            if (![v isKindOfClass:[UIView class]] || !v.window) continue;
-            [UIView animateWithDuration:0.25 animations:^{ v.alpha = 1.0; }];
-            n++;
-        }
-        [sHNPMPrehiddenCells removeAllObjects];
-        HNPMAppendLog([NSString stringWithFormat:@"[透明·预隐藏] 淡入恢复 %d 处", n]);
-    } @catch (NSException *e) {}
-}
-
-static void HNPMPrehideCardCells(void) {
-    if (![NSThread isMainThread]) {
-        dispatch_async(dispatch_get_main_queue(), ^{ HNPMPrehideCardCells(); });
-        return;
-    }
-    @try {
-        if (!sHNPMPrehiddenCells) sHNPMPrehiddenCells = [NSHashTable weakObjectsHashTable];
-        int n = 0;
-        for (UIWindow *w in [UIApplication sharedApplication].windows) {
-            if (!w || w.hidden) continue;
-            int guard = 0;
-            NSMutableArray *stack = [NSMutableArray arrayWithObject:w];
-            while (stack.count > 0 && guard++ < 600) {
-                UIView *v = stack.firstObject;
-                [stack removeObjectAtIndex:0];
-                if (!v) continue;
-                if (v != w && (v.hidden || v.alpha < 0.01)) continue;
-                if ([NSStringFromClass([v class]) isEqualToString:@"NCNotificationListCell"]) {
-                    if (v.alpha > 0.01 && ![sHNPMPrehiddenCells containsObject:v]) {
-                        v.alpha = 0.0;
-                        [sHNPMPrehiddenCells addObject:v];
-                        n++;
-                    }
-                    continue;   // cell 整体藏, 不再下钻
-                }
-                [stack addObjectsFromArray:v.subviews];
-            }
-        }
-        if (n > 0) HNPMAppendLog([NSString stringWithFormat:@"[透明·预隐藏] 已藏卡 %d 处(首帧避让)", n]);
-    } @catch (NSException *e) {}
-}
 
 // v0.0.91: 亮屏盲区补漏 — v0.0.90 真机毫秒日志实锤: 系统每隔几秒随机重置一次 bg alpha
 //          (连扫均当帧修掉), 但若重置恰好发生在"亮屏瞬间、任何触发点出现之前"
@@ -2105,98 +1691,12 @@ static void HNPMScreenStateCB(CFNotificationCenterRef center, void *observer,
                               CFStringRef name, const void *object, CFDictionaryRef userInfo) {
     HNPMAppendLog([NSString stringWithFormat:@"[透明] 屏幕状态通知(%@) → 连扫窗口开启",
                    (__bridge NSString *)name]);
-    HNPMCapturePersistOnce();   // v0.1.34: 通知即刻压一次(不等 0.5s 节拍)
-    // v0.1.42: 整卡避让·预隐藏 — 屏幕还黑的此刻藏卡 cell, +0.3s 淡入恢复(赶在首帧渲染前)
-    HNPMPrehideCardCells();
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.3 * NSEC_PER_SEC)),
-                   dispatch_get_main_queue(), ^{ @try { HNPMPrehideRestore(); } @catch (NSException *e) {} });
     HNPMStartAlphaBurst();
-    // v0.1.44: CaptureOnly 宿主完整解剖 — 亮/灭屏 +0.05s 一次, 看清白底画手内部结构
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.05 * NSEC_PER_SEC)),
-                   dispatch_get_main_queue(), ^{ @try { HNPMCaptureHostAutopsy(@"0.05"); } @catch (NSException *e) {} });
-    // v0.1.43: AOD 捕获层高频侦察+钉扎 — 灭屏捕获/亮屏过渡双窗口, 追 AOD 短命渲染物
-    for (NSString *d in @[@"0.02", @"0.05", @"0.1", @"0.2", @"0.4", @"0.8"]) {
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
-                       (int64_t)([d doubleValue] * NSEC_PER_SEC)),
-                       dispatch_get_main_queue(), ^{
-            @try { HNPMCaptureSweep(d); } @catch (NSException *e) {}
-        });
-    }
-    HNPMScheduleDeepDumps();   // v0.0.95: 每次亮/灭屏排程时序化深诊断
-    // v0.1.37: 卡区白巡 — 亮/灭屏后 0.05/0.2/0.5/1.0s 各一次(只读, 几何+颜色抓白)
-    for (NSString *d in @[@"0.05", @"0.2", @"0.5", @"1.0"]) {
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
-                       (int64_t)([d doubleValue] * NSEC_PER_SEC)),
-                       dispatch_get_main_queue(), ^{
-            @try { HNPMRegionWhiteProbe(d); } @catch (NSException *e) {}
-        });
-    }
     // v0.1.8: 免登记亮屏直扫 — 立即一次 + 时序化九次, 不等登记/配方(见 HNPMCoversWakeSweep 注释)
     HNPMCoversWakeSweep();
     HNPMScheduleWakeSweeps();
 }
 
-// v0.0.95: 时序化深诊断 — v0.0.94 一次性 dump 实锤 dump 瞬间材质容器 h=1、场景宿主 a=0.00 h=1,
-//          但单帧无法判断可见化时序。改为亮/灭屏后 0.3/0.8/1.5/2.5s 各 dump 一次(只读),
-//          并加 presentation 层 opacity(p=)捕捉动画中的值 — 对齐歌词变暗窗口与重挂时序。
-static void HNPMDeepDumpAt(NSString *tag) {
-    if (![NSThread isMainThread]) return;
-    @try {
-        UIView *cell = nil;
-        for (UIView *c in [hnpmCardCells copy]) {
-            if ([c isKindOfClass:[UIView class]] && c.window) { cell = c; break; }
-        }
-        if (!cell) {
-            HNPMAppendLog([NSString stringWithFormat:@"[透明·深诊断@%@] 无在场登记卡", tag]);
-            return;
-        }
-        NSMutableArray *rows = [NSMutableArray array];
-        NSMutableArray *stack = [NSMutableArray arrayWithObject:cell];
-        int guard = 0;
-        while (stack.count > 0 && guard++ < 200 && rows.count < 40) {
-            UIView *v = stack.firstObject;
-            [stack removeObjectAtIndex:0];
-            if (!v) continue;
-            NSString *cls = NSStringFromClass([v class]);
-            NSString *extra = @"";
-            if ([v isKindOfClass:[UILabel class]]) {
-                NSString *t = [(UILabel *)v text] ?: @"";
-                if (t.length > 16) t = [t substringWithRange:NSMakeRange(0, 16)];
-                extra = [NSString stringWithFormat:@" text=%@", t];
-            }
-            if ([v isKindOfClass:[UIVisualEffectView class]]) extra = [extra stringByAppendingString:@" <EFX>"];
-            // v0.1.40: 标记白底嫌疑犯 — 原生模糊渲染器与材质容器
-            if ([cls isEqualToString:@"_UIVisualEffectBackdropView"]) extra = [extra stringByAppendingString:@" <BD>"];
-            if ([cls isEqualToString:@"MTMaterialView"]) extra = [extra stringByAppendingString:@" <MT>"];
-            if ([cls isEqualToString:@"PLPlatterView"]) extra = [extra stringByAppendingString:@" <PL>"];
-            // v0.1.41: 父链消歧 — BD 到底挂在谁下面(我们罩层子树内=无害 / 系统内容层=白底真身)
-            NSString *sup = v.superview ? NSStringFromClass([v.superview class]) : @"(nil)";
-            if (sup.length > 24) sup = [sup substringFromIndex:sup.length - 24];
-            if (v.tag == HNPM_COVER_TAG) extra = [extra stringByAppendingString:@" <COVER>"];
-            extra = [extra stringByAppendingFormat:@" sup=%@", sup];
-            CALayer *pl = (CALayer *)v.layer.presentationLayer;
-            CGFloat pop = pl ? pl.opacity : -1.0;
-            [rows addObject:[NSString stringWithFormat:@"%@ a=%.2f p=%.2f h=%d%@",
-                             cls, v.alpha, pop, v.hidden ? 1 : 0, extra]];
-            [stack addObjectsFromArray:v.subviews];
-        }
-        HNPMAppendLog([NSString stringWithFormat:@"[透明·深诊断@%@] %lu视图: %@",
-                       tag, (unsigned long)rows.count, [rows componentsJoinedByString:@" || "]]);
-    } @catch (NSException *e) {}
-}
-
-static void HNPMScheduleDeepDumps(void) {
-    // v0.1.40: 提前到 +0.01/+0.05/+0.15 — 抓亮屏首帧材质满亮度渲染的时序(v0.1.39 裁决)
-    for (NSString *d in @[@"0.01", @"0.05", @"0.15", @"0.3", @"0.8", @"1.5", @"2.5"]) {
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)([d doubleValue] * NSEC_PER_SEC)),
-                       dispatch_get_main_queue(), ^{
-            @try {
-                HNPMClampAllCells();   // v0.0.97: 连扫窗口外的钳制兜底
-                HNPMDeepDumpAt(d);
-            } @catch (NSException *e) {}
-        });
-    }
-}
 
 // v0.0.93: 空闲巡逻 — 连扫窗口只覆盖事件后 3s; 若系统在"无任何布局/挂载事件"的空闲期
 //          静默重置 alpha(锁屏静置时布局 pass 极少), 侦测 hook 不会触发 → 卡片不透明
@@ -3475,7 +2975,7 @@ static void HNPMAttachPanIfNeeded(UIView *view) {
 #pragma mark - 入口
 
 __attribute__((constructor)) static void HNPMRawCtor(void) {
-    HNPMAppendLog(@"v0.1.46: dylib 构造函数已执行(dyld 加载成功)");
+    HNPMAppendLog(@"v0.1.47: dylib 构造函数已执行(dyld 加载成功)");
 }
 
 // v0.0.50/51: 岛元素抑制策略钩子 — 隐藏期让系统把 NowPlaying 元素当作"应被抑制",
@@ -3536,30 +3036,10 @@ __attribute__((constructor)) static void HNPMRawCtor(void) {
 %end
 %end
 
-// v0.1.36: 捕获快照宿主生命周期钩子 — 类不存在时 %init 不执行(安全), 见 %ctor 守卫
-%group HNPMCaptureHost
-%hook NCMaterialDisplayingCaptureOnlyViewControllerView
-- (void)didMoveToWindow {
-    %orig;
-    @try {
-        HNPMCaptureHostPin((UIView *)self, @"挂窗");
-        HNPMCaptureHostPinDelayed((UIView *)self, @"挂窗");
-    } @catch (NSException *e) {}
-}
-- (void)didMoveToSuperview {
-    %orig;
-    @try { HNPMCaptureHostPin((UIView *)self, @"挂父"); } @catch (NSException *e) {}
-}
-- (void)layoutSubviews {
-    %orig;
-    @try { HNPMCaptureHostPin((UIView *)self, @"布局"); } @catch (NSException *e) {}
-}
-%end
-%end
 
 %ctor {
     @autoreleasepool {
-        HNPMAppendLog(@"v0.1.46: logos %ctor 进入");
+        HNPMAppendLog(@"v0.1.47: logos %ctor 进入");
     HNPMAppendLog(HNPMCoverMode()
         ? @"[透明] 罩层模式 ON(HideNowPlaying.cover 存在 → 系统材质不动, 用自有 blur 罩层)"
         : @"[透明] 罩层模式 OFF(经典 alpha 模式; 建 /var/mobile/Documents/HideNowPlaying.cover 可切换)");
@@ -3632,9 +3112,6 @@ __attribute__((constructor)) static void HNPMRawCtor(void) {
         if (objc_getClass("_SAUIElementViewContentView"))    { %init(HNPMIslandElement); }
         if (objc_getClass("_SAUIProvidedViewContainerView")) { %init(HNPMIslandPortal); }
         if (objc_getClass("SBSystemApertureSceneElement"))   { %init(HNPMIslandSuppression); HNPMAppendLog(@"hook 已注册: 岛元素抑制策略+元素跟踪(NowPlaying)"); }
-        if (objc_getClass("NCMaterialDisplayingCaptureOnlyViewControllerView"))
-            { %init(HNPMCaptureHost); HNPMAppendLog(@"hook 已注册: 捕获快照宿主钉扎(捕获时刻压卡区)"); }
-        else { HNPMAppendLog(@"v0.1.37: 捕获快照宿主类不存在, 钉扎钩子未注册"); }
 
         // v0.0.66: 16 秒后输出终判(此时所有 tweak 必已加载, 检测结果可靠)
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(16.0 * NSEC_PER_SEC)),
@@ -3660,9 +3137,7 @@ __attribute__((constructor)) static void HNPMRawCtor(void) {
         // v0.0.93: 空闲巡逻(0.5s 只读一次, 无在场卡自动停) — 堵"空闲期静默重置无事件触发"盲区
         HNPMIdleAlphaCheck();
         HNPMHookBackdrop();
-        HNPMCapturePersistLoop();   // v0.1.34: 卡区捕获快照持续压住(0.5s 一拍, 自续)
-        HNPMAppendLog(@"v0.1.46: 卡区透明持续生效循环已启动");
-        HNPMAppendLog(@"v0.1.46: 空闲巡逻已启动");
-        HNPMAppendLog(@"v0.1.46: %ctor 正常完成");
+        HNPMAppendLog(@"v0.1.47: 空闲巡逻已启动");
+        HNPMAppendLog(@"v0.1.47: %ctor 正常完成");
     }
 }
