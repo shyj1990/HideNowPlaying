@@ -1275,6 +1275,45 @@ static void HNPMCaptureHostAutopsy(NSString *tag) {
 //          全树无 hidden 剪枝(捕获快照视图常以 hidden 态预渲染)。
 static void HNPMCaptureHostPin(UIView *host, NSString *tag);   // 前向声明(v0.1.36 定义于后)
 
+// v0.1.46: 捕获类方法表 dump — v0.1.45 实测裁决: 宿主材质压掉(h=1)后白底依旧,
+//          白底为系统 AOD 过渡合成(进程外)。最后一搏路线: 运行时枚举
+//          NCMaterialDisplaying* 全部类的方法表(实例+类方法), 找可 hook 的
+//          捕获/快照方法, 供下版精准拦截。一次会话只 dump 一份。
+static void HNPMCaptureVCDump(void) {
+    static BOOL done = NO;
+    if (done) return;
+    done = YES;
+    @try {
+        unsigned int cnt = 0;
+        Class *classes = objc_copyClassList(&cnt);
+        if (!classes) return;
+        int dumped = 0;
+        for (unsigned int i = 0; i < cnt && dumped < 8; i++) {
+            NSString *name = NSStringFromClass(classes[i]);
+            if (![name hasPrefix:@"NCMaterialDisplaying"]) continue;
+            dumped++;
+            unsigned int m = 0;
+            Method *list = class_copyMethodList(classes[i], &m);
+            NSMutableString *s = [NSMutableString stringWithFormat:@"[捕获类] %@ (%u):", name, m];
+            for (unsigned int j = 0; j < m && j < 80; j++)
+                [s appendFormat:@" %@", NSStringFromSelector(method_getName(list[j]))];
+            HNPMAppendLog(s);
+            if (list) free(list);
+            unsigned int cm = 0;
+            Method *clist = class_copyMethodList(object_getClass(classes[i]), &cm);
+            if (cm > 0) {
+                NSMutableString *cs = [NSMutableString stringWithFormat:@"[捕获类+] %@ 类方法(%u):", name, cm];
+                for (unsigned int j = 0; j < cm && j < 40; j++)
+                    [cs appendFormat:@" %@", NSStringFromSelector(method_getName(clist[j]))];
+                HNPMAppendLog(cs);
+            }
+            if (clist) free(clist);
+        }
+        free(classes);
+        HNPMAppendLog([NSString stringWithFormat:@"[捕获类] NCMaterialDisplaying* 扫描完成, 命中 %d 类", dumped]);
+    } @catch (NSException *e) {}
+}
+
 static void HNPMCaptureSweep(NSString *tag) {
     if (![NSThread isMainThread]) {
         dispatch_async(dispatch_get_main_queue(), ^{ HNPMCaptureSweep(tag); });
@@ -1282,6 +1321,7 @@ static void HNPMCaptureSweep(NSString *tag) {
     }
     @try {
         if (!HNPMCoverMode() || CGRectIsEmpty(sHNPMCardRegion33)) return;
+        HNPMCaptureVCDump();   // v0.1.46: 一次性 dump 捕获类方法表
         if (sHNPMCaptureHiddenViews == nil)
             sHNPMCaptureHiddenViews = [NSHashTable weakObjectsHashTable];
         int capCount = 0, pinCount = 0;
@@ -1353,18 +1393,9 @@ static void HNPMCaptureHostPin(UIView *host, NSString *tag) {
         [stack removeObjectAtIndex:0];
         if (!v) continue;
         NSString *cls = NSStringFromClass([v class]);
-        // v0.1.45: 宿主解剖实锤 — CaptureOnly 宿主唯一子视图是 MTMaterialView
-        //          (bg=nil, 内容走私有材质层渲染, 亮屏首帧白底就是它)。直接隐藏。
-        if ([cls isEqualToString:@"MTMaterialView"]) {
-            CGRect vf = [v convertRect:v.bounds toView:nil];
-            CGRect inter = CGRectIntersection(vf, sHNPMCardRegion33);
-            if (!CGRectIsNull(inter) && !CGRectIsEmpty(inter) && !v.hidden) {
-                v.hidden = YES;
-                [sHNPMCaptureHiddenViews addObject:v];
-                n++;
-            }
-            continue;   // 材质层无子视图价值, 不下钻
-        }
+        // v0.1.46: 回退 v0.1.45 的 MTMaterialView 隐藏通道 — 实测宿主材质 h=1 后
+        //          白底依旧(白底=系统 AOD 过渡合成, 进程外), 反致 AOD 音乐卡消失
+        //          数秒的纯代价副作用。钉扎恢复 v0.1.44 行为(只压 BSUIVibrancy*)。
         if (![cls hasPrefix:@"BSUIVibrancyBackdrop"] && ![cls hasPrefix:@"BSUIVibrancyAnimatingPortal"]) {
             [stack addObjectsFromArray:v.subviews];   // 一路下钻, 宿主本身不隐藏
             continue;
@@ -3444,7 +3475,7 @@ static void HNPMAttachPanIfNeeded(UIView *view) {
 #pragma mark - 入口
 
 __attribute__((constructor)) static void HNPMRawCtor(void) {
-    HNPMAppendLog(@"v0.1.45: dylib 构造函数已执行(dyld 加载成功)");
+    HNPMAppendLog(@"v0.1.46: dylib 构造函数已执行(dyld 加载成功)");
 }
 
 // v0.0.50/51: 岛元素抑制策略钩子 — 隐藏期让系统把 NowPlaying 元素当作"应被抑制",
@@ -3528,7 +3559,7 @@ __attribute__((constructor)) static void HNPMRawCtor(void) {
 
 %ctor {
     @autoreleasepool {
-        HNPMAppendLog(@"v0.1.45: logos %ctor 进入");
+        HNPMAppendLog(@"v0.1.46: logos %ctor 进入");
     HNPMAppendLog(HNPMCoverMode()
         ? @"[透明] 罩层模式 ON(HideNowPlaying.cover 存在 → 系统材质不动, 用自有 blur 罩层)"
         : @"[透明] 罩层模式 OFF(经典 alpha 模式; 建 /var/mobile/Documents/HideNowPlaying.cover 可切换)");
@@ -3630,8 +3661,8 @@ __attribute__((constructor)) static void HNPMRawCtor(void) {
         HNPMIdleAlphaCheck();
         HNPMHookBackdrop();
         HNPMCapturePersistLoop();   // v0.1.34: 卡区捕获快照持续压住(0.5s 一拍, 自续)
-        HNPMAppendLog(@"v0.1.45: 卡区透明持续生效循环已启动");
-        HNPMAppendLog(@"v0.1.45: 空闲巡逻已启动");
-        HNPMAppendLog(@"v0.1.45: %ctor 正常完成");
+        HNPMAppendLog(@"v0.1.46: 卡区透明持续生效循环已启动");
+        HNPMAppendLog(@"v0.1.46: 空闲巡逻已启动");
+        HNPMAppendLog(@"v0.1.46: %ctor 正常完成");
     }
 }
