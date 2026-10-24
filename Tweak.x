@@ -1211,6 +1211,73 @@ static void HNPMCapturePersistLoop(void) {
     });
 }
 
+// v0.1.43: AOD 捕获层侦察+钉扎 — 根因坐实: 白底 = AOD(始终显示)灭屏时独立渲染的音乐卡
+//          材质, 亮屏过渡瞬间闪现(用户关闭 AOD 白底消失实测)。AOD 捕获宿主
+//          (NCMaterialDisplayingCaptureOnlyViewControllerView, v0.1.30 唯一一次在案)
+//          不在常规巡检时机在场 → 本版亮/灭屏后 +0.02/0.05/0.1/0.2/0.4/0.8s 高频扫:
+//          ①CaptureOnly 命中→立即钉扎宿主内与卡区相交的 BSUIVibrancyBackdrop/Portal
+//          ②与卡区记忆相交的顶层 BSUIVibrancy* → 直接压(同 PersistOnce 判定)
+//          ③AOD/AlwaysOn/Idle 关键词命中→侦察记录(类名/窗口/frame/hidden), 下版精打
+//          全树无 hidden 剪枝(捕获快照视图常以 hidden 态预渲染)。
+static void HNPMCaptureHostPin(UIView *host, NSString *tag);   // 前向声明(v0.1.36 定义于后)
+
+static void HNPMCaptureSweep(NSString *tag) {
+    if (![NSThread isMainThread]) {
+        dispatch_async(dispatch_get_main_queue(), ^{ HNPMCaptureSweep(tag); });
+        return;
+    }
+    @try {
+        if (!HNPMCoverMode() || CGRectIsEmpty(sHNPMCardRegion33)) return;
+        if (sHNPMCaptureHiddenViews == nil)
+            sHNPMCaptureHiddenViews = [NSHashTable weakObjectsHashTable];
+        int capCount = 0, pinCount = 0;
+        NSMutableArray *rows = [NSMutableArray array];
+        for (UIWindow *w in [UIApplication sharedApplication].windows) {
+            if (!w) continue;
+            NSMutableArray *stack = [NSMutableArray arrayWithObject:w];
+            int guard = 0;
+            while (stack.count > 0 && guard++ < 1200) {
+                UIView *v = stack.firstObject;
+                [stack removeObjectAtIndex:0];
+                if (!v || v.tag == HNPM_COVER_TAG) continue;
+                NSString *cls = NSStringFromClass([v class]);
+                CGRect vf = [v convertRect:v.bounds toView:nil];
+                CGRect inter = CGRectIntersection(vf, sHNPMCardRegion33);
+                BOOL inCard = !CGRectIsNull(inter) && !CGRectIsEmpty(inter);
+                BOOL isCap = [cls containsString:@"CaptureOnly"];
+                BOOL isAODkw = [cls containsString:@"AlwaysOn"] ||
+                               [cls containsString:@"AOD"] ||
+                               [cls rangeOfString:@"Idle" options:NSCaseInsensitiveSearch].location != NSNotFound;
+                BOOL isVib = [cls hasPrefix:@"BSUIVibrancyBackdrop"] ||
+                             [cls hasPrefix:@"BSUIVibrancyAnimatingPortal"];
+                if (isCap || isAODkw || (isVib && inCard)) {
+                    if (rows.count < 20)
+                        [rows addObject:[NSString stringWithFormat:
+                            @"%@|win=%@ %.0fx%.0f@%.0f,%.0f a=%.2f h=%d 卡区=%d",
+                            cls, NSStringFromClass([w class]),
+                            vf.size.width, vf.size.height, vf.origin.x, vf.origin.y,
+                            v.alpha, v.hidden ? 1 : 0, inCard ? 1 : 0]];
+                }
+                if (isCap) {                       // 宿主绝不隐藏, 钉扎其内卡区 backdrop
+                    HNPMCaptureHostPin(v, tag);
+                    capCount++;
+                } else if (isVib && inCard && !v.hidden && v.alpha > 0.01) {
+                    v.hidden = YES;                // 顶层独立 Vibrancy 与卡区相交 → 压
+                    [sHNPMCaptureHiddenViews addObject:v];
+                    pinCount++;
+                }
+                [stack addObjectsFromArray:v.subviews];
+            }
+        }
+        if (rows.count > 0)
+            HNPMAppendLog([NSString stringWithFormat:@"[AOD侦察@%@] %lu处: %@", tag,
+                           (unsigned long)rows.count, [rows componentsJoinedByString:@" || "]]);
+        if (capCount > 0 || pinCount > 0)
+            HNPMAppendLog([NSString stringWithFormat:
+                @"[AOD侦察@%@] 钉扎: CaptureOnly宿主 %d 个, 顶层卡区Vibrancy %d 处", tag, capCount, pinCount]);
+    } @catch (NSException *e) {}
+}
+
 // v0.1.36: 捕获时刻钉扎 — v0.1.35 探针裁决(42 条探针逐卡区过滤): 白窗期间进程内
 //          全窗口/全树(view+layer)与卡区相交的只有全屏壁纸材质与 57x40 小元素,
 //          没有任何卡区尺寸的白底画手; CaptureOnly 宿主也从未出现在枚举/探针里
@@ -1947,6 +2014,14 @@ static void HNPMScreenStateCB(CFNotificationCenterRef center, void *observer,
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.3 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{ @try { HNPMPrehideRestore(); } @catch (NSException *e) {} });
     HNPMStartAlphaBurst();
+    // v0.1.43: AOD 捕获层高频侦察+钉扎 — 灭屏捕获/亮屏过渡双窗口, 追 AOD 短命渲染物
+    for (NSString *d in @[@"0.02", @"0.05", @"0.1", @"0.2", @"0.4", @"0.8"]) {
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
+                       (int64_t)([d doubleValue] * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            @try { HNPMCaptureSweep(d); } @catch (NSException *e) {}
+        });
+    }
     HNPMScheduleDeepDumps();   // v0.0.95: 每次亮/灭屏排程时序化深诊断
     // v0.1.37: 卡区白巡 — 亮/灭屏后 0.05/0.2/0.5/1.0s 各一次(只读, 几何+颜色抓白)
     for (NSString *d in @[@"0.05", @"0.2", @"0.5", @"1.0"]) {
@@ -3300,7 +3375,7 @@ static void HNPMAttachPanIfNeeded(UIView *view) {
 #pragma mark - 入口
 
 __attribute__((constructor)) static void HNPMRawCtor(void) {
-    HNPMAppendLog(@"v0.1.42: dylib 构造函数已执行(dyld 加载成功)");
+    HNPMAppendLog(@"v0.1.43: dylib 构造函数已执行(dyld 加载成功)");
 }
 
 // v0.0.50/51: 岛元素抑制策略钩子 — 隐藏期让系统把 NowPlaying 元素当作"应被抑制",
@@ -3384,7 +3459,7 @@ __attribute__((constructor)) static void HNPMRawCtor(void) {
 
 %ctor {
     @autoreleasepool {
-        HNPMAppendLog(@"v0.1.42: logos %ctor 进入");
+        HNPMAppendLog(@"v0.1.43: logos %ctor 进入");
     HNPMAppendLog(HNPMCoverMode()
         ? @"[透明] 罩层模式 ON(HideNowPlaying.cover 存在 → 系统材质不动, 用自有 blur 罩层)"
         : @"[透明] 罩层模式 OFF(经典 alpha 模式; 建 /var/mobile/Documents/HideNowPlaying.cover 可切换)");
@@ -3486,8 +3561,8 @@ __attribute__((constructor)) static void HNPMRawCtor(void) {
         HNPMIdleAlphaCheck();
         HNPMHookBackdrop();
         HNPMCapturePersistLoop();   // v0.1.34: 卡区捕获快照持续压住(0.5s 一拍, 自续)
-        HNPMAppendLog(@"v0.1.42: 卡区透明持续生效循环已启动");
-        HNPMAppendLog(@"v0.1.42: 空闲巡逻已启动");
-        HNPMAppendLog(@"v0.1.42: %ctor 正常完成");
+        HNPMAppendLog(@"v0.1.43: 卡区透明持续生效循环已启动");
+        HNPMAppendLog(@"v0.1.43: 空闲巡逻已启动");
+        HNPMAppendLog(@"v0.1.43: %ctor 正常完成");
     }
 }
