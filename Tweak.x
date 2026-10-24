@@ -1211,6 +1211,7 @@ static void HNPMCapturePersistLoop(void) {
     });
 }
 
+static NSString *HNPMCGColorDesc(CGColorRef c);   // 前向声明(v0.1.44 宿主解剖用, 定义于后)
 // v0.1.44: CaptureOnly 宿主完整解剖 — v0.1.43 侦察实锤: NCMaterialDisplayingCapture-
 //          OnlyViewControllerView 常驻 SBCoverSheetWindow(393x852@0,0 a=1.00 h=0 全屏,
 //          与卡区相交, 96 条侦察行全程在案), 但钉扎 0 命中(宿主内无 BSUIVibrancy* 类
@@ -1273,7 +1274,6 @@ static void HNPMCaptureHostAutopsy(NSString *tag) {
 //          ③AOD/AlwaysOn/Idle 关键词命中→侦察记录(类名/窗口/frame/hidden), 下版精打
 //          全树无 hidden 剪枝(捕获快照视图常以 hidden 态预渲染)。
 static void HNPMCaptureHostPin(UIView *host, NSString *tag);   // 前向声明(v0.1.36 定义于后)
-static NSString *HNPMCGColorDesc(CGColorRef c);   // 前向声明(v0.1.44 宿主解剖用, 定义于后)
 
 static void HNPMCaptureSweep(NSString *tag) {
     if (![NSThread isMainThread]) {
