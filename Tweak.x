@@ -1211,6 +1211,59 @@ static void HNPMCapturePersistLoop(void) {
     });
 }
 
+// v0.1.44: CaptureOnly 宿主完整解剖 — v0.1.43 侦察实锤: NCMaterialDisplayingCapture-
+//          OnlyViewControllerView 常驻 SBCoverSheetWindow(393x852@0,0 a=1.00 h=0 全屏,
+//          与卡区相交, 96 条侦察行全程在案), 但钉扎 0 命中(宿主内无 BSUIVibrancy* 类
+//          可压) → 白底要么是宿主自身材质层(它是 NCMaterial*View 材质视图), 要么是
+//          宿主内其他类名的子层。本版亮/灭屏 +0.05s 对该宿主做一次完整 DFS 解剖:
+//          类名/frame/alpha/hidden/背景色(view+layer), 上限 48 行 — 看清内部后精打。
+static void HNPMCaptureHostAutopsy(NSString *tag) {
+    if (![NSThread isMainThread]) {
+        dispatch_async(dispatch_get_main_queue(), ^{ HNPMCaptureHostAutopsy(tag); });
+        return;
+    }
+    @try {
+        UIView *host = nil;
+        for (UIWindow *w in [UIApplication sharedApplication].windows) {
+            if (!w) continue;
+            NSMutableArray *stack = [NSMutableArray arrayWithObject:w];
+            int guard = 0;
+            while (stack.count > 0 && guard++ < 1500 && !host) {
+                UIView *v = stack.firstObject;
+                [stack removeObjectAtIndex:0];
+                if (!v) continue;
+                if ([NSStringFromClass([v class]) containsString:@"CaptureOnly"]) { host = v; break; }
+                [stack addObjectsFromArray:v.subviews];
+            }
+            if (host) break;
+        }
+        if (!host) {
+            HNPMAppendLog([NSString stringWithFormat:@"[宿主解剖@%@] 无 CaptureOnly 宿主在场", tag]);
+            return;
+        }
+        NSMutableArray *rows = [NSMutableArray array];
+        NSMutableArray *stack = [NSMutableArray arrayWithObject:host];
+        int guard = 0;
+        while (stack.count > 0 && guard++ < 400 && rows.count < 48) {
+            UIView *v = stack.firstObject;
+            [stack removeObjectAtIndex:0];
+            if (!v) continue;
+            NSString *cls = NSStringFromClass([v class]);
+            CGRect vf = [v convertRect:v.bounds toView:nil];
+            NSString *bg = v.backgroundColor ? HNPMCGColorDesc(v.backgroundColor.CGColor) : @"nil";
+            NSString *lbg = v.layer.backgroundColor ? HNPMCGColorDesc(v.layer.backgroundColor) : @"nil";
+            CALayer *pl = (CALayer *)v.layer.presentationLayer;
+            CGFloat pop = pl ? pl.opacity : -1.0;
+            [rows addObject:[NSString stringWithFormat:@"%@ %.0fx%.0f@%.0f,%.0f a=%.2f p=%.2f h=%d bg=%@ lbg=%@",
+                             cls, vf.size.width, vf.size.height, vf.origin.x, vf.origin.y,
+                             v.alpha, pop, v.hidden ? 1 : 0, bg, lbg]];
+            [stack addObjectsFromArray:v.subviews];
+        }
+        HNPMAppendLog([NSString stringWithFormat:@"[宿主解剖@%@] %lu行: %@", tag,
+                       (unsigned long)rows.count, [rows componentsJoinedByString:@" || "]]);
+    } @catch (NSException *e) {}
+}
+
 // v0.1.43: AOD 捕获层侦察+钉扎 — 根因坐实: 白底 = AOD(始终显示)灭屏时独立渲染的音乐卡
 //          材质, 亮屏过渡瞬间闪现(用户关闭 AOD 白底消失实测)。AOD 捕获宿主
 //          (NCMaterialDisplayingCaptureOnlyViewControllerView, v0.1.30 唯一一次在案)
@@ -2014,6 +2067,9 @@ static void HNPMScreenStateCB(CFNotificationCenterRef center, void *observer,
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.3 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{ @try { HNPMPrehideRestore(); } @catch (NSException *e) {} });
     HNPMStartAlphaBurst();
+    // v0.1.44: CaptureOnly 宿主完整解剖 — 亮/灭屏 +0.05s 一次, 看清白底画手内部结构
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.05 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{ @try { HNPMCaptureHostAutopsy(@"0.05"); } @catch (NSException *e) {} });
     // v0.1.43: AOD 捕获层高频侦察+钉扎 — 灭屏捕获/亮屏过渡双窗口, 追 AOD 短命渲染物
     for (NSString *d in @[@"0.02", @"0.05", @"0.1", @"0.2", @"0.4", @"0.8"]) {
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
@@ -3375,7 +3431,7 @@ static void HNPMAttachPanIfNeeded(UIView *view) {
 #pragma mark - 入口
 
 __attribute__((constructor)) static void HNPMRawCtor(void) {
-    HNPMAppendLog(@"v0.1.43: dylib 构造函数已执行(dyld 加载成功)");
+    HNPMAppendLog(@"v0.1.44: dylib 构造函数已执行(dyld 加载成功)");
 }
 
 // v0.0.50/51: 岛元素抑制策略钩子 — 隐藏期让系统把 NowPlaying 元素当作"应被抑制",
@@ -3459,7 +3515,7 @@ __attribute__((constructor)) static void HNPMRawCtor(void) {
 
 %ctor {
     @autoreleasepool {
-        HNPMAppendLog(@"v0.1.43: logos %ctor 进入");
+        HNPMAppendLog(@"v0.1.44: logos %ctor 进入");
     HNPMAppendLog(HNPMCoverMode()
         ? @"[透明] 罩层模式 ON(HideNowPlaying.cover 存在 → 系统材质不动, 用自有 blur 罩层)"
         : @"[透明] 罩层模式 OFF(经典 alpha 模式; 建 /var/mobile/Documents/HideNowPlaying.cover 可切换)");
@@ -3561,8 +3617,8 @@ __attribute__((constructor)) static void HNPMRawCtor(void) {
         HNPMIdleAlphaCheck();
         HNPMHookBackdrop();
         HNPMCapturePersistLoop();   // v0.1.34: 卡区捕获快照持续压住(0.5s 一拍, 自续)
-        HNPMAppendLog(@"v0.1.43: 卡区透明持续生效循环已启动");
-        HNPMAppendLog(@"v0.1.43: 空闲巡逻已启动");
-        HNPMAppendLog(@"v0.1.43: %ctor 正常完成");
+        HNPMAppendLog(@"v0.1.44: 卡区透明持续生效循环已启动");
+        HNPMAppendLog(@"v0.1.44: 空闲巡逻已启动");
+        HNPMAppendLog(@"v0.1.44: %ctor 正常完成");
     }
 }
