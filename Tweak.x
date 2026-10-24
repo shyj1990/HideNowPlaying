@@ -1849,21 +1849,22 @@ static void HNPMRegionWhiteProbe(NSString *tag) {
                 [stack addObjectsFromArray:v.subviews];
             }
         }
-        // v0.1.38: 全屏(≥360x790)且完全无背景的透明容器是噪音, 先收集后过滤, 卡区真内容才浮得出
+        // v0.1.39: 修复 v0.1.38 尺寸解析 bug(尺寸在'@'之前, 之前取到的是坐标→全屏判定从未生效)
         NSMutableArray *rows = [NSMutableArray array];
         for (NSString *r in all) {
             if (rows.count >= 24) break;
-            NSRange fr = [r rangeOfString:@"@"];   // 尺寸解析: "WxH@X,Y"
-            if (fr.location == NSNotFound) { [rows addObject:r]; continue; }
-            NSString *geo = [r substringFromIndex:fr.location + 1];
-            NSArray *parts = [geo componentsSeparatedByCharactersInSet:
-                [NSCharacterSet characterSetWithCharactersInString:@"x,"]];
-            if (parts.count >= 4) {
-                double pw = [parts[0] doubleValue], ph = [parts[1] doubleValue];
-                BOOL fullscreen = (pw >= 360 && ph >= 790);
-                BOOL hasBG = (![r containsString:@" bg=nil lbg=nil"]);
-                if (fullscreen && !hasBG) continue;   // 透明全屏容器→丢
-            }
+            NSUInteger at = [r rangeOfString:@"@"].location;
+            if (at == NSNotFound) { [rows addObject:r]; continue; }
+            NSString *pre = [r substringToIndex:at];               // "类|win=窗 393x852"
+            NSRange sp = [pre rangeOfString:@" " options:NSBackwardsSearch];
+            if (sp.location == NSNotFound) { [rows addObject:r]; continue; }
+            NSString *sizeTok = [pre substringFromIndex:sp.location + 1];   // "393x852"
+            NSArray *wh = [sizeTok componentsSeparatedByString:@"x"];
+            if (wh.count != 2) { [rows addObject:r]; continue; }
+            double pw = [wh[0] doubleValue], ph = [wh[1] doubleValue];
+            BOOL fullscreen = (pw >= 360 && ph >= 790);
+            BOOL hasBG = (![r containsString:@" bg=nil lbg=nil"]);
+            if (fullscreen && !hasBG) continue;   // 透明全屏容器→丢
             [rows addObject:r];
         }
         HNPMAppendLog([NSString stringWithFormat:@"[卡区白巡@%@] %lu行: %@",
@@ -3227,7 +3228,7 @@ static void HNPMAttachPanIfNeeded(UIView *view) {
 #pragma mark - 入口
 
 __attribute__((constructor)) static void HNPMRawCtor(void) {
-    HNPMAppendLog(@"v0.1.38: dylib 构造函数已执行(dyld 加载成功)");
+    HNPMAppendLog(@"v0.1.39: dylib 构造函数已执行(dyld 加载成功)");
 }
 
 // v0.0.50/51: 岛元素抑制策略钩子 — 隐藏期让系统把 NowPlaying 元素当作"应被抑制",
@@ -3311,7 +3312,7 @@ __attribute__((constructor)) static void HNPMRawCtor(void) {
 
 %ctor {
     @autoreleasepool {
-        HNPMAppendLog(@"v0.1.38: logos %ctor 进入");
+        HNPMAppendLog(@"v0.1.39: logos %ctor 进入");
     HNPMAppendLog(HNPMCoverMode()
         ? @"[透明] 罩层模式 ON(HideNowPlaying.cover 存在 → 系统材质不动, 用自有 blur 罩层)"
         : @"[透明] 罩层模式 OFF(经典 alpha 模式; 建 /var/mobile/Documents/HideNowPlaying.cover 可切换)");
@@ -3413,8 +3414,8 @@ __attribute__((constructor)) static void HNPMRawCtor(void) {
         HNPMIdleAlphaCheck();
         HNPMHookBackdrop();
         HNPMCapturePersistLoop();   // v0.1.34: 卡区捕获快照持续压住(0.5s 一拍, 自续)
-        HNPMAppendLog(@"v0.1.38: 卡区透明持续生效循环已启动");
-        HNPMAppendLog(@"v0.1.38: 空闲巡逻已启动");
-        HNPMAppendLog(@"v0.1.38: %ctor 正常完成");
+        HNPMAppendLog(@"v0.1.39: 卡区透明持续生效循环已启动");
+        HNPMAppendLog(@"v0.1.39: 空闲巡逻已启动");
+        HNPMAppendLog(@"v0.1.39: %ctor 正常完成");
     }
 }
