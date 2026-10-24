@@ -235,24 +235,18 @@ static void HNPMQueryNowPlayingOnce(void) {
     });
 }
 
-// v0.0.60: 被动监听(双路纯收听, 零注册调用) — 隐藏期收到"媒体信息变化"广播 → 即时查询一次(限流1s防广播高频反噬省电)
+// v0.0.60: 被动监听(纯收听) — 隐藏期收到"媒体信息变化"广播 → 即时查询一次(限流1s防广播高频反噬省电)
+// v0.1.52 清理: A/B 路(Darwin中心/NS分布式)已随 v0.1.48 监听删除, 对应死分支+标记变量一并移除;
+//          现唯一广播源 = MR 路(进程内 InfoDidChange/IsPlayingDidChange)。
 static int hnpmNotifCount = 0;
 static CFAbsoluteTime hnpmNotifLogAt = 0;
 static CFAbsoluteTime hnpmNotifLastQuery = 0;
-static BOOL hnpmNotifSeenA = NO;
-static BOOL hnpmNotifSeenB = NO;
 static BOOL hnpmNotifSeenMR = NO;
 
 static void HNPMNotifyHit(NSString *path) {
     dispatch_async(dispatch_get_main_queue(), ^{
         @try {
-            if ([path hasPrefix:@"A"] && !hnpmNotifSeenA) {
-                hnpmNotifSeenA = YES;
-                HNPMAppendLog(@"[通知] A路(CF Darwin中心)首次收到广播(验证通过)");
-            } else if ([path hasPrefix:@"B"] && !hnpmNotifSeenB) {
-                hnpmNotifSeenB = YES;
-                HNPMAppendLog(@"[通知] B路(NS分布式)首次收到广播(验证通过)");
-            } else if ([path hasPrefix:@"MR"] && !hnpmNotifSeenMR) {
+            if ([path hasPrefix:@"MR"] && !hnpmNotifSeenMR) {
                 hnpmNotifSeenMR = YES;
                 HNPMAppendLog(@"[通知] MR路(进程内)首次收到广播(验证通过)");
             }
@@ -1529,11 +1523,22 @@ static int sHNPMAlphaBurstStable = 0;         // v0.0.92: 稳定门 — 连续�
 
 static HNPMBurstTarget *sHNPMAlphaBurstTarget = nil;
 
+// v0.1.52: 事件新鲜度 — 任意系统活动信号(亮灭屏/漂移修正/配方写入/登记重建)都会把
+//          新鲜窗口续 45s; 空闲巡逻据此自适应节奏(窗口内 0.5s 快巡, 过期 2.0s 稳态)。
+//          收益: 灭屏 AOD 整夜(无任何事件)巡逻从 7200 次/h 降到 1800 次/h。
+static CFAbsoluteTime sHNPMEventFreshUntil = 0;
+static BOOL sHNPMIdleSteadyLogged = NO;
+static void HNPMBumpEventFresh(void) {
+    sHNPMEventFreshUntil = CFAbsoluteTimeGetCurrent() + 45.0;
+    sHNPMIdleSteadyLogged = NO;
+}
+
 static void HNPMStartAlphaBurst(void) {
     if (![NSThread isMainThread]) {
         dispatch_async(dispatch_get_main_queue(), ^{ HNPMStartAlphaBurst(); });
         return;
     }
+    HNPMBumpEventFresh();   // v0.1.52: 连扫=系统在活动 → 巡逻保持快巡
     sHNPMAlphaBurstEnd = CFAbsoluteTimeGetCurrent() + 3.0;
     sHNPMAlphaBurstLogged = NO;
     if (sHNPMAlphaBurst) return;   // 已在跑: 只续窗口
@@ -1578,7 +1583,14 @@ static void HNPMIdleAlphaCheck(void) {
             if (a < 0.99 && fabs(cur - a) > 0.01) {
                 HNPMStartAlphaBurst();   // 只开窗不写: 修正走连扫稳定门
             }
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)),
+            // v0.1.52: 自适应节奏 — 事件后 45s 内 0.5s 快巡, 之后 2.0s 稳态省电
+            //          (漂移修正延迟最坏 +1.5s, 仅发生在灭屏静置期, 视觉无感)
+            double step = (CFAbsoluteTimeGetCurrent() < sHNPMEventFreshUntil) ? 0.5 : 2.0;
+            if (step > 1.0 && !sHNPMIdleSteadyLogged) {
+                sHNPMIdleSteadyLogged = YES;
+                HNPMAppendLog(@"[巡逻] 转入稳态 2.0s(45s 无事件)");
+            }
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(step * NSEC_PER_SEC)),
                            dispatch_get_main_queue(), ^{ @try { HNPMIdleAlphaCheck(); } @catch (NSException *e) {} });
         }
         // 无卡 → 不再排下一次(解锁/停播自动停)
@@ -2828,7 +2840,7 @@ static void HNPMAttachPanIfNeeded(UIView *view) {
 #pragma mark - 入口
 
 __attribute__((constructor)) static void HNPMRawCtor(void) {
-    HNPMAppendLog(@"v0.1.51: dylib 构造函数已执行(dyld 加载成功)");
+    HNPMAppendLog(@"v0.1.52: dylib 构造函数已执行(dyld 加载成功)");
 }
 
 // v0.0.50/51: 岛元素抑制策略钩子 — 隐藏期让系统把 NowPlaying 元素当作"应被抑制",
@@ -2892,7 +2904,7 @@ __attribute__((constructor)) static void HNPMRawCtor(void) {
 
 %ctor {
     @autoreleasepool {
-        HNPMAppendLog(@"v0.1.51: logos %ctor 进入");
+        HNPMAppendLog(@"v0.1.52: logos %ctor 进入");
     HNPMAppendLog(HNPMCoverMode()
         ? @"[透明] 罩层模式 ON(设置面板 coverMode → 系统材质不动, 用自有 blur 罩层)"
         : @"[透明] 罩层模式 OFF(经典 alpha 模式; 设置面板可切换)");
@@ -2986,7 +2998,7 @@ __attribute__((constructor)) static void HNPMRawCtor(void) {
         // v0.0.93: 空闲巡逻(0.5s 只读一次, 无在场卡自动停) — 堵"空闲期静默重置无事件触发"盲区
         HNPMIdleAlphaCheck();
         HNPMHookBackdrop();
-        HNPMAppendLog(@"v0.1.51: 空闲巡逻已启动");
-        HNPMAppendLog(@"v0.1.51: %ctor 正常完成");
+        HNPMAppendLog(@"v0.1.52: 空闲巡逻已启动");
+        HNPMAppendLog(@"v0.1.52: %ctor 正常完成");
     }
 }
